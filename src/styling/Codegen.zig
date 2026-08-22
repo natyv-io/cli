@@ -8,15 +8,34 @@
 //! Only emits `BackgroundColor`/`Padding` into the generated
 //! `widgets.ResolvedStyle` literals -- the only two properties
 //! `widgets.ApplyStyle`/`natyv_set_style` actually consume today.
-//! `cornerRadius`/`border`/`gradient`/`texture` all parse and resolve
-//! correctly (Resolver.zig) but have no rendering path to apply to yet
-//! (Stage 3's SDF-shader migration) and `widgets.ResolvedStyle` has no
-//! fields for them yet -- silently omitted here rather than guessing at a
-//! Go shape Stage 3 hasn't defined. `margin`/`text`/`transition` are
-//! never emitted here at all: margin is compile-time JSX-wrapper sugar
-//! (a different pipeline stage entirely, not a runtime `ApplyStyle`
-//! concern), and text/transition's own real schemas are still open
-//! decisions (amber-woven-lantern.md's own sign-off list).
+//! `cornerRadius`/`border`/`gradient` all parse and resolve correctly
+//! (Resolver.zig) but have no rendering path to apply to yet (Stage 3's
+//! SDF-shader migration) and `widgets.ResolvedStyle` has no fields for
+//! them yet -- silently omitted here rather than guessing at a Go shape
+//! Stage 3 hasn't defined.
+//!
+//! `texture` resolves correctly (Resolver.zig validates/stores it) but is
+//! **deliberately silently dropped here**, not even a warning yet --
+//! confirmed 2026-08-21: a real capability-gated warning/error needs
+//! `conf.natyv.json`'s image-capability flag to actually exist and reach
+//! this pipeline, and neither does until asset staging is implemented.
+//! Revisit this exact spot once it is; don't add a stub check against a
+//! flag that isn't real yet.
+//!
+//! `margin` is never emitted here at all, and deliberately not implemented
+//! anywhere else in the SDK either right now -- confirmed 2026-08-21:
+//! margin-as-implicit-Container-wrap is real "build system" sugar (see
+//! CLAUDE.md's styling section), and the only widget-authoring surface
+//! today is hand-written direct `widgets.CreateX(...)` calls, which v1
+//! deliberately won't keep as the real authoring model once the `.ntx`
+//! JSX layer ships (guests will *only* author through `.ntx` post-v1).
+//! Building a margin-wrapping helper against the interim direct-call API
+//! now would target a surface that's going away -- real margin support
+//! belongs entirely in the `.ntx` transpiler's own implementation pass
+//! (see `natyv_jsx_markup_layer` memory), not here.
+//!
+//! `text`/`transition` are also never emitted -- their own real schemas
+//! are still open decisions (amber-woven-lantern.md's own sign-off list).
 //!
 //! Not yet wrapped in a CLI (`natyv prepare` doesn't exist as a real
 //! executable) -- deliberately deferred to the tooling arc, alongside the
