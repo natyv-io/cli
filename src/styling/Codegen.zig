@@ -5,14 +5,13 @@
 //! yet; that's real, but premature, work for languages with no SDK to
 //! receive it.
 //!
-//! Only emits `BackgroundColor`/`Padding` into the generated
-//! `widgets.ResolvedStyle` literals -- the only two properties
-//! `widgets.ApplyStyle`/`natyv_set_style` actually consume today.
-//! `cornerRadius`/`border`/`gradient` all parse and resolve correctly
-//! (Resolver.zig) but have no rendering path to apply to yet (Stage 3's
-//! SDF-shader migration) and `widgets.ResolvedStyle` has no fields for
-//! them yet -- silently omitted here rather than guessing at a Go shape
-//! Stage 3 hasn't defined.
+//! Emits `BackgroundColor`/`Padding`/`CornerRadius`/`Border` into the
+//! generated `widgets.ResolvedStyle` literals -- everything
+//! `widgets.ApplyStyle`/`natyv_set_style` consume as of Stage 5a. `gradient`
+//! parses and resolves correctly (Resolver.zig) but has no rendering path
+//! yet (Stage 5b) and `widgets.ResolvedStyle` has no field for it --
+//! silently omitted here rather than guessing at a Go shape Stage 5b
+//! hasn't defined.
 //!
 //! `texture` resolves correctly (Resolver.zig validates/stores it) but is
 //! **deliberately silently dropped here**, not even a warning yet --
@@ -117,6 +116,34 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, tokens
             try writeGoU16(&out, allocator, p);
             try out.appendSlice(allocator, "},\n");
         }
+        if (tok.corner_radius) |cr| {
+            // Bare integer literals (untyped constants) assign straight
+            // into widgets.CornerRadius's float32 fields -- no separate
+            // float formatter needed for what's always an integer-pixel
+            // value coming out of the resolver.
+            try out.appendSlice(allocator, "\t\tCornerRadius: &widgets.CornerRadius{TopLeft: ");
+            try writeGoU16(&out, allocator, cr[0]);
+            try out.appendSlice(allocator, ", TopRight: ");
+            try writeGoU16(&out, allocator, cr[1]);
+            try out.appendSlice(allocator, ", BottomRight: ");
+            try writeGoU16(&out, allocator, cr[2]);
+            try out.appendSlice(allocator, ", BottomLeft: ");
+            try writeGoU16(&out, allocator, cr[3]);
+            try out.appendSlice(allocator, "},\n");
+        }
+        if (tok.border) |b| {
+            try out.appendSlice(allocator, "\t\tBorder: &widgets.Border{Width: ");
+            try writeGoU16(&out, allocator, b.width);
+            try out.appendSlice(allocator, ", Color: widgets.Color{R: ");
+            try writeGoFloat(&out, allocator, b.color.r);
+            try out.appendSlice(allocator, ", G: ");
+            try writeGoFloat(&out, allocator, b.color.g);
+            try out.appendSlice(allocator, ", B: ");
+            try writeGoFloat(&out, allocator, b.color.b);
+            try out.appendSlice(allocator, ", A: ");
+            try writeGoFloat(&out, allocator, b.color.a);
+            try out.appendSlice(allocator, "}},\n");
+        }
         try out.appendSlice(allocator, "\t},\n");
     }
 
@@ -139,6 +166,21 @@ test "generates valid-looking Go for a full token" {
     try std.testing.expect(std.mem.indexOf(u8, src, "\"card-header\": {") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "BackgroundColor: &widgets.Color{R: 0.1, G: 0.2, B: 0.3, A: 1}") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "Padding: &widgets.Padding{Left: 8, Right: 8, Top: 8, Bottom: 8}") != null);
+}
+
+test "generates cornerRadius and border for a styled token" {
+    const tokens = [_]Resolver.ResolvedStyleToken{
+        .{
+            .name = "card-style",
+            .corner_radius = .{ 4, 8, 12, 16 },
+            .border = .{ .width = 2, .color = .{ .r = 0.545, .g = 0.361, .b = 0.965, .a = 1.0 } },
+        },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = try generateGo(arena.allocator(), "main", &tokens);
+    try std.testing.expect(std.mem.indexOf(u8, src, "CornerRadius: &widgets.CornerRadius{TopLeft: 4, TopRight: 8, BottomRight: 12, BottomLeft: 16}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "Border: &widgets.Border{Width: 2, Color: widgets.Color{R: 0.545, G: 0.361, B: 0.965, A: 1}}") != null);
 }
 
 test "omits fields that were never resolved" {
