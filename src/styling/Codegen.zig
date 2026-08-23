@@ -5,13 +5,14 @@
 //! yet; that's real, but premature, work for languages with no SDK to
 //! receive it.
 //!
-//! Emits `BackgroundColor`/`Padding`/`CornerRadius`/`Border` into the
-//! generated `widgets.ResolvedStyle` literals -- everything
-//! `widgets.ApplyStyle`/`natyv_set_style` consume as of Stage 5a. `gradient`
-//! parses and resolves correctly (Resolver.zig) but has no rendering path
-//! yet (Stage 5b) and `widgets.ResolvedStyle` has no field for it --
-//! silently omitted here rather than guessing at a Go shape Stage 5b
-//! hasn't defined.
+//! Emits `BackgroundColor`/`Padding`/`CornerRadius`/`Border`/`Gradient`
+//! into the generated `widgets.ResolvedStyle` literals -- everything
+//! `widgets.ApplyStyle`/`natyv_set_style` consume as of Stage 5b.
+//! `gradient`'s named anchor (`topLeft`, etc.) is resolved to a plain 0..1
+//! UV position *here*, at prepare time -- the host/rendering side
+//! (ShapeCache.drawRoundedRectGradient) is deliberately anchor-agnostic,
+//! same as how a hex color is resolved to floats here rather than crossing
+//! the wire as a string.
 //!
 //! `texture` resolves correctly (Resolver.zig validates/stores it) but is
 //! **deliberately silently dropped here**, not even a warning yet --
@@ -42,6 +43,22 @@
 
 const std = @import("std");
 const Resolver = @import("Resolver.zig");
+
+/// Resolves a stylesheet gradient anchor to a plain 0..1 shape-space UV
+/// position -- see this file's own doc comment for why this happens here,
+/// at prepare time, rather than crossing the wire as a name.
+fn anchorUV(anchor: Resolver.GradientAnchor) [2]f32 {
+    return switch (anchor) {
+        .top => .{ 0.5, 0 },
+        .bottom => .{ 0.5, 1 },
+        .left => .{ 0, 0.5 },
+        .right => .{ 1, 0.5 },
+        .topLeft => .{ 0, 0 },
+        .topRight => .{ 1, 0 },
+        .bottomLeft => .{ 0, 1 },
+        .bottomRight => .{ 1, 1 },
+    };
+}
 
 fn writeGoFloat(out: *std.ArrayList(u8), allocator: std.mem.Allocator, v: f32) !void {
     // Formatting `v` directly as f32 (not widened to f64 first) matters:
@@ -144,6 +161,35 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, tokens
             try writeGoFloat(&out, allocator, b.color.a);
             try out.appendSlice(allocator, "}},\n");
         }
+        if (tok.gradient) |g| {
+            const start_uv = anchorUV(g.start.pos);
+            const end_uv = anchorUV(g.end.pos);
+            try out.appendSlice(allocator, "\t\tGradient: &widgets.Gradient{StartPos: [2]float32{");
+            try writeGoFloat(&out, allocator, start_uv[0]);
+            try out.appendSlice(allocator, ", ");
+            try writeGoFloat(&out, allocator, start_uv[1]);
+            try out.appendSlice(allocator, "}, StartColor: widgets.Color{R: ");
+            try writeGoFloat(&out, allocator, g.start.color.r);
+            try out.appendSlice(allocator, ", G: ");
+            try writeGoFloat(&out, allocator, g.start.color.g);
+            try out.appendSlice(allocator, ", B: ");
+            try writeGoFloat(&out, allocator, g.start.color.b);
+            try out.appendSlice(allocator, ", A: ");
+            try writeGoFloat(&out, allocator, g.start.color.a);
+            try out.appendSlice(allocator, "}, EndPos: [2]float32{");
+            try writeGoFloat(&out, allocator, end_uv[0]);
+            try out.appendSlice(allocator, ", ");
+            try writeGoFloat(&out, allocator, end_uv[1]);
+            try out.appendSlice(allocator, "}, EndColor: widgets.Color{R: ");
+            try writeGoFloat(&out, allocator, g.end.color.r);
+            try out.appendSlice(allocator, ", G: ");
+            try writeGoFloat(&out, allocator, g.end.color.g);
+            try out.appendSlice(allocator, ", B: ");
+            try writeGoFloat(&out, allocator, g.end.color.b);
+            try out.appendSlice(allocator, ", A: ");
+            try writeGoFloat(&out, allocator, g.end.color.a);
+            try out.appendSlice(allocator, "}},\n");
+        }
         try out.appendSlice(allocator, "\t},\n");
     }
 
@@ -181,6 +227,22 @@ test "generates cornerRadius and border for a styled token" {
     const src = try generateGo(arena.allocator(), "main", &tokens);
     try std.testing.expect(std.mem.indexOf(u8, src, "CornerRadius: &widgets.CornerRadius{TopLeft: 4, TopRight: 8, BottomRight: 12, BottomLeft: 16}") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "Border: &widgets.Border{Width: 2, Color: widgets.Color{R: 0.545, G: 0.361, B: 0.965, A: 1}}") != null);
+}
+
+test "generates gradient with anchors resolved to UV positions" {
+    const tokens = [_]Resolver.ResolvedStyleToken{
+        .{
+            .name = "fade",
+            .gradient = .{
+                .start = .{ .pos = .topLeft, .color = .{ .r = 0, .g = 0, .b = 0, .a = 1 } },
+                .end = .{ .pos = .bottomRight, .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 } },
+            },
+        },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = try generateGo(arena.allocator(), "main", &tokens);
+    try std.testing.expect(std.mem.indexOf(u8, src, "Gradient: &widgets.Gradient{StartPos: [2]float32{0, 0}, StartColor: widgets.Color{R: 0, G: 0, B: 0, A: 1}, EndPos: [2]float32{1, 1}, EndColor: widgets.Color{R: 1, G: 1, B: 1, A: 1}}") != null);
 }
 
 test "omits fields that were never resolved" {
