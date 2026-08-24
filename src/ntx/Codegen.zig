@@ -881,11 +881,37 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
     try generated.appendSlice(allocator, "\n\npackage ");
     try generated.appendSlice(allocator, package_name);
     try generated.appendSlice(allocator, "\n\n");
-    if (used_paths.items.len == 0) {
-        try generated.appendSlice(allocator, "import \"natyv/sdk/widgets\"\n");
-    } else {
-        try generated.appendSlice(allocator, "import (\n\t\"natyv/sdk/widgets\"\n");
-        for (used_paths.items) |p| {
+    // `natyv/sdk/widgets` is included only if `body` actually references
+    // it -- real, necessary since Stage 6a made it possible for a
+    // composer's entire body to be nothing but a bare component-tag call
+    // (e.g. `<children/>`) that never touches a real widget kind, which
+    // would otherwise get an unconditional, unused `widgets` import and
+    // fail real `go build`/`tinygo build` with "imported and not used"
+    // (a real bug found this way, not by inspection). A plain substring
+    // search over the already-fully-emitted `body` -- rather than a
+    // hand-tracked flag threaded through every call site that might emit
+    // `widgets.` (`emitLayout`, `emitApplyStyle`, and any composer's own
+    // verbatim-copied signature text, e.g. `children widgets.Builder`,
+    // which Codegen never structurally parses) -- catches every real
+    // case in one place, at the cost of a narrow, accepted false-positive
+    // risk: a widget's own literal text content coincidentally containing
+    // the substring "widgets." (e.g. a Label reading "our widgets. Now!")
+    // would reintroduce the same unused-import failure in that one rare
+    // case. Same "acceptable v1 simplification" posture as `Expose.zig`'s
+    // own literal `func Name(` text-match already accepts.
+    const uses_widgets = std.mem.indexOf(u8, body.items, "widgets.") != null;
+
+    var all_imports: std.ArrayList([]const u8) = .empty;
+    if (uses_widgets) try all_imports.append(allocator, "natyv/sdk/widgets");
+    try all_imports.appendSlice(allocator, used_paths.items);
+
+    if (all_imports.items.len == 1) {
+        try generated.appendSlice(allocator, "import ");
+        try writeGoStringLiteral(&generated, allocator, all_imports.items[0]);
+        try generated.appendSlice(allocator, "\n");
+    } else if (all_imports.items.len > 1) {
+        try generated.appendSlice(allocator, "import (\n");
+        for (all_imports.items) |p| {
             try generated.appendSlice(allocator, "\t");
             try writeGoStringLiteral(&generated, allocator, p);
             try generated.appendSlice(allocator, "\n");
@@ -1477,4 +1503,68 @@ test "<children/> rejects attributes and its own children with a clear error" {
     const result2 = try generateGo(allocator, "main", src_with_children, found2.composers, &.{}, &.{}, 0, 0);
     try std.testing.expect(result2.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result2.err.?.message, "its own children") != null);
+}
+
+test "a composer body that never references a real widget kind gets no unused 'widgets' import, even when its own signature does" {
+    // `children widgets.Builder` in the signature is copied verbatim and
+    // does mention `widgets.` -- correctly still needs the import, even
+    // though the body itself (a bare `<children/>` call) never emits
+    // widgets.CreateX/ApplyStyle/ParentID anywhere.
+    const src =
+        \\expose Card
+        \\
+        \\func Card(parent uint32, children widgets.Builder) error {
+        \\  <children/>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    try std.testing.expect(result.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "import \"natyv/sdk/widgets\"\n") != null);
+}
+
+test "a composer body whose signature and body both never mention 'widgets' gets no import block at all" {
+    const src =
+        \\expose Card
+        \\
+        \\func Card(parent uint32, children func(uint32) error) error {
+        \\  <children/>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "import") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "if err := children(uint32(parent)); err != nil {") != null);
+}
+
+test "a component-only composer body needing a 'uses' import but no real widget gets only that import, no unused widgets import" {
+    const src =
+        \\uses (
+        \\  { OtherComp } from "some/other/pkg"
+        \\)
+        \\
+        \\expose Card
+        \\
+        \\func Card(parent uint32) error {
+        \\  <OtherComp/>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "import \"some/other/pkg\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "natyv/sdk/widgets") == null);
 }
