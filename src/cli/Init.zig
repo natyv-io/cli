@@ -1,14 +1,13 @@
 //! `natyv init` (`.ntx` tooling, ~/.claude/plans/lexical-wishing-penguin.md's
 //! last remaining open item): interactively asks which guest language the
-//! dev is using, then scaffolds a real, immediately-buildable natyv app
-//! in the current working directory -- in place, not a new subdirectory
-//! (matching `cargo init`'s convention, not `cargo new`'s, per Quinn's
-//! own original phrasing: "scaffolds a new natyv app for them in the
-//! current working directory it was run from"). Go is the only real
-//! guest language with a shipped SDK today; anything else is a clear
-//! "not supported yet" error, not a silent stub -- matches every other
-//! closed-vocabulary surface in this project (widget kinds, `.ntx`
-//! guest-language dispatch, etc.).
+//! dev is using, then scaffolds a real natyv app in the current working
+//! directory -- in place, not a new subdirectory (matching `cargo init`'s
+//! convention, not `cargo new`'s, per Quinn's own original phrasing:
+//! "scaffolds a new natyv app for them in the current working directory
+//! it was run from"). Go is the only real guest language with a shipped
+//! SDK today; anything else is a clear "not supported yet" error, not a
+//! silent stub -- matches every other closed-vocabulary surface in this
+//! project (widget kinds, `.ntx` guest-language dispatch, etc.).
 //!
 //! The scaffold's `go.mod` `replace` directive points at natyv-core's own
 //! `sdk/go`, resolved via the exact same "where's natyv-core" mechanism
@@ -18,13 +17,14 @@
 //! var/build_options itself, for the same testability reason `Bundle.zig`
 //! takes `natyv_core_src` as a parameter instead of resolving it inline.
 //!
-//! Runs `Prepare.run` on the freshly-scaffolded guest directory as its
-//! last step, so the new app is immediately buildable (`natyv build`)
-//! with no extra manual step the dev has to remember.
+//! **Deliberately does not run `Prepare.run`** -- Quinn's own explicit
+//! call: `natyv init` only ever scaffolds, it never transpiles. The
+//! starter `.ntx` file is left exactly as scaffolded; running `natyv
+//! prepare`/`natyv build` afterward is a separate, real step the dev
+//! takes on their own, same as any other change to `.ntx` source.
 
 const std = @import("std");
 const Io = std.Io;
-const Prepare = @import("Prepare");
 
 pub const InitError = struct {
     message: []const u8,
@@ -202,16 +202,6 @@ pub fn run(allocator: std.mem.Allocator, io: Io, language: []const u8, cwd_name:
     try guest_dir.writeFile(io, .{ .sub_path = "main.go", .data = main_go_content });
     try guest_dir.writeFile(io, .{ .sub_path = "app.go.ntx", .data = app_go_ntx_content });
 
-    // Immediately transpile the starter `.ntx` file so the scaffold is
-    // real and buildable right away -- a dev shouldn't have to remember
-    // to run `natyv prepare` themselves before their first `natyv build`.
-    const outcome = try Prepare.run(allocator, io, guest_dir);
-    if (outcome.err) |e| {
-        return .{ .ok = false, .err = .{
-            .message = try std.fmt.allocPrint(allocator, "natyv init: scaffolded the app, but the starter file failed to transpile: {s}", .{e.message}),
-        } };
-    }
-
     return .{ .ok = true, .err = null };
 }
 
@@ -240,7 +230,7 @@ test "an unsupported language is a clear, natyv-attributed error, no files writt
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "conf.natyv.json", .{}));
 }
 
-test "a real Go scaffold produces every real file, transpiled and ready to build" {
+test "a real Go scaffold produces every real file, untranspiled" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const io = std.testing.io;
@@ -267,12 +257,11 @@ test "a real Go scaffold produces every real file, transpiled and ready to build
     _ = try guest_dir.readFileAlloc(io, "main.go", allocator, .unlimited);
     _ = try guest_dir.readFileAlloc(io, "app.go.ntx", allocator, .unlimited);
 
-    // Real proof `Prepare.run` actually transpiled the starter file, not
-    // just that it didn't error.
-    const generated = try guest_dir.readFileAlloc(io, "app.natyv.go", allocator, .unlimited);
-    try std.testing.expect(std.mem.indexOf(u8, generated, "widgets.CreateContainer") != null);
-    const logic = try guest_dir.readFileAlloc(io, "app.go", allocator, .unlimited);
-    try std.testing.expect(std.mem.indexOf(u8, logic, "return natyvBuildApp(parent)") != null);
+    // `natyv init` only ever scaffolds -- it must never also transpile
+    // (Quinn's own explicit call). Real proof: neither generated output
+    // file exists yet.
+    try std.testing.expectError(error.FileNotFound, guest_dir.access(io, "app.natyv.go", .{}));
+    try std.testing.expectError(error.FileNotFound, guest_dir.access(io, "app.go", .{}));
 }
 
 test "refuses to scaffold over an existing conf.natyv.json" {

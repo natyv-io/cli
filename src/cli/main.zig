@@ -17,7 +17,7 @@ const Prepare = @import("Prepare");
 const Compile = @import("Compile.zig");
 const BuildCache = @import("BuildCache");
 const Bundle = @import("Bundle.zig");
-const Init = @import("Init");
+const Init = @import("Init.zig");
 const build_options = @import("build_options");
 
 pub const Subcommand = enum { prepare, build, init };
