@@ -5,8 +5,10 @@
 //! body-bounded) and `Parser.zig`'s tag trees, and emits:
 //!
 //! - a generated builder file (`DO NOT EDIT`, real `widgets.CreateX(...)`
-//!   calls wired via `widgets.ParentID(uint32(...))`, matching the real
-//!   SDK convention in `sdk/go/widgets/layout.go`) -- one
+//!   calls, each preceded by a `<var>Layout := widgets.ParentID(uint32(
+//!   ...))` built on the real SDK convenience constructor in
+//!   `sdk/go/widgets/layout.go` plus per-tag default `Sizing`/`Direction`/
+//!   `Padding`/`ChildGap` assignments -- see `LayoutDefaults` -- one
 //!   `func natyvBuild<Name>(<original params>) error { ... }` per exposed
 //!   composer.
 //! - a rewritten logic file: the original source, byte-identical except
@@ -219,42 +221,123 @@ const Emitter = struct {
         try self.out.appendSlice(self.allocator, ")\n");
     }
 
+    /// Sensible per-tag layout defaults, applied unconditionally until a
+    /// real sizing/layout attribute grammar is designed (not yet -- no
+    /// `.ntx` example anywhere authors explicit sizing/padding/direction
+    /// today). Real, necessary fix, not cosmetic: every real hand-written
+    /// widget in this codebase always sets explicit `Sizing`/`Direction`
+    /// -- a bare `widgets.ParentID(...)` Layout leaves every other field
+    /// at Go's zero value, which for `Sizing` means both axes `Fit` with
+    /// a 0 min (see `sdk/go/widgets/layout.go`'s own `Fit` doc comment:
+    /// "leaf widgets ... collapse toward their min size [0] until natyv
+    /// has real font-driven text measurement"). Found by actually running
+    /// the generated code, not by inspection -- every widget rendered on
+    /// top of every other at (0,0) until these defaults were added.
+    const LayoutDefaults = struct {
+        direction: ?[]const u8 = null, // raw Go expr, e.g. "widgets.TopToBottom"
+        child_gap: ?u16 = null,
+        padding: ?u16 = null, // uniform on all four sides
+        width_fixed: ?f32 = null,
+        height_fixed: ?f32 = null,
+    };
+
+    fn appendNum(self: *Emitter, comptime fmt: []const u8, value: anytype) EmitError!void {
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, fmt, .{value}) catch unreachable; // 32 bytes is ample for any u16/f32 here
+        try self.out.appendSlice(self.allocator, s);
+    }
+
+    /// Emits `<layout_var> := widgets.ParentID(uint32(<parent_expr>))`
+    /// plus one assignment statement per non-null `LayoutDefaults` field --
+    /// building on the SDK's own real `ParentID` convenience constructor
+    /// (see `layout.go`) rather than hand-rolling the pointer-taking
+    /// ourselves.
+    fn emitLayout(self: *Emitter, layout_var: []const u8, parent_expr: []const u8, d: LayoutDefaults) EmitError!void {
+        try self.out.appendSlice(self.allocator, "\t");
+        try self.out.appendSlice(self.allocator, layout_var);
+        try self.out.appendSlice(self.allocator, " := widgets.ParentID(uint32(");
+        try self.out.appendSlice(self.allocator, parent_expr);
+        try self.out.appendSlice(self.allocator, "))\n");
+        if (d.direction) |dir| {
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ".Direction = ");
+            try self.out.appendSlice(self.allocator, dir);
+            try self.out.appendSlice(self.allocator, "\n");
+        }
+        if (d.child_gap) |g| {
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ".ChildGap = ");
+            try self.appendNum("{d}", g);
+            try self.out.appendSlice(self.allocator, "\n");
+        }
+        if (d.padding) |p| {
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ".Padding = widgets.Padding{Left: ");
+            try self.appendNum("{d}", p);
+            try self.out.appendSlice(self.allocator, ", Right: ");
+            try self.appendNum("{d}", p);
+            try self.out.appendSlice(self.allocator, ", Top: ");
+            try self.appendNum("{d}", p);
+            try self.out.appendSlice(self.allocator, ", Bottom: ");
+            try self.appendNum("{d}", p);
+            try self.out.appendSlice(self.allocator, "}\n");
+        }
+        if (d.width_fixed) |w| {
+            const h = d.height_fixed orelse 0;
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ".Sizing = widgets.Sizing{Width: widgets.Fixed(");
+            try self.appendNum("{d}", w);
+            try self.out.appendSlice(self.allocator, "), Height: widgets.Fixed(");
+            try self.appendNum("{d}", h);
+            try self.out.appendSlice(self.allocator, ")}\n");
+        }
+    }
+
     fn emitElement(self: *Emitter, el: Parser.Element, parent_expr: []const u8) EmitError![]const u8 {
         const var_name = try std.fmt.allocPrint(self.allocator, "{s}{d}", .{ el.tag, self.counter });
         self.counter += 1;
+        const layout_var = try std.fmt.allocPrint(self.allocator, "{s}Layout", .{var_name});
         var skip_attr: ?[]const u8 = null;
 
         if (std.mem.eql(u8, el.tag, "Container")) {
+            try self.emitLayout(layout_var, parent_expr, .{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 });
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
-            try self.out.appendSlice(self.allocator, ", err := widgets.CreateContainer(widgets.ParentID(uint32(");
-            try self.out.appendSlice(self.allocator, parent_expr);
-            try self.out.appendSlice(self.allocator, ")), false, 0)\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateContainer(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", false, 0)\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "Label")) {
             const text = try self.childText(el);
+            try self.emitLayout(layout_var, parent_expr, .{ .width_fixed = 300, .height_fixed = 24 });
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
-            try self.out.appendSlice(self.allocator, ", err := widgets.CreateLabel(widgets.ParentID(uint32(");
-            try self.out.appendSlice(self.allocator, parent_expr);
-            try self.out.appendSlice(self.allocator, ")), ");
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateLabel(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
             try writeGoStringLiteral(self.out, self.allocator, text);
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "Button")) {
             const text = try self.childText(el);
+            try self.emitLayout(layout_var, parent_expr, .{ .width_fixed = 120, .height_fixed = 32 });
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
-            try self.out.appendSlice(self.allocator, ", err := widgets.CreateButton(widgets.ParentID(uint32(");
-            try self.out.appendSlice(self.allocator, parent_expr);
-            try self.out.appendSlice(self.allocator, ")), ");
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateButton(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
             try writeGoStringLiteral(self.out, self.allocator, text);
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "TextField")) {
             const placeholder = (try self.stringAttr(el, "placeholder")) orelse "";
+            try self.emitLayout(layout_var, parent_expr, .{ .width_fixed = 240, .height_fixed = 32 });
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
-            try self.out.appendSlice(self.allocator, ", err := widgets.CreateTextField(widgets.ParentID(uint32(");
-            try self.out.appendSlice(self.allocator, parent_expr);
-            try self.out.appendSlice(self.allocator, ")), ");
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateTextField(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", ");
             try writeGoStringLiteral(self.out, self.allocator, placeholder);
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attr = "placeholder";
@@ -465,9 +548,10 @@ test "generates a builder function and a spliced logic file for a single flat co
     try std.testing.expect(std.mem.indexOf(u8, out.generated, "// Code generated by natyv prepare. DO NOT EDIT.") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.generated, "// source-hash: ") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.generated, "func natyvBuildNavBar(parent widgets.Container) error {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.generated, "widgets.CreateContainer(widgets.ParentID(uint32(parent)), false, 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.generated, "Container0Layout := widgets.ParentID(uint32(parent))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.generated, "widgets.CreateContainer(Container0Layout, false, 0)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.generated, "widgets.ApplyStyle(uint32(Container0), StyleTokens, \"nav\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.generated, "widgets.CreateLabel(widgets.ParentID(uint32(Container0)), \"Home\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.generated, "widgets.CreateLabel(Label1Layout, \"Home\")") != null);
 
     try std.testing.expect(std.mem.indexOf(u8, out.logic, "expose NavBar") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.logic, "<Container") == null);
@@ -540,7 +624,7 @@ test "ref={&x} assigns the created widget's address to the named package-level v
     const found = try Expose.findComposers(allocator, src);
     const result = try generateGo(allocator, "main", src, found.composers);
     try std.testing.expect(result.err == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.CreateTextField(widgets.ParentID(uint32(parent)), \"Your name\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.CreateTextField(TextField0Layout, \"Your name\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "nameField = &TextField0") != null);
 }
 
@@ -562,7 +646,7 @@ test "onClick={handler} binds the real .OnClick(...) method, and onClick reads a
     const result = try generateGo(allocator, "main", src, found.composers);
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
-    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateButton(widgets.ParentID(uint32(Container0)), \"Save\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateButton(Button2Layout, \"Save\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "Button2.OnClick(handleSave)") != null);
 }
 
