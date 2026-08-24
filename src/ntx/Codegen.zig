@@ -51,10 +51,34 @@
 //! `ref`/dynamic `styles` expressions and any other braced attribute are
 //! also clear codegen errors here, not silently dropped -- they're Stage
 //! 4's job.
+//!
+//! **Margin-as-wrapper (Stage 5)**: `margin` has no runtime representation
+//! anywhere in the SDK on purpose (`widgets.ResolvedStyle` in
+//! `sdk/go/widgets/style.go` has no `Margin` field) -- see
+//! `styling/Codegen.zig`'s own doc comment: margin was always meant to be
+//! prepare-time sugar implemented entirely in this transpiler, once it
+//! existed, rather than a hand-written-call-era stopgap. `generateGo` now
+//! takes the app's real resolved stylesheet tokens (`Resolver.zig`'s
+//! output) so it can look up whether any name in a `styles={...}` list
+//! resolves (later-wins, same merge order as `widgets.ApplyStyle` itself)
+//! to a non-zero margin -- if so, a wrapper `<Container>` is inserted
+//! immediately before the real widget's own create-call, parented exactly
+//! where the real widget would have been, with `Padding` set to the
+//! margin amount on all four sides and `Sizing` left at its default `Fit`
+//! (correct here, unlike a leaf widget's own `Fit` pitfall documented
+//! above -- a wrapper's only child already has a real resolved size by the
+//! time Clay lays out the wrapper). The wrapper is transparent to
+//! everything else: `ref`/event bindings still attach to the real widget's
+//! own variable, and the real widget's *children* still parent directly
+//! under the real widget, never under its wrapper -- only the real
+//! widget's *own* attachment point to its parent moves. An unknown style
+//! name contributes no margin here, same as `ApplyStyle`'s own token
+//! lookup being a runtime-only concern this codegen doesn't duplicate.
 
 const std = @import("std");
 const Parser = @import("Parser.zig");
 const Expose = @import("Expose.zig");
+const Resolver = @import("Resolver");
 
 pub const CodegenError = struct {
     line: u32,
@@ -127,6 +151,7 @@ const EmitError = error{CodegenError} || std.mem.Allocator.Error;
 const Emitter = struct {
     allocator: std.mem.Allocator,
     out: *std.ArrayList(u8),
+    style_tokens: []const Resolver.ResolvedStyleToken = &.{},
     counter: u32 = 0,
     err: ?CodegenError = null,
 
@@ -297,14 +322,68 @@ const Emitter = struct {
         }
     }
 
+    /// Looks up the `styles={...}` attribute (if any) and resolves its
+    /// names against `self.style_tokens`, later-wins, same merge order
+    /// `widgets.ApplyStyle`/`mergeStyles` itself uses -- returns the
+    /// resolved margin, or `null` if no name sets one (including when the
+    /// attribute is absent, dynamic, or names an unknown token: unknown
+    /// names are a runtime `ApplyStyle` concern, not re-validated here).
+    fn marginFor(self: *Emitter, el: Parser.Element) ?u16 {
+        for (el.attrs) |attr| {
+            if (!std.mem.eql(u8, attr.name, "styles")) continue;
+            const names = switch (attr.value) {
+                .styles => |n| n,
+                else => return null,
+            };
+            var margin: ?u16 = null;
+            for (names) |name| {
+                for (self.style_tokens) |tok| {
+                    if (std.mem.eql(u8, tok.name, name)) {
+                        if (tok.margin) |m| margin = m;
+                        break;
+                    }
+                }
+            }
+            return margin;
+        }
+        return null;
+    }
+
+    /// Inserts a wrapper `<Container>` between `parent_expr` and whatever
+    /// real widget is about to be created, giving margin's visual effect
+    /// (space *outside* the widget) via `Padding` on a `Fit`-sized
+    /// container -- see this file's own doc comment for why `Fit` is
+    /// correct here even though it isn't for a bare leaf widget. Returns
+    /// the wrapper's own variable name, to use as the real widget's
+    /// `parent_expr` in its place.
+    fn emitMarginWrapper(self: *Emitter, parent_expr: []const u8, margin: u16) EmitError![]const u8 {
+        const wrap_var = try std.fmt.allocPrint(self.allocator, "Margin{d}", .{self.counter});
+        self.counter += 1;
+        const layout_var = try std.fmt.allocPrint(self.allocator, "{s}Layout", .{wrap_var});
+        try self.emitLayout(layout_var, parent_expr, .{ .direction = "widgets.TopToBottom", .child_gap = 0, .padding = margin });
+        try self.out.appendSlice(self.allocator, "\t");
+        try self.out.appendSlice(self.allocator, wrap_var);
+        try self.out.appendSlice(self.allocator, ", err := widgets.CreateContainer(");
+        try self.out.appendSlice(self.allocator, layout_var);
+        try self.out.appendSlice(self.allocator, ", false, 0)\n\tif err != nil {\n\t\treturn err\n\t}\n\t_ = ");
+        try self.out.appendSlice(self.allocator, wrap_var);
+        try self.out.appendSlice(self.allocator, "\n");
+        return wrap_var;
+    }
+
     fn emitElement(self: *Emitter, el: Parser.Element, parent_expr: []const u8) EmitError![]const u8 {
+        var attach_expr = parent_expr;
+        if (self.marginFor(el)) |margin| {
+            if (margin > 0) attach_expr = try self.emitMarginWrapper(parent_expr, margin);
+        }
+
         const var_name = try std.fmt.allocPrint(self.allocator, "{s}{d}", .{ el.tag, self.counter });
         self.counter += 1;
         const layout_var = try std.fmt.allocPrint(self.allocator, "{s}Layout", .{var_name});
         var skip_attr: ?[]const u8 = null;
 
         if (std.mem.eql(u8, el.tag, "Container")) {
-            try self.emitLayout(layout_var, parent_expr, .{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 });
+            try self.emitLayout(layout_var, attach_expr, .{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 });
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateContainer(");
@@ -312,7 +391,7 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ", false, 0)\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "Label")) {
             const text = try self.childText(el);
-            try self.emitLayout(layout_var, parent_expr, .{ .width_fixed = 300, .height_fixed = 24 });
+            try self.emitLayout(layout_var, attach_expr, .{ .width_fixed = 300, .height_fixed = 24 });
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateLabel(");
@@ -322,7 +401,7 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "Button")) {
             const text = try self.childText(el);
-            try self.emitLayout(layout_var, parent_expr, .{ .width_fixed = 120, .height_fixed = 32 });
+            try self.emitLayout(layout_var, attach_expr, .{ .width_fixed = 120, .height_fixed = 32 });
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateButton(");
@@ -332,7 +411,7 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "TextField")) {
             const placeholder = (try self.stringAttr(el, "placeholder")) orelse "";
-            try self.emitLayout(layout_var, parent_expr, .{ .width_fixed = 240, .height_fixed = 32 });
+            try self.emitLayout(layout_var, attach_expr, .{ .width_fixed = 240, .height_fixed = 32 });
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateTextField(");
@@ -431,7 +510,7 @@ fn applyEdits(allocator: std.mem.Allocator, src: []const u8, edits: []Edit) ![]c
     return out.toOwnedSlice(allocator);
 }
 
-pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: []const u8, composers: []const Expose.Composer) !struct { output: ?Output, err: ?CodegenError } {
+pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: []const u8, composers: []const Expose.Composer, style_tokens: []const Resolver.ResolvedStyleToken) !struct { output: ?Output, err: ?CodegenError } {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(src, &digest, .{});
     const hash_hex = hexDigest(digest);
@@ -488,7 +567,7 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
             } };
         };
 
-        var emitter: Emitter = .{ .allocator = allocator, .out = &generated };
+        var emitter: Emitter = .{ .allocator = allocator, .out = &generated, .style_tokens = style_tokens };
         _ = emitter.emitElement(node.element, parent_name) catch |e| {
             if (e == error.CodegenError) {
                 const eerr = emitter.err.?;
@@ -541,7 +620,7 @@ test "generates a builder function and a spliced logic file for a single flat co
 
     const found = try Expose.findComposers(allocator, src);
     try std.testing.expect(found.err == null);
-    const result = try generateGo(allocator, "main", src, found.composers);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{});
     try std.testing.expect(result.err == null);
     const out = result.output.?;
 
@@ -570,7 +649,7 @@ test "forwards multiple parameters positionally in the logic file's call-through
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{});
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "func natyvBuildFoo(parent widgets.Container, extra int) error {") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.logic, "return natyvBuildFoo(parent, extra)") != null);
@@ -588,7 +667,7 @@ test "rejects a void composer with a clear error" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{});
     try std.testing.expect(result.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "must have signature") != null);
 }
@@ -605,7 +684,7 @@ test "rejects an unsupported widget kind with a clear error" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{});
     try std.testing.expect(result.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "Slider") != null);
 }
@@ -622,7 +701,7 @@ test "ref={&x} assigns the created widget's address to the named package-level v
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{});
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.CreateTextField(TextField0Layout, \"Your name\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "nameField = &TextField0") != null);
@@ -643,7 +722,7 @@ test "onClick={handler} binds the real .OnClick(...) method, and onClick reads a
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateButton(Button2Layout, \"Save\")") != null);
@@ -662,7 +741,7 @@ test "rejects an unrecognized attribute with a clear error, translated to an abs
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{});
     try std.testing.expect(result.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "bogus") != null);
     try std.testing.expectEqual(@as(u32, 4), result.err.?.line);
@@ -680,7 +759,7 @@ test "rejects <Container> with text content" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{});
     try std.testing.expect(result.output == null);
 }
 
@@ -701,11 +780,127 @@ test "multiple composers each get their own generated function and splice" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{});
     try std.testing.expect(result.err == null);
     const out = result.output.?;
     try std.testing.expect(std.mem.indexOf(u8, out.generated, "func natyvBuildNavBar") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.generated, "func natyvBuildFooter") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.logic, "return natyvBuildNavBar(parent)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.logic, "return natyvBuildFooter(parent)") != null);
+}
+
+test "styles naming a token with margin inserts a wrapper Container, transparent to the real widget's own var name" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Label styles={card}>hi</Label>
+        \\}
+    ;
+    const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "card", .margin = 12 }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Margin0Layout := widgets.ParentID(uint32(parent))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Margin0Layout.Padding = widgets.Padding{Left: 12, Right: 12, Top: 12, Bottom: 12}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Margin0, err := widgets.CreateContainer(Margin0Layout, false, 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Label1Layout := widgets.ParentID(uint32(Margin0))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateLabel(Label1Layout, \"hi\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.ApplyStyle(uint32(Label1), StyleTokens, \"card\")") != null);
+}
+
+test "a token with no margin never inserts a wrapper" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Label styles={plain}>hi</Label>
+        \\}
+    ;
+    const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "plain", .padding = 4 }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateContainer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Label0Layout := widgets.ParentID(uint32(parent))") != null);
+}
+
+test "an unknown style name contributes no margin and causes no error" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Label styles={mystery}>hi</Label>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{});
+    try std.testing.expect(result.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.CreateContainer") == null);
+}
+
+test "later-wins margin resolution across multiple style names, matching ApplyStyle's own merge order" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Label styles={a, b}>hi</Label>
+        \\}
+    ;
+    const tokens = [_]Resolver.ResolvedStyleToken{
+        .{ .name = "a", .margin = 4 },
+        .{ .name = "b", .margin = 20 },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens);
+    try std.testing.expect(result.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "Margin0Layout.Padding = widgets.Padding{Left: 20, Right: 20, Top: 20, Bottom: 20}") != null);
+}
+
+test "nested margins produce a two-level wrapper chain, and ref still binds the real inner widget" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Container styles={outer}>
+        \\    <TextField ref={&nameField} styles={inner} placeholder="hi" />
+        \\  </Container>
+        \\}
+    ;
+    const tokens = [_]Resolver.ResolvedStyleToken{
+        .{ .name = "outer", .margin = 8 },
+        .{ .name = "inner", .margin = 4 },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    // Outer wrapper attaches to the composer's own parent param.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Margin0Layout := widgets.ParentID(uint32(parent))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Margin0Layout.Padding = widgets.Padding{Left: 8, Right: 8, Top: 8, Bottom: 8}") != null);
+    // The real outer Container attaches to that wrapper, not directly to parent.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Container1Layout := widgets.ParentID(uint32(Margin0))") != null);
+    // The inner wrapper attaches to the real outer Container.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Margin2Layout := widgets.ParentID(uint32(Container1))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Margin2Layout.Padding = widgets.Padding{Left: 4, Right: 4, Top: 4, Bottom: 4}") != null);
+    // The real TextField attaches to the inner wrapper, and ref still names the real widget.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "TextField3Layout := widgets.ParentID(uint32(Margin2))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "nameField = &TextField3") != null);
 }
