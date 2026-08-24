@@ -41,10 +41,45 @@ pub const Composer = struct {
     /// (exclusive of both braces) -- handed to `Parser.parseTopLevel`
     /// unmodified by Stage 3b.
     body: []const u8,
+    /// `body`'s own byte offsets into the original file -- Stage 3b splices
+    /// the logic file by cutting exactly `[body_start, body_end)` and
+    /// substituting a call-through statement, leaving everything else in
+    /// the original file untouched.
+    body_start: usize,
+    body_end: usize,
+    /// Raw text of the function's parameter list (between its `(` and
+    /// matching `)`, exclusive) -- copied verbatim into the generated
+    /// builder function's own signature, and used by Stage 3b to extract
+    /// each parameter's own name (the leading identifier of each
+    /// top-level comma-separated segment -- correct even for Go's
+    /// shared-type grouped params like `a, b int`) for the logic file's
+    /// forwarding call.
+    params: []const u8,
+    /// Raw, trimmed text between the parameter list's `)` and the body's
+    /// `{` -- empty for a void composer, `"error"` for the idiomatic
+    /// error-returning shape this codebase's own hand-written composers
+    /// already use (see e.g. `examples/clay-fixture/guest/main.go`'s
+    /// `openModal() error`). Stage 3b supports exactly these two shapes;
+    /// anything else is an accepted, documented v1 gap.
+    return_type: []const u8,
+    /// The exact `[start, end)` span of the literal `expose Name` text
+    /// (not including surrounding whitespace/comments, which Stage 3b
+    /// preserves) -- spliced out of the logic file the same way `body` is
+    /// spliced and replaced.
+    expose_start: usize,
+    expose_end: usize,
     /// Position of the `expose` line that named this composer -- used for
-    /// diagnostics, not the function declaration's own position.
+    /// diagnostics about the composer as a whole (e.g. "no matching func"),
+    /// not the function declaration's own position.
     line: u32,
     col: u32,
+    /// Absolute position of `body`'s own first byte (right after the
+    /// function's opening `{`) -- Stage 3b's codegen uses this (not
+    /// `line`/`col` above) to translate a `Parser`-relative error position
+    /// (always starting at (1, 1) for a fresh `Parser` over just the body
+    /// slice) back to a real position in the original file.
+    body_line: u32,
+    body_col: u32,
 };
 
 pub const ExposeError = struct {
@@ -121,6 +156,50 @@ fn skipInsignificant(cur: *Cursor) void {
     }
 }
 
+/// Skips a leading `package <name>` line and any `import (...)`/
+/// `import "..."` block(s), interspersed with the usual insignificant
+/// (blank/comment) content -- real Go files must start with `package`,
+/// so the `expose` header block realistically begins after it, not
+/// literally at byte 0. A no-op (falls straight through) for a file or
+/// snippet with neither, so this doesn't change behavior for those.
+fn skipPackageAndImports(cur: *Cursor) void {
+    while (true) {
+        skipInsignificant(cur);
+        if (cur.startsWithKeyword("package")) {
+            while (cur.peek()) |c| {
+                cur.advance();
+                if (c == '\n') break;
+            }
+            continue;
+        }
+        if (cur.startsWithKeyword("import")) {
+            for (0.."import".len) |_| cur.advance();
+            skipInsignificant(cur);
+            if (cur.peek() == '(') {
+                var depth: u32 = 1;
+                cur.advance();
+                while (cur.peek()) |b| {
+                    if (b == '(') {
+                        depth += 1;
+                        cur.advance();
+                    } else if (b == ')') {
+                        depth -= 1;
+                        cur.advance();
+                        if (depth == 0) break;
+                    } else cur.advance();
+                }
+            } else {
+                while (cur.peek()) |c| {
+                    cur.advance();
+                    if (c == '\n') break;
+                }
+            }
+            continue;
+        }
+        break;
+    }
+}
+
 fn lineColAt(src: []const u8, offset: usize) struct { line: u32, col: u32 } {
     var line: u32 = 1;
     var col: u32 = 1;
@@ -138,6 +217,8 @@ const ExposedName = struct {
     name: []const u8,
     line: u32,
     col: u32,
+    expose_start: usize,
+    expose_end: usize,
 };
 
 /// Parses the leading `expose <Name>` header block. Returns the list of
@@ -150,9 +231,11 @@ fn parseHeader(allocator: std.mem.Allocator, src: []const u8) !struct { names: [
     var names: std.ArrayList(ExposedName) = .empty;
     errdefer names.deinit(allocator);
 
+    skipPackageAndImports(&cur);
     while (true) {
         skipInsignificant(&cur);
         if (!cur.startsWithKeyword("expose")) break;
+        const expose_start = cur.pos;
         const expose_line = cur.line;
         const expose_col = cur.col;
         for (0.."expose".len) |_| cur.advance();
@@ -182,7 +265,7 @@ fn parseHeader(allocator: std.mem.Allocator, src: []const u8) !struct { names: [
                 return .{ .names = &.{}, .body_search_start = 0, .err = .{ .line = expose_line, .col = expose_col, .message = "duplicate 'expose' for the same name" } };
             }
         }
-        try names.append(allocator, .{ .name = name, .line = expose_line, .col = expose_col });
+        try names.append(allocator, .{ .name = name, .line = expose_line, .col = expose_col, .expose_start = expose_start, .expose_end = cur.pos });
     }
 
     return .{ .names = try names.toOwnedSlice(allocator), .body_search_start = cur.pos, .err = null };
@@ -213,18 +296,48 @@ fn findFuncSignature(src: []const u8, search_start: usize, name: []const u8) ?us
     return null;
 }
 
-/// From the byte right after a function's parameter-list opening `(`
-/// (`paren_open_pos + 1`), finds the byte offset of that function's own
-/// opening `{`. Deliberately does not track paren/bracket depth or
-/// string-literal contents: a real Go function *signature* (parameter
-/// list + optional return type) structurally can never contain a string
-/// literal, and essentially never contains a bare `{` outside the
-/// vanishingly-rare anonymous-struct-type parameter/return case, which is
-/// an accepted, documented v1 gap rather than something worth real
-/// parsing to handle. Comments are still skipped, since
+/// From a function's parameter-list opening `(` (as returned by
+/// `findFuncSignature`), finds the byte offset of the matching `)`.
+/// Tracks paren depth (a param's own type can itself contain parens, e.g.
+/// a callback param `cb func(int) error`) and skips comments (so a
+/// comment containing a stray `)` doesn't end the list early) -- no
+/// string-literal awareness needed, since a real Go parameter list
+/// structurally can never contain one.
+fn findMatchingCloseParen(src: []const u8, open_paren_pos: usize) ?usize {
+    var cur: Cursor = .{ .src = src, .pos = open_paren_pos + 1 };
+    var depth: u32 = 1;
+    while (cur.peek()) |b| {
+        if (b == '/' and (cur.peekAt(1) == '/' or cur.peekAt(1) == '*')) {
+            skipInsignificant(&cur);
+            continue;
+        }
+        switch (b) {
+            '(' => {
+                depth += 1;
+                cur.advance();
+            },
+            ')' => {
+                depth -= 1;
+                if (depth == 0) return cur.pos;
+                cur.advance();
+            },
+            else => cur.advance(),
+        }
+    }
+    return null;
+}
+
+/// From a function's parameter-list closing `)` (as returned by
+/// `findMatchingCloseParen`), finds the byte offset of that function's own
+/// opening `{`. Deliberately does not track brace/bracket depth or
+/// string-literal contents: a real Go function *return type* structurally
+/// can never contain a string literal, and essentially never contains a
+/// bare `{` outside the vanishingly-rare anonymous-struct-type return
+/// case, which is an accepted, documented v1 gap rather than something
+/// worth real parsing to handle. Comments are still skipped, since
 /// `func Foo() /* returns { nothing } */ {` is real, valid Go.
-fn findFuncOpenBrace(src: []const u8, paren_open_pos: usize) ?usize {
-    var cur: Cursor = .{ .src = src, .pos = paren_open_pos + 1 };
+fn findFuncOpenBrace(src: []const u8, close_paren_pos: usize) ?usize {
+    var cur: Cursor = .{ .src = src, .pos = close_paren_pos + 1 };
     while (cur.peek()) |_| {
         skipInsignificant(&cur);
         if (cur.peek() == '{') return cur.pos;
@@ -249,7 +362,14 @@ pub fn findComposers(allocator: std.mem.Allocator, src: []const u8) !struct { co
                 .message = try std.fmt.allocPrint(allocator, "expose '{s}' has no matching 'func {s}(...) {{ ... }}' in this file", .{ exposed.name, exposed.name }),
             } };
         };
-        const open_brace_pos = findFuncOpenBrace(src, paren_pos) orelse {
+        const close_paren_pos = findMatchingCloseParen(src, paren_pos) orelse {
+            return .{ .composers = &.{}, .err = .{
+                .line = exposed.line,
+                .col = exposed.col,
+                .message = try std.fmt.allocPrint(allocator, "could not find the closing ')' of 'func {s}('", .{exposed.name}),
+            } };
+        };
+        const open_brace_pos = findFuncOpenBrace(src, close_paren_pos) orelse {
             return .{ .composers = &.{}, .err = .{
                 .line = exposed.line,
                 .col = exposed.col,
@@ -273,8 +393,16 @@ pub fn findComposers(allocator: std.mem.Allocator, src: []const u8) !struct { co
         try composers.append(allocator, .{
             .name = exposed.name,
             .body = src[open_brace_pos + 1 .. body_end],
+            .body_start = open_brace_pos + 1,
+            .body_end = body_end,
+            .params = src[paren_pos + 1 .. close_paren_pos],
+            .return_type = std.mem.trim(u8, src[close_paren_pos + 1 .. open_brace_pos], " \t\r\n"),
+            .expose_start = exposed.expose_start,
+            .expose_end = exposed.expose_end,
             .line = exposed.line,
             .col = exposed.col,
+            .body_line = pos.line,
+            .body_col = pos.col,
         });
     }
 
@@ -377,6 +505,25 @@ test "reports a real error on a duplicate expose" {
     defer arena.deinit();
     const result = try findComposers(arena.allocator(), src);
     try std.testing.expect(result.err != null);
+}
+
+test "captures params, return type, and exact splice offsets for Stage 3b codegen" {
+    const src =
+        \\expose NavBar
+        \\
+        \\func NavBar(parent widgets.Container) error {
+        \\  <Label>Home</Label>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try findComposers(arena.allocator(), src);
+    try std.testing.expect(result.err == null);
+    const c = result.composers[0];
+    try std.testing.expectEqualStrings("parent widgets.Container", c.params);
+    try std.testing.expectEqualStrings("error", c.return_type);
+    try std.testing.expectEqualStrings(c.body, src[c.body_start..c.body_end]);
+    try std.testing.expectEqualStrings("expose NavBar", src[c.expose_start..c.expose_end]);
 }
 
 test "a func signature's own comment containing a brace doesn't confuse open-brace discovery" {
