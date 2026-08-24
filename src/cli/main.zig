@@ -93,8 +93,8 @@ pub fn main(init: std.process.Init) !void {
 
     // Guest source lives under `guest/`, relative to the *config file's*
     // own directory (not the process's cwd) -- matches every real example
-    // and the same convention `app_wasm` resolution already uses in
-    // `src/main.zig`.
+    // and the same convention `src/main.zig`'s own wasm-path resolution
+    // already uses.
     const config_dir = std.fs.path.dirname(parsed.config_path) orelse ".";
     const guest_dir_path = try std.fs.path.join(allocator, &.{ config_dir, "guest" });
     defer allocator.free(guest_dir_path);
@@ -131,7 +131,7 @@ pub fn main(init: std.process.Init) !void {
             // own design: if nothing that affects the compiled wasm has
             // changed since the last successful wasm_compile, skip
             // straight to bundling instead of redoing prepare/compile.
-            const wasm_basename = std.fs.path.basename(config.value.app_wasm);
+            const wasm_basename = try config.value.wasmFilename(arena_alloc);
             if (try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename)) {
                 std.debug.print("natyv build: {s} -- wasm is already up to date, skipping prepare/wasm_compile\n", .{config.value.name});
             } else {
