@@ -6,10 +6,10 @@
 //! and spawns the dev's own configured compile command (`Compile.zig`),
 //! so it carries none of natyv-core's SDL3/Extism/Clay dependencies.
 //!
-//! `natyv build` currently only runs the `wasm_compile` step (Stage 7)
-//! -- embedding the resulting wasm into a self-contained binary via
-//! `zig build` is the next real sub-step, not yet implemented.
-//! `natyv init` is not yet implemented at all.
+//! `natyv build` runs the full prepare -> wasm_compile -> bundle chain
+//! (skipping straight to bundling when nothing's changed since the last
+//! successful compile), producing a genuinely self-contained binary.
+//! `natyv init` interactively scaffolds a new app in place.
 
 const std = @import("std");
 const Config = @import("Config");
@@ -17,6 +17,7 @@ const Prepare = @import("Prepare");
 const Compile = @import("Compile.zig");
 const BuildCache = @import("BuildCache");
 const Bundle = @import("Bundle.zig");
+const Init = @import("Init");
 const build_options = @import("build_options");
 
 pub const Subcommand = enum { prepare, build, init };
@@ -81,7 +82,27 @@ pub fn main(init: std.process.Init) !void {
     // `init` creates a config, rather than reading one -- it deliberately
     // never reaches the `Config.load` call below.
     if (parsed.subcommand == .init) {
-        std.debug.print("natyv init: not yet implemented\n", .{});
+        std.debug.print("What language is your guest code in? (go): ", .{});
+        var line_buf: [256]u8 = undefined;
+        const language = Init.readLine(io, &line_buf) catch |err| {
+            std.debug.print("natyv init: could not read input: {}\n", .{err});
+            return err;
+        };
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        const cwd_path = try std.process.currentPathAlloc(io, arena_alloc);
+        const cwd_name = std.fs.path.basename(cwd_path);
+        const natyv_core_src = init.environ_map.get("NATYV_CORE_SRC") orelse build_options.natyv_core_src_default;
+
+        const result = try Init.run(arena_alloc, io, language, cwd_name, natyv_core_src, std.Io.Dir.cwd());
+        if (result.err) |e| {
+            std.debug.print("{s}\n", .{e.message});
+            return error.InitFailed;
+        }
+        std.debug.print("natyv init: scaffolded a new Go natyv app here -- try `natyv build` next\n", .{});
         return;
     }
 
