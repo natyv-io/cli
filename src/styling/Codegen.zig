@@ -42,7 +42,7 @@
 //! `.ntx` transpiler, per Quinn's own explicit scoping.
 
 const std = @import("std");
-const Resolver = @import("Resolver.zig");
+const Resolver = @import("Resolver");
 
 /// Resolves a stylesheet gradient anchor to a plain 0..1 shape-space UV
 /// position -- see this file's own doc comment for why this happens here,

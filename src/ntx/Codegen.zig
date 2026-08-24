@@ -127,8 +127,8 @@
 //! attributes, no children of its own -- see `emitChildrenSlot`.
 
 const std = @import("std");
-const Parser = @import("Parser.zig");
-const Expose = @import("Expose.zig");
+const Parser = @import("Parser");
+const Expose = @import("Expose");
 const Resolver = @import("Resolver");
 
 pub const CodegenError = struct {
@@ -713,6 +713,18 @@ fn hexDigest(bytes: [32]u8) [64]u8 {
     return out;
 }
 
+/// The exact hex digest `generateGo` embeds as `// source-hash: <hex>` in
+/// every generated file's header -- exported so Stage 7's `natyv build`
+/// staleness check (hard-error if a `.ntx` source's current hash diverges
+/// from what its already-generated output embeds) computes the *same*
+/// hash over the *current* source bytes, not a reimplementation that
+/// could silently drift from this one.
+pub fn sourceHashHex(src: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(src, &digest, .{});
+    return hexDigest(digest);
+}
+
 /// Translates a `Parser`-relative (line, col) -- relative to a composer's
 /// own body slice, always starting at (1, 1) -- back to an absolute
 /// position in the original file, using the body's own known starting
@@ -750,9 +762,7 @@ fn applyEdits(allocator: std.mem.Allocator, src: []const u8, edits: []Edit) ![]c
 }
 
 pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: []const u8, composers: []const Expose.Composer, style_tokens: []const Resolver.ResolvedStyleToken, uses: []const Expose.UseImport, uses_start: usize, uses_end: usize) !struct { output: ?Output, err: ?CodegenError } {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(src, &digest, .{});
-    const hash_hex = hexDigest(digest);
+    const hash_hex = sourceHashHex(src);
 
     for (uses) |u| {
         if (Emitter.isBuiltinWidgetKind(u.name)) {

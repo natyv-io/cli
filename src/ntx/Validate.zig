@@ -162,8 +162,8 @@ test "validateForExtension dispatches 'go' to the real go list check" {
 // Go cycle unrelated to `.ntx` codegen. Deliberately test-only cross-
 // module use of `Expose`/`Codegen` -- `Validate.zig`'s own production
 // code needs neither.
-const Expose = @import("Expose.zig");
-const Codegen = @import("Codegen.zig");
+const Expose = @import("Expose");
+const Codegen = @import("Codegen");
 const Resolver = @import("Resolver");
 
 test "a genuine mutual component-reuse cycle, produced through the real .ntx uses+codegen pipeline, is caught by goListCheck" {

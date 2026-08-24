@@ -33,7 +33,7 @@
 //! keyword, not redesigning this mechanism.
 
 const std = @import("std");
-const Parser = @import("Parser.zig").Parser;
+const Parser = @import("Parser").Parser;
 
 pub const Composer = struct {
     name: []const u8,

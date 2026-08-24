@@ -1,0 +1,60 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "natyv Stylesheet",
+  "scopeName": "source.ntss",
+  "comment": "Syntax highlighting only, mirroring src/styling/Stylesheet.zig's real grammar (token { field: value }, '//' line comments, no string escapes). Misspelled field names/values are still only caught by `natyv prepare` itself, not by this grammar -- see CLAUDE.md's LSP section for the separate, larger effort that would be needed for live diagnostics.",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#token-name" },
+    { "include": "#field-key" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#punctuation" },
+    { "include": "#bare-ident" }
+  ],
+  "repository": {
+    "comments": {
+      "name": "comment.line.double-slash.ntss",
+      "match": "//.*$"
+    },
+    "token-name": {
+      "comment": "A bare identifier immediately followed by '{' with no colon in between only ever occurs at a top-level `name { ... }` declaration -- every nested block value is always introduced by `key: {`, caught by #field-key first.",
+      "match": "([A-Za-z_][A-Za-z0-9_-]*)\\s*(?=\\{)",
+      "captures": {
+        "1": { "name": "entity.name.type.ntss" }
+      }
+    },
+    "field-key": {
+      "match": "([A-Za-z_][A-Za-z0-9_-]*)\\s*(:)",
+      "captures": {
+        "1": { "name": "support.type.property-name.ntss" },
+        "2": { "name": "punctuation.separator.key-value.ntss" }
+      }
+    },
+    "strings": {
+      "name": "string.quoted.double.ntss",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "comment": "Hex colors (#RRGGBB / #RRGGBBAA) get their own scope so a theme can color-swatch or at least visually distinguish them from plain text values.",
+          "name": "constant.other.color.ntss",
+          "match": "#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?"
+        }
+      ]
+    },
+    "numbers": {
+      "name": "constant.numeric.ntss",
+      "match": "-?[0-9]+(\\.[0-9]+)?"
+    },
+    "punctuation": {
+      "match": "[{}(),]",
+      "name": "punctuation.section.ntss"
+    },
+    "bare-ident": {
+      "comment": "A bare identifier that isn't a token name or field key -- anchor keywords (top/bottomRight/...) and any other bare-word value.",
+      "name": "constant.language.ntss",
+      "match": "[A-Za-z_][A-Za-z0-9_-]*"
+    }
+  }
+}

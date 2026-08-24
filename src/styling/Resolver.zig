@@ -17,7 +17,7 @@
 //! type-checked yet.
 
 const std = @import("std");
-const Stylesheet = @import("Stylesheet.zig");
+const Stylesheet = @import("Stylesheet");
 
 pub const GradientAnchor = enum {
     top,
