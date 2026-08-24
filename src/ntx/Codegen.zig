@@ -1,9 +1,8 @@
-//! `.ntx` tooling Stage 3b (~/.claude/plans/lexical-wishing-penguin.md):
-//! codegen + the real two-file split, for a flat tree (no `ref`/event
-//! handlers, no `margin`, no cross-file component reuse yet -- Stages 4,
-//! 5, and 6 respectively). Consumes `Expose.zig`'s discovered `Composer`s
-//! (each already located and body-bounded) and `Parser.zig`'s tag trees,
-//! and emits:
+//! `.ntx` tooling Stages 3b + 4 (~/.claude/plans/lexical-wishing-penguin.md):
+//! codegen + the real two-file split, plus `ref`/event-handler binding.
+//! `margin` and cross-file component reuse are still Stages 5/6. Consumes
+//! `Expose.zig`'s discovered `Composer`s (each already located and
+//! body-bounded) and `Parser.zig`'s tag trees, and emits:
 //!
 //! - a generated builder file (`DO NOT EDIT`, real `widgets.CreateX(...)`
 //!   calls wired via `widgets.ParentID(uint32(...))`, matching the real
@@ -25,14 +24,27 @@
 //! there's no way to do that from a void function, and no real precedent
 //! for a void one. A void composer is an accepted, documented v1 gap.
 //!
-//! **Deliberately narrow widget-kind scope**: only `Container` and
-//! `Label` -- the two attribute-light kinds needed to prove the whole
-//! mechanism end-to-end (nesting, static `styles`, parent wiring, the
-//! two-file split, the content-hash header). Every other real widget kind
+//! **`ref={&target}`** (Stage 4): `target` is a plain identifier naming a
+//! package-level `*WidgetType` variable declared by hand elsewhere in the
+//! logic file -- `emitRefAssign` assigns `target = &varName` right after
+//! creation, giving any handler declared anywhere else in the same file a
+//! stable way to read this widget later, the same closed-over-slot
+//! property React's own `ref` has.
+//!
+//! **`on[A-Z]...` attributes** (Stage 4, `onClick`, `onChange`, `onBlur`,
+//! ...): bind to the real Go method of the same capitalized name
+//! (`onClick` -> `.OnClick(handler)`) via a plain string transform, not a
+//! hardcoded per-widget-kind method table -- whether a given widget kind
+//! actually *has* that method is deliberately left for Go's own compiler
+//! to catch as an undefined-method error, not re-validated here.
+//!
+//! **Widget-kind scope, still deliberately narrow but grown for Stage 4**:
+//! `Container`, `Label`, `Button`, `TextField` -- enough to prove the
+//! whole mechanism end-to-end including a real ref-bound `TextField` read
+//! by a `Button`'s `onClick` handler. Every other real widget kind still
 //! errors clearly (`"widget kind 'X' is not yet supported"`) rather than
-//! silently misbehaving. Extending this to natyv's ~30 other widget kinds
-//! is real, same-pattern, incremental follow-up work -- not automatic
-//! just because the mechanism exists.
+//! silently misbehaving; extending this to natyv's ~25 remaining widget
+//! kinds is real, same-pattern, incremental follow-up work.
 //!
 //! `ref`/dynamic `styles` expressions and any other braced attribute are
 //! also clear codegen errors here, not silently dropped -- they're Stage
@@ -121,15 +133,39 @@ const Emitter = struct {
         return error.CodegenError;
     }
 
-    fn labelText(self: *Emitter, el: Parser.Element) EmitError![]const u8 {
+    /// Concatenates every direct text child, erroring on a nested element
+    /// -- shared by `Label` and `Button`, both of which take their real
+    /// text/label param from child content, not an attribute (matching
+    /// every real design-doc example, e.g. `<Button ...>Save</Button>`).
+    fn childText(self: *Emitter, el: Parser.Element) EmitError![]const u8 {
         var text: std.ArrayList(u8) = .empty;
         for (el.children) |child| {
             switch (child) {
                 .text => |t| try text.appendSlice(self.allocator, t),
-                .element => return self.fail(el.line, el.col, "<Label> doesn't accept nested elements", .{}),
+                .element => return self.fail(el.line, el.col, "<{s}> doesn't accept nested elements", .{el.tag}),
             }
         }
         return text.toOwnedSlice(self.allocator);
+    }
+
+    fn consumesTextChildren(tag: []const u8) bool {
+        return std.mem.eql(u8, tag, "Label") or std.mem.eql(u8, tag, "Button");
+    }
+
+    /// Looks up a plain (non-braced) string attribute by name -- e.g.
+    /// `TextField`'s `placeholder="..."`, a real per-tag constructor
+    /// param, not a generic post-creation attribute like `styles`/`ref`/
+    /// an event handler. Returns `null` if absent (caller supplies its
+    /// own default); errors if present but not a plain string.
+    fn stringAttr(self: *Emitter, el: Parser.Element, name: []const u8) EmitError!?[]const u8 {
+        for (el.attrs) |attr| {
+            if (!std.mem.eql(u8, attr.name, name)) continue;
+            switch (attr.value) {
+                .string_literal => |s| return s,
+                else => return self.fail(attr.line, attr.col, "'{s}' must be a plain string, e.g. {s}=\"...\"", .{ name, name }),
+            }
+        }
+        return null;
     }
 
     fn emitApplyStyle(self: *Emitter, var_name: []const u8, names: [][]const u8) EmitError!void {
@@ -143,9 +179,50 @@ const Emitter = struct {
         try self.out.appendSlice(self.allocator, "); err != nil {\n\t\treturn err\n\t}\n");
     }
 
+    /// `ref={&target}` -- `target` (already stripped of its leading `&` by
+    /// `Parser`) is a plain identifier naming a package-level `*WidgetType`
+    /// variable declared by hand elsewhere in the logic file, untouched by
+    /// natyv. Assigning `target = &varName` here is what lets a handler
+    /// declared anywhere else in the same file read this widget later --
+    /// same "closed-over stable slot" property React's own `ref` has.
+    /// Real type mismatches (e.g. a `*widgets.Label` ref on a `<Button>`)
+    /// are deliberately left for Go's own compiler to catch -- natyv
+    /// doesn't re-implement Go's type checker to pre-validate this.
+    fn emitRefAssign(self: *Emitter, target: []const u8, var_name: []const u8) EmitError!void {
+        try self.out.appendSlice(self.allocator, "\t");
+        try self.out.appendSlice(self.allocator, target);
+        try self.out.appendSlice(self.allocator, " = &");
+        try self.out.appendSlice(self.allocator, var_name);
+        try self.out.appendSlice(self.allocator, "\n");
+    }
+
+    /// An `on[A-Z]...` attribute (`onClick`, `onChange`, `onBlur`, ...)
+    /// binds to the real Go method of the same name (`onClick` ->
+    /// `.OnClick(...)`) -- a plain capitalize-first-letter transform, not
+    /// a hardcoded per-widget-kind method table. Whether a given widget
+    /// kind actually *has* that method (e.g. `<Label onClick=...>` doesn't)
+    /// is deliberately left for Go's own compiler to catch as an undefined-
+    /// method error -- natyv doesn't duplicate the SDK's own method set
+    /// here just to pre-validate it.
+    fn isEventAttr(name: []const u8) bool {
+        return name.len > 2 and name[0] == 'o' and name[1] == 'n' and std.ascii.isUpper(name[2]);
+    }
+
+    fn emitEventBinding(self: *Emitter, var_name: []const u8, attr_name: []const u8, handler_expr: []const u8) EmitError!void {
+        try self.out.appendSlice(self.allocator, "\t");
+        try self.out.appendSlice(self.allocator, var_name);
+        try self.out.appendSlice(self.allocator, ".On");
+        try self.out.append(self.allocator, attr_name[2]); // already uppercase, see isEventAttr
+        try self.out.appendSlice(self.allocator, attr_name[3..]);
+        try self.out.appendSlice(self.allocator, "(");
+        try self.out.appendSlice(self.allocator, handler_expr);
+        try self.out.appendSlice(self.allocator, ")\n");
+    }
+
     fn emitElement(self: *Emitter, el: Parser.Element, parent_expr: []const u8) EmitError![]const u8 {
         const var_name = try std.fmt.allocPrint(self.allocator, "{s}{d}", .{ el.tag, self.counter });
         self.counter += 1;
+        var skip_attr: ?[]const u8 = null;
 
         if (std.mem.eql(u8, el.tag, "Container")) {
             try self.out.appendSlice(self.allocator, "\t");
@@ -154,7 +231,7 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, parent_expr);
             try self.out.appendSlice(self.allocator, ")), false, 0)\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "Label")) {
-            const text = try self.labelText(el);
+            const text = try self.childText(el);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateLabel(widgets.ParentID(uint32(");
@@ -162,6 +239,25 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, ")), ");
             try writeGoStringLiteral(self.out, self.allocator, text);
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+        } else if (std.mem.eql(u8, el.tag, "Button")) {
+            const text = try self.childText(el);
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateButton(widgets.ParentID(uint32(");
+            try self.out.appendSlice(self.allocator, parent_expr);
+            try self.out.appendSlice(self.allocator, ")), ");
+            try writeGoStringLiteral(self.out, self.allocator, text);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+        } else if (std.mem.eql(u8, el.tag, "TextField")) {
+            const placeholder = (try self.stringAttr(el, "placeholder")) orelse "";
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateTextField(widgets.ParentID(uint32(");
+            try self.out.appendSlice(self.allocator, parent_expr);
+            try self.out.appendSlice(self.allocator, ")), ");
+            try writeGoStringLiteral(self.out, self.allocator, placeholder);
+            try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attr = "placeholder";
         } else {
             return self.fail(el.line, el.col, "widget kind '{s}' is not yet supported by natyv prepare's .ntx codegen", .{el.tag});
         }
@@ -169,24 +265,35 @@ const Emitter = struct {
         // id again -- Go rejects a declared-and-unused local outright, so
         // this blank-identifier use is required for real compilability,
         // not just style. Harmless even when the id *is* used again below
-        // (ApplyStyle, or as a child's parent_expr) -- Go permits `_ = x`
-        // alongside a later real use of the same variable.
+        // (ApplyStyle, ref, an event binding, or as a child's parent_expr)
+        // -- Go permits `_ = x` alongside a later real use of `x`.
         try self.out.appendSlice(self.allocator, "\t_ = ");
         try self.out.appendSlice(self.allocator, var_name);
         try self.out.appendSlice(self.allocator, "\n");
 
         for (el.attrs) |attr| {
+            if (skip_attr != null and std.mem.eql(u8, attr.name, skip_attr.?)) continue;
             if (std.mem.eql(u8, attr.name, "styles")) {
                 switch (attr.value) {
                     .styles => |names| try self.emitApplyStyle(var_name, names),
-                    else => return self.fail(attr.line, attr.col, "dynamic 'styles' expressions aren't supported until Stage 4", .{}),
+                    else => return self.fail(attr.line, attr.col, "dynamic 'styles' expressions aren't supported until a future stage", .{}),
+                }
+            } else if (std.mem.eql(u8, attr.name, "ref")) {
+                switch (attr.value) {
+                    .ref => |target| try self.emitRefAssign(target, var_name),
+                    else => return self.fail(attr.line, attr.col, "malformed 'ref' attribute", .{}),
+                }
+            } else if (isEventAttr(attr.name)) {
+                switch (attr.value) {
+                    .expr => |handler| try self.emitEventBinding(var_name, attr.name, handler),
+                    else => return self.fail(attr.line, attr.col, "'{s}' must be a real handler expression, e.g. {s}={{handleX}}", .{ attr.name, attr.name }),
                 }
             } else {
-                return self.fail(attr.line, attr.col, "attribute '{s}' isn't supported until Stage 4", .{attr.name});
+                return self.fail(attr.line, attr.col, "attribute '{s}' isn't supported yet", .{attr.name});
             }
         }
 
-        if (!std.mem.eql(u8, el.tag, "Label")) {
+        if (!consumesTextChildren(el.tag)) {
             for (el.children) |child| {
                 switch (child) {
                     .text => return self.fail(el.line, el.col, "<{s}> doesn't accept text content", .{el.tag}),
@@ -419,12 +526,52 @@ test "rejects an unsupported widget kind with a clear error" {
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "Slider") != null);
 }
 
-test "rejects ref (Stage 4's job) with a clear error, translated to an absolute file position" {
+test "ref={&x} assigns the created widget's address to the named package-level variable" {
+    const src =
+        \\expose Form
+        \\
+        \\func Form(parent widgets.Container) error {
+        \\  <TextField ref={&nameField} placeholder="Your name" />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers);
+    try std.testing.expect(result.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.CreateTextField(widgets.ParentID(uint32(parent)), \"Your name\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "nameField = &TextField0") != null);
+}
+
+test "onClick={handler} binds the real .OnClick(...) method, and onClick reads a ref-bound sibling" {
+    const src =
+        \\expose Form
+        \\
+        \\func Form(parent widgets.Container) error {
+        \\  <Container>
+        \\    <TextField ref={&nameField} placeholder="Your name" />
+        \\    <Button onClick={handleSave}>Save</Button>
+        \\  </Container>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateButton(widgets.ParentID(uint32(Container0)), \"Save\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Button2.OnClick(handleSave)") != null);
+}
+
+test "rejects an unrecognized attribute with a clear error, translated to an absolute file position" {
     const src =
         \\expose Foo
         \\
         \\func Foo(parent widgets.Container) error {
-        \\  <Label ref={&x}>hi</Label>
+        \\  <Label bogus={1}>hi</Label>
         \\}
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -433,7 +580,7 @@ test "rejects ref (Stage 4's job) with a clear error, translated to an absolute 
     const found = try Expose.findComposers(allocator, src);
     const result = try generateGo(allocator, "main", src, found.composers);
     try std.testing.expect(result.output == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "ref") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "bogus") != null);
     try std.testing.expectEqual(@as(u32, 4), result.err.?.line);
 }
 
