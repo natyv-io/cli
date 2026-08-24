@@ -15,6 +15,7 @@ const std = @import("std");
 const Config = @import("Config");
 const Prepare = @import("Prepare");
 const Compile = @import("Compile.zig");
+const BuildCache = @import("BuildCache");
 
 pub const Subcommand = enum { prepare, build, init };
 
@@ -114,20 +115,42 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("natyv prepare: {s} -- transpiled {d} file(s)\n", .{ config.value.name, outcome.processed });
         },
         .build => {
-            var guest_dir = std.Io.Dir.cwd().openDir(io, guest_dir_path, .{}) catch |err| {
+            var guest_dir = std.Io.Dir.cwd().openDir(io, guest_dir_path, .{ .iterate = true }) catch |err| {
                 std.debug.print("natyv build: could not open '{s}': {}\n", .{ guest_dir_path, err });
                 return err;
             };
             defer guest_dir.close(io);
 
-            std.debug.print("natyv build: {s} -- running wasm_compile...\n", .{config.value.name});
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
-            const compile_result = try Compile.run(arena.allocator(), io, config.value.wasm_compile, guest_dir);
+            const arena_alloc = arena.allocator();
+
+            // Checked once, up front, before running anything -- Quinn's
+            // own design: if nothing that affects the compiled wasm has
+            // changed since the last successful wasm_compile, skip
+            // straight to bundling instead of redoing prepare/compile.
+            const wasm_basename = std.fs.path.basename(config.value.app_wasm);
+            if (try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename)) {
+                std.debug.print("natyv build: {s} -- wasm is already up to date, skipping prepare/wasm_compile (bundling not yet implemented)\n", .{config.value.name});
+                return;
+            }
+
+            const outcome = try Prepare.run(arena_alloc, io, guest_dir);
+            if (outcome.err) |e| {
+                std.debug.print("{s}\n", .{e.message});
+                return error.PrepareFailed;
+            }
+
+            std.debug.print("natyv build: {s} -- running wasm_compile...\n", .{config.value.name});
+            const compile_result = try Compile.run(arena_alloc, io, config.value.wasm_compile, guest_dir);
             if (compile_result.err) |e| {
                 std.debug.print("{s}\n", .{e.message});
                 return error.WasmCompileFailed;
             }
+
+            const new_hash = try BuildCache.computeSourceHash(arena_alloc, io, guest_dir);
+            try BuildCache.writeCachedHash(io, guest_dir, new_hash);
+
             std.debug.print("natyv build: {s} -- wasm_compile succeeded (bundling not yet implemented)\n", .{config.value.name});
         },
         .init => unreachable, // handled above
