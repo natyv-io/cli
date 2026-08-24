@@ -88,6 +88,21 @@ pub const ExposeError = struct {
     message: []const u8,
 };
 
+/// One name bound by a `uses (...)` block (Stage 6a, confirmed 2026-08-24
+/// -- replaces the earlier dotted-tag-as-call-site design: a component's
+/// import path now lives in one declared block, not encoded into every
+/// tag name that uses it). `{ Card, UserCard } from "pkg/path"` produces
+/// one `UseImport` per name, all sharing that entry's `path` -- flattened
+/// this way (rather than kept grouped) because every real lookup Codegen
+/// needs is "given this bare tag name, what's its import path", never
+/// "what names does this path expose".
+pub const UseImport = struct {
+    name: []const u8,
+    path: []const u8,
+    line: u32,
+    col: u32,
+};
+
 fn isIdentStart(b: u8) bool {
     return std.ascii.isAlphabetic(b) or b == '_';
 }
@@ -200,6 +215,111 @@ fn skipPackageAndImports(cur: *Cursor) void {
     }
 }
 
+/// Scans a double-quoted string starting at the opening `"`, returning its
+/// raw content. No escape-sequence support -- a real import path
+/// structurally never needs one, unlike a Go string literal in general
+/// (`Parser.zig`'s own `scanQuotedString` handles that harder case for
+/// attribute values; this is the narrower, `uses`-only need).
+fn scanQuotedPath(cur: *Cursor) ?[]const u8 {
+    if (cur.peek() != '"') return null;
+    cur.advance();
+    const start = cur.pos;
+    while (cur.peek()) |b| {
+        if (b == '"') {
+            const content = cur.src[start..cur.pos];
+            cur.advance();
+            return content;
+        }
+        if (b == '\n') return null;
+        cur.advance();
+    }
+    return null;
+}
+
+/// Parses an optional `uses (...)` block -- Stage 6a's real import
+/// mechanism (~/.claude/plans/lexical-wishing-penguin.md), confirmed by
+/// Quinn 2026-08-24 to replace encoding a component's package directly
+/// into its tag name (`<components.Card/>`) with a declared block, so
+/// markup only ever uses bare tag names (`<Card/>`), mirroring a real
+/// `import { Card } from "..."` in JS/TS-family languages. Sits between
+/// `package`/`import` and the `expose` line(s) -- optional, at most one
+/// block per file (v1 scope; multiplicity wasn't asked for and isn't
+/// obviously useful the way multiple `expose` lines are). Each line
+/// inside is `{ Name (, Name)* } from "path"`; every name across every
+/// line must be unique (checked here) -- collision with a same-file
+/// `expose`d composer name is checked by the caller, which has both
+/// lists: collision with a *built-in widget kind* name is checked by
+/// `Codegen.zig`, which owns that list, not duplicated here.
+fn parseUsesBlock(allocator: std.mem.Allocator, cur: *Cursor) !struct { uses: []UseImport, block_start: usize, block_end: usize, err: ?ExposeError } {
+    var uses: std.ArrayList(UseImport) = .empty;
+    errdefer uses.deinit(allocator);
+
+    skipInsignificant(cur);
+    if (!cur.startsWithKeyword("uses")) return .{ .uses = &.{}, .block_start = 0, .block_end = 0, .err = null };
+    // Captured *after* skipping leading whitespace/comments, so the
+    // spliced-out span (Stage 3b's edit mechanism, reused here) is
+    // exactly the `uses (...)` text itself, matching how `expose_start`/
+    // `expose_end` below already exclude their own surrounding
+    // whitespace.
+    const block_start = cur.pos;
+    for (0.."uses".len) |_| cur.advance();
+    skipInsignificant(cur);
+    if (cur.peek() != '(') return .{ .uses = &.{}, .block_start = 0, .block_end = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected '(' after 'uses'" } };
+    cur.advance();
+
+    while (true) {
+        skipInsignificant(cur);
+        if (cur.peek() == ')') {
+            cur.advance();
+            break;
+        }
+        const entry_line = cur.line;
+        const entry_col = cur.col;
+        if (cur.peek() != '{') return .{ .uses = &.{}, .block_start = 0, .block_end = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected '{' to start a 'uses' entry, e.g. { Card } from \"...\"" } };
+        cur.advance();
+
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(allocator);
+        while (true) {
+            skipInsignificant(cur);
+            const name_start = cur.pos;
+            const nb = cur.peek() orelse return .{ .uses = &.{}, .block_start = 0, .block_end = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected a component name inside 'uses { ... }'" } };
+            if (!isIdentStart(nb)) return .{ .uses = &.{}, .block_start = 0, .block_end = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected a component name inside 'uses { ... }'" } };
+            cur.advance();
+            while (cur.peek()) |c| {
+                if (!isIdentCont(c)) break;
+                cur.advance();
+            }
+            try names.append(allocator, cur.src[name_start..cur.pos]);
+            skipInsignificant(cur);
+            if (cur.peek() == ',') {
+                cur.advance();
+                continue;
+            }
+            break;
+        }
+        if (cur.peek() != '}') return .{ .uses = &.{}, .block_start = 0, .block_end = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected '}' to close a 'uses' entry" } };
+        cur.advance();
+
+        skipInsignificant(cur);
+        if (!cur.startsWithKeyword("from")) return .{ .uses = &.{}, .block_start = 0, .block_end = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected 'from \"path\"' after '{...}' in a 'uses' entry" } };
+        for (0.."from".len) |_| cur.advance();
+        skipInsignificant(cur);
+        const path = scanQuotedPath(cur) orelse return .{ .uses = &.{}, .block_start = 0, .block_end = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected a quoted import path after 'from'" } };
+
+        for (names.items) |name| {
+            for (uses.items) |existing| {
+                if (std.mem.eql(u8, existing.name, name)) {
+                    return .{ .uses = &.{}, .block_start = 0, .block_end = 0, .err = .{ .line = entry_line, .col = entry_col, .message = try std.fmt.allocPrint(allocator, "component name '{s}' is already imported (via 'uses')", .{name}) } };
+                }
+            }
+            try uses.append(allocator, .{ .name = name, .path = path, .line = entry_line, .col = entry_col });
+        }
+    }
+
+    return .{ .uses = try uses.toOwnedSlice(allocator), .block_start = block_start, .block_end = cur.pos, .err = null };
+}
+
 fn lineColAt(src: []const u8, offset: usize) struct { line: u32, col: u32 } {
     var line: u32 = 1;
     var col: u32 = 1;
@@ -221,17 +341,23 @@ const ExposedName = struct {
     expose_end: usize,
 };
 
-/// Parses the leading `expose <Name>` header block. Returns the list of
-/// exposed names (each with the position of its `expose` line) and the
-/// byte offset where the header ends -- composer function declarations
-/// are only ever searched for from that offset onward, so a `func Name(`
-/// mentioned in a leading comment can never be mistaken for a real match.
-fn parseHeader(allocator: std.mem.Allocator, src: []const u8) !struct { names: []ExposedName, body_search_start: usize, err: ?ExposeError } {
+/// Parses the leading `expose <Name>` header block, plus an optional
+/// preceding `uses (...)` block (Stage 6a). Returns the list of exposed
+/// names (each with the position of its `expose` line), the `uses`
+/// bindings, and the byte offset where the header ends -- composer
+/// function declarations are only ever searched for from that offset
+/// onward, so a `func Name(` mentioned in a leading comment can never be
+/// mistaken for a real match.
+fn parseHeader(allocator: std.mem.Allocator, src: []const u8) !struct { names: []ExposedName, uses: []UseImport, uses_start: usize, uses_end: usize, body_search_start: usize, err: ?ExposeError } {
     var cur: Cursor = .{ .src = src };
     var names: std.ArrayList(ExposedName) = .empty;
     errdefer names.deinit(allocator);
 
     skipPackageAndImports(&cur);
+
+    const parsed_uses = try parseUsesBlock(allocator, &cur);
+    if (parsed_uses.err) |e| return .{ .names = &.{}, .uses = &.{}, .uses_start = 0, .uses_end = 0, .body_search_start = 0, .err = e };
+
     while (true) {
         skipInsignificant(&cur);
         if (!cur.startsWithKeyword("expose")) break;
@@ -240,9 +366,9 @@ fn parseHeader(allocator: std.mem.Allocator, src: []const u8) !struct { names: [
         const expose_col = cur.col;
         for (0.."expose".len) |_| cur.advance();
 
-        const ws = cur.peek() orelse return .{ .names = &.{}, .body_search_start = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected a name after 'expose'" } };
+        const ws = cur.peek() orelse return .{ .names = &.{}, .uses = &.{}, .uses_start = 0, .uses_end = 0, .body_search_start = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected a name after 'expose'" } };
         if (ws != ' ' and ws != '\t') {
-            return .{ .names = &.{}, .body_search_start = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected whitespace after 'expose'" } };
+            return .{ .names = &.{}, .uses = &.{}, .uses_start = 0, .uses_end = 0, .body_search_start = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected whitespace after 'expose'" } };
         }
         while (cur.peek()) |b| {
             if (b != ' ' and b != '\t') break;
@@ -250,9 +376,9 @@ fn parseHeader(allocator: std.mem.Allocator, src: []const u8) !struct { names: [
         }
 
         const name_start = cur.pos;
-        const nb = cur.peek() orelse return .{ .names = &.{}, .body_search_start = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected a name after 'expose'" } };
+        const nb = cur.peek() orelse return .{ .names = &.{}, .uses = &.{}, .uses_start = 0, .uses_end = 0, .body_search_start = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected a name after 'expose'" } };
         if (!isIdentStart(nb)) {
-            return .{ .names = &.{}, .body_search_start = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected a name after 'expose'" } };
+            return .{ .names = &.{}, .uses = &.{}, .uses_start = 0, .uses_end = 0, .body_search_start = 0, .err = .{ .line = cur.line, .col = cur.col, .message = "expected a name after 'expose'" } };
         }
         cur.advance();
         while (cur.peek()) |c| {
@@ -262,13 +388,13 @@ fn parseHeader(allocator: std.mem.Allocator, src: []const u8) !struct { names: [
         const name = src[name_start..cur.pos];
         for (names.items) |existing| {
             if (std.mem.eql(u8, existing.name, name)) {
-                return .{ .names = &.{}, .body_search_start = 0, .err = .{ .line = expose_line, .col = expose_col, .message = "duplicate 'expose' for the same name" } };
+                return .{ .names = &.{}, .uses = &.{}, .uses_start = 0, .uses_end = 0, .body_search_start = 0, .err = .{ .line = expose_line, .col = expose_col, .message = "duplicate 'expose' for the same name" } };
             }
         }
         try names.append(allocator, .{ .name = name, .line = expose_line, .col = expose_col, .expose_start = expose_start, .expose_end = cur.pos });
     }
 
-    return .{ .names = try names.toOwnedSlice(allocator), .body_search_start = cur.pos, .err = null };
+    return .{ .names = try names.toOwnedSlice(allocator), .uses = parsed_uses.uses, .uses_start = parsed_uses.block_start, .uses_end = parsed_uses.block_end, .body_search_start = cur.pos, .err = null };
 }
 
 /// Finds `func <name>(` at or after `search_start`, verifying real word
@@ -347,30 +473,42 @@ fn findFuncOpenBrace(src: []const u8, close_paren_pos: usize) ?usize {
     return null;
 }
 
-pub fn findComposers(allocator: std.mem.Allocator, src: []const u8) !struct { composers: []Composer, err: ?ExposeError } {
+pub fn findComposers(allocator: std.mem.Allocator, src: []const u8) !struct { composers: []Composer, uses: []UseImport, uses_start: usize, uses_end: usize, err: ?ExposeError } {
     const header = try parseHeader(allocator, src);
-    if (header.err) |e| return .{ .composers = &.{}, .err = e };
+    if (header.err) |e| return .{ .composers = &.{}, .uses = &.{}, .uses_start = 0, .uses_end = 0, .err = e };
+
+    for (header.uses) |use| {
+        for (header.names) |exposed| {
+            if (std.mem.eql(u8, use.name, exposed.name)) {
+                return .{ .composers = &.{}, .uses = &.{}, .uses_start = 0, .uses_end = 0, .err = .{
+                    .line = use.line,
+                    .col = use.col,
+                    .message = try std.fmt.allocPrint(allocator, "'{s}' is both a 'uses' import and a composer exposed in this file -- pick one name", .{use.name}),
+                } };
+            }
+        }
+    }
 
     var composers: std.ArrayList(Composer) = .empty;
     errdefer composers.deinit(allocator);
 
     for (header.names) |exposed| {
         const paren_pos = findFuncSignature(src, header.body_search_start, exposed.name) orelse {
-            return .{ .composers = &.{}, .err = .{
+            return .{ .composers = &.{}, .uses = &.{}, .uses_start = 0, .uses_end = 0, .err = .{
                 .line = exposed.line,
                 .col = exposed.col,
                 .message = try std.fmt.allocPrint(allocator, "expose '{s}' has no matching 'func {s}(...) {{ ... }}' in this file", .{ exposed.name, exposed.name }),
             } };
         };
         const close_paren_pos = findMatchingCloseParen(src, paren_pos) orelse {
-            return .{ .composers = &.{}, .err = .{
+            return .{ .composers = &.{}, .uses = &.{}, .uses_start = 0, .uses_end = 0, .err = .{
                 .line = exposed.line,
                 .col = exposed.col,
                 .message = try std.fmt.allocPrint(allocator, "could not find the closing ')' of 'func {s}('", .{exposed.name}),
             } };
         };
         const open_brace_pos = findFuncOpenBrace(src, close_paren_pos) orelse {
-            return .{ .composers = &.{}, .err = .{
+            return .{ .composers = &.{}, .uses = &.{}, .uses_start = 0, .uses_end = 0, .err = .{
                 .line = exposed.line,
                 .col = exposed.col,
                 .message = try std.fmt.allocPrint(allocator, "could not find the opening '{{' of 'func {s}(...)'", .{exposed.name}),
@@ -385,7 +523,7 @@ pub fn findComposers(allocator: std.mem.Allocator, src: []const u8) !struct { co
         const body_end = body_parser.scanUntilMatchingBrace(pos.line, pos.col) catch |e| {
             if (e == error.ParseError) {
                 const perr = body_parser.last_error.?;
-                return .{ .composers = &.{}, .err = .{ .line = perr.line, .col = perr.col, .message = perr.message } };
+                return .{ .composers = &.{}, .uses = &.{}, .uses_start = 0, .uses_end = 0, .err = .{ .line = perr.line, .col = perr.col, .message = perr.message } };
             }
             return e;
         };
@@ -406,7 +544,7 @@ pub fn findComposers(allocator: std.mem.Allocator, src: []const u8) !struct { co
         });
     }
 
-    return .{ .composers = try composers.toOwnedSlice(allocator), .err = null };
+    return .{ .composers = try composers.toOwnedSlice(allocator), .uses = header.uses, .uses_start = header.uses_start, .uses_end = header.uses_end, .err = null };
 }
 
 test "finds a single exposed composer's body after a leading comment block" {
@@ -539,4 +677,112 @@ test "a func signature's own comment containing a brace doesn't confuse open-bra
     const result = try findComposers(arena.allocator(), src);
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.composers[0].body, "hi") != null);
+}
+
+test "parses a 'uses' block with multiple entries and multiple names per entry" {
+    const src =
+        \\package main
+        \\
+        \\import "natyv/sdk/widgets"
+        \\
+        \\uses (
+        \\  { Card, UserCard } from "natyv/ntx-components-guest/components"
+        \\  { Badge } from "natyv/ntx-badges-guest/badges"
+        \\)
+        \\
+        \\expose Page
+        \\
+        \\func Page(parent widgets.Container) error {
+        \\  <Label>hi</Label>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try findComposers(arena.allocator(), src);
+    try std.testing.expect(result.err == null);
+    try std.testing.expectEqual(@as(usize, 3), result.uses.len);
+    try std.testing.expectEqualStrings("Card", result.uses[0].name);
+    try std.testing.expectEqualStrings("natyv/ntx-components-guest/components", result.uses[0].path);
+    try std.testing.expectEqualStrings("UserCard", result.uses[1].name);
+    try std.testing.expectEqualStrings("natyv/ntx-components-guest/components", result.uses[1].path);
+    try std.testing.expectEqualStrings("Badge", result.uses[2].name);
+    try std.testing.expectEqualStrings("natyv/ntx-badges-guest/badges", result.uses[2].path);
+}
+
+test "a file with no 'uses' block yields zero uses entries, not an error" {
+    const src =
+        \\expose Page
+        \\
+        \\func Page(parent widgets.Container) error {
+        \\  <Label>hi</Label>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try findComposers(arena.allocator(), src);
+    try std.testing.expect(result.err == null);
+    try std.testing.expectEqual(@as(usize, 0), result.uses.len);
+}
+
+test "reports a real error on a duplicate name across 'uses' entries" {
+    const src =
+        \\uses (
+        \\  { Card } from "a/components"
+        \\  { Card } from "b/components"
+        \\)
+        \\
+        \\expose Page
+        \\
+        \\func Page(parent widgets.Container) error {
+        \\  <Label>hi</Label>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try findComposers(arena.allocator(), src);
+    try std.testing.expect(result.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "Card") != null);
+}
+
+test "reports a real error when a 'uses' name collides with a same-file exposed composer" {
+    const src =
+        \\uses (
+        \\  { Header } from "a/components"
+        \\)
+        \\
+        \\expose Header
+        \\expose Page
+        \\
+        \\func Header(parent uint32) error {
+        \\  <Label>hi</Label>
+        \\}
+        \\
+        \\func Page(parent widgets.Container) error {
+        \\  <Label>hi</Label>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try findComposers(arena.allocator(), src);
+    try std.testing.expect(result.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "Header") != null);
+}
+
+test "reports a clear error on a malformed 'uses' block (missing 'from')" {
+    const src =
+        \\uses (
+        \\  { Card } "a/components"
+        \\)
+        \\
+        \\expose Page
+        \\
+        \\func Page(parent widgets.Container) error {
+        \\  <Label>hi</Label>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try findComposers(arena.allocator(), src);
+    try std.testing.expect(result.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "from") != null);
 }

@@ -170,6 +170,22 @@ pub const Parser = struct {
         return self.parseIdentRaw(isIdentCont, "an identifier");
     }
 
+    /// A tag name is a plain identifier, optionally followed by `.` and a
+    /// second identifier (`pkg.Name`) -- `.ntx` tooling Stage 6a's
+    /// component-reuse convention (~/.claude/plans/lexical-wishing-penguin.md):
+    /// a dotted tag calls a composer exposed by another package, forwarded
+    /// verbatim as a qualified Go selector. Only tag names get this;
+    /// attribute names/`ref` targets/etc. still use plain `parseIdent`.
+    fn parseTagName(self: *Parser) error{ParseError}![]const u8 {
+        const start = self.pos;
+        _ = try self.parseIdentRaw(isIdentCont, "a tag name");
+        if (self.peek() == '.') {
+            self.advance();
+            _ = try self.parseIdentRaw(isIdentCont, "an identifier after '.'");
+        }
+        return self.src[start..self.pos];
+    }
+
     fn expectByte(self: *Parser, b: u8) error{ParseError}!void {
         if (self.peek() != b) {
             return self.failHere("expected '{c}', found {s}", .{ b, if (self.peek()) |c| &[_]u8{c} else "end of input" });
@@ -191,7 +207,7 @@ pub const Parser = struct {
         const start_line = self.line;
         const start_col = self.col;
         try self.expectByte('<');
-        const tag = try self.parseIdent();
+        const tag = try self.parseTagName();
 
         var attrs: std.ArrayList(Attr) = .empty;
         errdefer attrs.deinit(self.allocator);
@@ -454,7 +470,7 @@ pub const Parser = struct {
                 self.advance();
                 const close_line = self.line;
                 const close_col = self.col;
-                const close_tag = try self.parseIdent();
+                const close_tag = try self.parseTagName();
                 if (!std.mem.eql(u8, close_tag, open_tag)) {
                     return self.fail(close_line, close_col, "mismatched closing tag: expected </{s}>, found </{s}>", .{ open_tag, close_tag });
                 }
@@ -626,4 +642,32 @@ test "rejects ref not shaped as an address-of expression" {
     var parser = Parser.init(arena.allocator(), src);
     try std.testing.expectError(error.ParseError, parser.parseTopLevel());
     try std.testing.expect(parser.last_error != null);
+}
+
+test "a dotted tag name (pkg.Name) parses as a single tag, self-closing" {
+    const src = "<components.UserCard name=\"Bob\" />";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    const node = try parser.parseTopLevel();
+    try std.testing.expectEqualStrings("components.UserCard", node.element.tag);
+}
+
+test "a dotted tag name with children requires a matching dotted closing tag" {
+    const src = "<components.Card><Label>hi</Label></components.Card>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    const node = try parser.parseTopLevel();
+    try std.testing.expectEqualStrings("components.Card", node.element.tag);
+    try std.testing.expectEqual(@as(usize, 1), node.element.children.len);
+}
+
+test "reports a clear error on a mismatched dotted closing tag" {
+    const src = "<components.Card>hi</components.OtherThing>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    try std.testing.expectError(error.ParseError, parser.parseTopLevel());
+    try std.testing.expect(std.mem.indexOf(u8, parser.last_error.?.message, "components.OtherThing") != null);
 }
