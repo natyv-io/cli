@@ -358,7 +358,17 @@ pub const Parser = struct {
     /// interleave mismatched bracket kinds. Returns the end offset
     /// (exclusive) of the opaque span; the matching `}` itself is
     /// consumed but not included in that span.
-    fn scanUntilMatchingBrace(self: *Parser, open_line: u32, open_col: u32) error{ParseError}!usize {
+    ///
+    /// `pub` (not just an internal attribute-value helper): `Expose.zig`'s
+    /// composer-body discovery reuses this exact scan -- a `func Name(...)
+    /// {`'s body needs the identical brace/string/comment-aware treatment
+    /// (it can contain attribute expressions with their own embedded
+    /// braces/strings), and duplicating this logic there was explicitly
+    /// rejected in favor of sharing it. Callers from outside this file
+    /// position a `Parser` at the byte right after the `{` they want
+    /// matched (via `pos`/`line`/`col` -- plain struct fields, not
+    /// private) before calling this.
+    pub fn scanUntilMatchingBrace(self: *Parser, open_line: u32, open_col: u32) error{ParseError}!usize {
         var depth: u32 = 1;
         while (self.peek()) |b| {
             switch (b) {
