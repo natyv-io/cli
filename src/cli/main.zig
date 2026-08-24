@@ -1,19 +1,20 @@
 //! Entry point for the dev-facing `natyv` CLI (`natyv prepare`, `natyv
-//! build`) -- see ~/.claude/plans/lexical-wishing-penguin.md for the full
-//! staged plan this is Stage 1 of. Deliberately a separate binary from
+//! build`, `natyv init`) -- see ~/.claude/plans/lexical-wishing-penguin.md
+//! for the full staged plan. Deliberately a separate binary from
 //! natyv-core (`src/main.zig`, the app runtime `natyv build` eventually
 //! bundles a compiled guest into): this one only ever reads/writes files
-//! and (later stages) spawns the dev's own configured compile command, so
-//! it carries none of natyv-core's SDL3/Extism/Clay dependencies.
+//! and spawns the dev's own configured compile command (`Compile.zig`),
+//! so it carries none of natyv-core's SDL3/Extism/Clay dependencies.
 //!
-//! Stage 1 scope, deliberately narrow: recognize the two subcommands and
-//! validate `conf.natyv.json` (including the new `wasm_compile` field --
-//! see Config.zig). Neither subcommand does any real work yet -- that's
-//! Stage 3 onward.
+//! `natyv build` currently only runs the `wasm_compile` step (Stage 7)
+//! -- embedding the resulting wasm into a self-contained binary via
+//! `zig build` is the next real sub-step, not yet implemented.
+//! `natyv init` is not yet implemented at all.
 
 const std = @import("std");
 const Config = @import("Config");
 const Prepare = @import("Prepare");
+const Compile = @import("Compile.zig");
 
 pub const Subcommand = enum { prepare, build, init };
 
@@ -112,7 +113,23 @@ pub fn main(init: std.process.Init) !void {
             }
             std.debug.print("natyv prepare: {s} -- transpiled {d} file(s)\n", .{ config.value.name, outcome.processed });
         },
-        .build => std.debug.print("natyv build: config OK for '{s}' (Stage 1 skeleton -- bundling not yet implemented)\n", .{config.value.name}),
+        .build => {
+            var guest_dir = std.Io.Dir.cwd().openDir(io, guest_dir_path, .{}) catch |err| {
+                std.debug.print("natyv build: could not open '{s}': {}\n", .{ guest_dir_path, err });
+                return err;
+            };
+            defer guest_dir.close(io);
+
+            std.debug.print("natyv build: {s} -- running wasm_compile...\n", .{config.value.name});
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const compile_result = try Compile.run(arena.allocator(), io, config.value.wasm_compile, guest_dir);
+            if (compile_result.err) |e| {
+                std.debug.print("{s}\n", .{e.message});
+                return error.WasmCompileFailed;
+            }
+            std.debug.print("natyv build: {s} -- wasm_compile succeeded (bundling not yet implemented)\n", .{config.value.name});
+        },
         .init => unreachable, // handled above
     }
 }
