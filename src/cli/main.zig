@@ -16,6 +16,8 @@ const Config = @import("Config");
 const Prepare = @import("Prepare");
 const Compile = @import("Compile.zig");
 const BuildCache = @import("BuildCache");
+const Bundle = @import("Bundle.zig");
+const build_options = @import("build_options");
 
 pub const Subcommand = enum { prepare, build, init };
 
@@ -131,27 +133,49 @@ pub fn main(init: std.process.Init) !void {
             // straight to bundling instead of redoing prepare/compile.
             const wasm_basename = std.fs.path.basename(config.value.app_wasm);
             if (try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename)) {
-                std.debug.print("natyv build: {s} -- wasm is already up to date, skipping prepare/wasm_compile (bundling not yet implemented)\n", .{config.value.name});
-                return;
+                std.debug.print("natyv build: {s} -- wasm is already up to date, skipping prepare/wasm_compile\n", .{config.value.name});
+            } else {
+                const outcome = try Prepare.run(arena_alloc, io, guest_dir);
+                if (outcome.err) |e| {
+                    std.debug.print("{s}\n", .{e.message});
+                    return error.PrepareFailed;
+                }
+
+                std.debug.print("natyv build: {s} -- running wasm_compile...\n", .{config.value.name});
+                const compile_result = try Compile.run(arena_alloc, io, config.value.wasm_compile, guest_dir);
+                if (compile_result.err) |e| {
+                    std.debug.print("{s}\n", .{e.message});
+                    return error.WasmCompileFailed;
+                }
+
+                const new_hash = try BuildCache.computeSourceHash(arena_alloc, io, guest_dir);
+                try BuildCache.writeCachedHash(io, guest_dir, new_hash);
             }
 
-            const outcome = try Prepare.run(arena_alloc, io, guest_dir);
-            if (outcome.err) |e| {
+            // Bundling always runs regardless of freshness -- freshness
+            // only ever skips prepare/wasm_compile, never the final
+            // bundle step, per Quinn's own explicit design.
+            //
+            // `NATYV_CORE_SRC` overrides the compile-time-baked default
+            // (`build_options.natyv_core_src_default` -- this repo's own
+            // root for a local dev build, or wherever a real packaging
+            // wrapper installs natyv-core's source for a real install)
+            // when set, but a real install never needs to set it at all.
+            const natyv_core_src = init.environ_map.get("NATYV_CORE_SRC") orelse build_options.natyv_core_src_default;
+
+            const dist_dir_path = try std.fs.path.join(arena_alloc, &.{ config_dir, "dist" });
+            var dist_dir = try std.Io.Dir.cwd().createDirPathOpen(io, dist_dir_path, .{});
+            defer dist_dir.close(io);
+
+            const wasm_full_path = try std.fs.path.join(arena_alloc, &.{ guest_dir_path, wasm_basename });
+
+            std.debug.print("natyv build: {s} -- bundling...\n", .{config.value.name});
+            const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, dist_dir, config.value.name);
+            if (bundle_result.err) |e| {
                 std.debug.print("{s}\n", .{e.message});
-                return error.PrepareFailed;
+                return error.BundleFailed;
             }
-
-            std.debug.print("natyv build: {s} -- running wasm_compile...\n", .{config.value.name});
-            const compile_result = try Compile.run(arena_alloc, io, config.value.wasm_compile, guest_dir);
-            if (compile_result.err) |e| {
-                std.debug.print("{s}\n", .{e.message});
-                return error.WasmCompileFailed;
-            }
-
-            const new_hash = try BuildCache.computeSourceHash(arena_alloc, io, guest_dir);
-            try BuildCache.writeCachedHash(io, guest_dir, new_hash);
-
-            std.debug.print("natyv build: {s} -- wasm_compile succeeded (bundling not yet implemented)\n", .{config.value.name});
+            std.debug.print("natyv build: {s} -- built {s}/{s}\n", .{ config.value.name, dist_dir_path, config.value.name });
         },
         .init => unreachable, // handled above
     }
