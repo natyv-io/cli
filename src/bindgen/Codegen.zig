@@ -15,12 +15,12 @@
 //! separately, against the emitted output).
 //!
 //! **Generic path** covers any function whose params are only
-//! `int_primitive`/`float_primitive`/`opaque_handle`, with at most one
-//! `struct_out_ptr` param, and whose return is
+//! `int_primitive`/`float_primitive`/`opaque_handle`/`byte_buffer_in`,
+//! with at most one `struct_out_ptr` param, and whose return is
 //! `void_kind`/`int_primitive`/`float_primitive`/`opaque_handle` --
 //! `fixture_create`/`fixture_destroy`/`fixture_get_point` all go through
-//! this path unmodified, and it's meant to generalize to zlib's own
-//! functions later (Stage 3) without new per-function code. Every
+//! this path unmodified, and it generalizes to real zlib functions
+//! (Stage 2.9's own `crc32`) without new per-function code. Every
 //! non-out-param becomes a positional JSON request field (`p0`, `p1`, ...
 //! -- C's type system doesn't preserve parameter names, so this is a real,
 //! accepted limitation, not an oversight); an `opaque_handle` param is
@@ -28,7 +28,18 @@
 //! pointer crossing the wire; a `struct_out_ptr` param's fields are
 //! flattened directly into the response object; an `opaque_handle` return
 //! becomes a new id inserted into the same table (`"handle"` response
-//! field), a primitive return becomes a `"result"` field.
+//! field), a primitive return becomes a `"result"` field. `int_primitive`
+//! params/returns carry their own real C width/signedness (Stage 2.9 --
+//! `zlibCompileFlags`-style trivial functions happened to make `i32`/
+//! `int32` look like a universal default, but real ones like `uLong`
+//! aren't) rather than always assuming `i32`/`int32`. A `byte_buffer_in`
+//! param (Stage 2.9 -- a `const <byte> *`, always paired with an
+//! immediately-following length param) becomes one base64-encoded string
+//! request field; the length param itself is dropped from the guest-
+//! facing surface entirely, since the host derives it from the real
+//! decoded byte count instead (Go's own `[]byte` <-> JSON already
+//! base64-encodes automatically, so the guest side needs no special
+//! handling at all -- only the host side runs a real `std.base64` decode).
 //!
 //! **A function name containing "destroy" additionally removes its first
 //! `opaque_handle` argument from the handle table after a successful
@@ -107,17 +118,46 @@ fn camelCase(allocator: std.mem.Allocator, snake: []const u8) ![]u8 {
     return pascal;
 }
 
-fn zigPrimitiveType(kind: Reflect.ParamKind) []const u8 {
-    return switch (kind) {
-        .int_primitive => "i32",
+/// Stage 2.9: real C integers aren't all `i32` -- zlib's own `uLong`/
+/// `uInt` are 64-bit/32-bit *unsigned* on this platform, and a `crc32`-
+/// shaped function silently mis-marshals (or simply fails to compile,
+/// since Zig has no implicit narrowing) if its wire type doesn't match.
+/// Only two real buckets exist among every C integer width this codebase
+/// has actually reflected so far (16/32-bit and 64-bit) -- narrower than
+/// 32 bits (e.g. a real `short`) still gets the 32-bit wire type, a
+/// harmless widening, not a correctness gap.
+fn zigIntType(bits: u16, signed: bool) []const u8 {
+    if (signed) return if (bits > 32) "i64" else "i32";
+    return if (bits > 32) "u64" else "u32";
+}
+
+fn goIntType(bits: u16, signed: bool) []const u8 {
+    if (signed) return if (bits > 32) "int64" else "int32";
+    return if (bits > 32) "uint64" else "uint32";
+}
+
+/// The real wire-facing field type for a request/response param, on each
+/// side -- dispatches across every kind `emitGeneric`'s generic path
+/// supports (`opaque_handle`/`byte_buffer_in` need their own fixed types;
+/// `int_primitive`/`float_primitive` need `p`'s own real width/
+/// signedness, not a blind `i32`/`int32`). `p.kind` must not be
+/// `.struct_out_ptr`/`.callback_ptr`/`.userdata_ptr` -- those never
+/// become a plain request/response field the way the others do.
+fn zigFieldType(p: Reflect.Param) []const u8 {
+    return switch (p.kind) {
+        .opaque_handle => "u32",
+        .byte_buffer_in => "[]const u8",
+        .int_primitive => zigIntType(p.int_bits, p.int_signed),
         .float_primitive => "f32",
         else => unreachable,
     };
 }
 
-fn goPrimitiveType(kind: Reflect.ParamKind) []const u8 {
-    return switch (kind) {
-        .int_primitive => "int32",
+fn goFieldType(p: Reflect.Param) []const u8 {
+    return switch (p.kind) {
+        .opaque_handle => "uint32",
+        .byte_buffer_in => "[]byte",
+        .int_primitive => goIntType(p.int_bits, p.int_signed),
         .float_primitive => "float32",
         else => unreachable,
     };
@@ -126,16 +166,41 @@ fn goPrimitiveType(kind: Reflect.ParamKind) []const u8 {
 /// A non-out-param's request-field role -- separated from `Reflect.Param`
 /// so the emitter doesn't need to re-derive "which index is this in the
 /// request struct" (out-params don't get one) in three different places.
+/// Carries the full `Reflect.Param` (not just its `kind`) since
+/// `zigFieldType`/`goFieldType` need `int_bits`/`int_signed` too now.
 const ReqField = struct {
     index: usize,
-    kind: Reflect.ParamKind,
+    param: Reflect.Param,
 };
 
+/// Also `emitGeneric`'s single source of shape validation -- any param
+/// kind not recognized below is a real `error.UnsupportedShape`, so the
+/// separate blanket check this function used to require alongside it
+/// (`if (out_param == null) for (...) ...`) was fully redundant and has
+/// been removed.
+///
+/// **A `.byte_buffer_in` param must be immediately followed by an
+/// `.int_primitive` length param** -- natyv has no other way to know how
+/// many bytes to read (real C convention: zlib's own `crc32(uLong, const
+/// Bytef *buf, uInt len)` is exactly this shape). The pair is emitted as
+/// *one* request field (the buffer's own real decoded length becomes the
+/// length argument at call time, see `emitGeneric`'s own call-building
+/// loop) -- the length param itself never gets its own separate request
+/// field or guest-facing Go parameter, which is both simpler and more
+/// idiomatic (a Go caller passes one `[]byte`, never a redundant
+/// buffer+length pair).
 fn collectReqFields(allocator: std.mem.Allocator, params: []const Reflect.Param) ![]ReqField {
     var fields: std.ArrayList(ReqField) = .empty;
-    for (params, 0..) |p, i| {
+    var i: usize = 0;
+    while (i < params.len) : (i += 1) {
+        const p = params[i];
         switch (p.kind) {
-            .int_primitive, .float_primitive, .opaque_handle => try fields.append(allocator, .{ .index = i, .kind = p.kind }),
+            .int_primitive, .float_primitive, .opaque_handle => try fields.append(allocator, .{ .index = i, .param = p }),
+            .byte_buffer_in => {
+                if (i + 1 >= params.len or params[i + 1].kind != .int_primitive) return error.UnsupportedShape;
+                try fields.append(allocator, .{ .index = i, .param = p });
+                i += 1; // the paired length param is consumed here, not its own field
+            },
             .struct_out_ptr => {},
             else => return error.UnsupportedShape,
         }
@@ -159,9 +224,6 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
     const is_destroy = std.mem.indexOf(u8, desc.name, "destroy") != null;
     const req_fields = try collectReqFields(allocator, desc.params[0..desc.params_len]);
     const out_param = findStructOutParam(desc.params[0..desc.params_len]);
-    if (out_param == null) {
-        for (desc.params[0..desc.params_len]) |p| if (p.kind != .int_primitive and p.kind != .float_primitive and p.kind != .opaque_handle) return error.UnsupportedShape;
-    }
     switch (desc.@"return".kind) {
         .void_kind, .int_primitive, .float_primitive, .opaque_handle => {},
         else => return error.UnsupportedShape,
@@ -175,8 +237,7 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
     try zig_out.appendSlice(allocator, pascal);
     try zig_out.appendSlice(allocator, "Request = struct {");
     for (req_fields) |f| {
-        const ty: []const u8 = if (f.kind == .opaque_handle) "u32" else zigPrimitiveType(f.kind);
-        try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator, " p{d}: {s},", .{ f.index, ty }));
+        try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator, " p{d}: {s},", .{ f.index, zigFieldType(f.param) }));
     }
     try zig_out.appendSlice(allocator, " };\n\n");
 
@@ -208,10 +269,12 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
     if (req_fields.len == 0) try zig_out.appendSlice(allocator, "    _ = req;\n");
 
     var call_args: std.ArrayList(u8) = .empty;
-    for (desc.params[0..desc.params_len], 0..) |p, i| {
-        if (i > 0) try call_args.appendSlice(allocator, ", ");
+    var pi: usize = 0;
+    while (pi < desc.params_len) : (pi += 1) {
+        const p = desc.params[pi];
+        if (pi > 0) try call_args.appendSlice(allocator, ", ");
         switch (p.kind) {
-            .int_primitive, .float_primitive => try call_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "req.p{d}", .{i})),
+            .int_primitive, .float_primitive => try call_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "req.p{d}", .{pi})),
             .opaque_handle => {
                 try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
                     \\    const p{d}_ptr = {s}.get(req.p{d}) orelse {{
@@ -219,12 +282,48 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
                     \\        return;
                     \\    }};
                     \\
-                , .{ i, handle_table_name, i, i }));
-                try call_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "p{d}_ptr", .{i}));
+                , .{ pi, handle_table_name, pi, pi }));
+                try call_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "p{d}_ptr", .{pi}));
             },
             .struct_out_ptr => {
-                try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator, "    var out_p{d}: {s}.{s} = undefined;\n", .{ i, c_alias, p.type_name }));
-                try call_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "&out_p{d}", .{i}));
+                try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator, "    var out_p{d}: {s}.{s} = undefined;\n", .{ pi, c_alias, p.type_name }));
+                try call_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "&out_p{d}", .{pi}));
+            },
+            .byte_buffer_in => {
+                // `collectReqFields` (already run above, before any of
+                // this text was emitted) guarantees a `.byte_buffer_in`
+                // param is always immediately followed by an
+                // `.int_primitive` length one -- so the real, decoded
+                // byte slice's own length is used directly as that C
+                // call argument, and the length param itself never
+                // becomes its own request field/Go parameter (a real
+                // wire-format simplification: the guest only ever
+                // supplies one `[]byte`, matching real Go idiom, not a
+                // redundant buffer+length pair). Wire encoding is plain
+                // base64 in the JSON string field -- Go's own
+                // `encoding/json` already marshals/unmarshals a `[]byte`
+                // field as base64 automatically, so the guest side needs
+                // no special-casing at all; only the host side needs a
+                // real decode step, via `std.base64` (this codebase's
+                // first real use of it).
+                try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
+                    \\    const p{0d}_len = std.base64.standard.Decoder.calcSizeForSlice(req.p{0d}) catch {{
+                    \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "invalid base64 for p{0d}", .{{}});
+                    \\        return;
+                    \\    }};
+                    \\    const p{0d}_buf = allocator.alloc(u8, p{0d}_len) catch {{
+                    \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory decoding p{0d}", .{{}});
+                    \\        return;
+                    \\    }};
+                    \\    defer allocator.free(p{0d}_buf);
+                    \\    std.base64.standard.Decoder.decode(p{0d}_buf, req.p{0d}) catch {{
+                    \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "invalid base64 for p{0d}", .{{}});
+                    \\        return;
+                    \\    }};
+                    \\
+                , .{pi}));
+                try call_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "p{d}_buf.ptr, @intCast(p{d}_buf.len)", .{ pi, pi }));
+                pi += 1; // consume the paired length param
             },
             else => return error.UnsupportedShape,
         }
@@ -315,8 +414,7 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
             try go_params.appendSlice(allocator, ", ");
             try req_json_fields.appendSlice(allocator, ",");
         }
-        const go_ty: []const u8 = if (f.kind == .opaque_handle) "uint32" else goPrimitiveType(f.kind);
-        try go_params.appendSlice(allocator, try std.fmt.allocPrint(allocator, "p{d} {s}", .{ f.index, go_ty }));
+        try go_params.appendSlice(allocator, try std.fmt.allocPrint(allocator, "p{d} {s}", .{ f.index, goFieldType(f.param) }));
         try req_json_fields.appendSlice(allocator, try std.fmt.allocPrint(allocator, "\"p{d}\":%v", .{f.index}));
         if (req_json_args.items.len > 0) try req_json_args.appendSlice(allocator, ", ");
         try req_json_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "p{d}", .{f.index}));
@@ -333,7 +431,7 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
     switch (desc.@"return".kind) {
         .void_kind => {},
         .opaque_handle => try go_decode_fields.appendSlice(allocator, "\tHandle uint32 `json:\"handle\"`\n"),
-        else => try go_decode_fields.appendSlice(allocator, try std.fmt.allocPrint(allocator, "\tResult {s} `json:\"result\"`\n", .{goPrimitiveType(desc.@"return".kind)})),
+        else => try go_decode_fields.appendSlice(allocator, try std.fmt.allocPrint(allocator, "\tResult {s} `json:\"result\"`\n", .{goFieldType(desc.@"return")})),
     }
     _ = &go_results;
 
@@ -350,10 +448,8 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
         \\
     , .{ desc.name, camel, pascal, go_decode_fields.items, pascal, go_params.items, pascal }));
 
-    for (req_fields, 0..) |f, fi| {
-        const go_ty: []const u8 = if (f.kind == .opaque_handle) "uint32" else goPrimitiveType(f.kind);
-        try go_out.appendSlice(allocator, try std.fmt.allocPrint(allocator, "\t\tP{d} {s} `json:\"p{d}\"`\n", .{ f.index, go_ty, f.index }));
-        _ = fi;
+    for (req_fields) |f| {
+        try go_out.appendSlice(allocator, try std.fmt.allocPrint(allocator, "\t\tP{d} {s} `json:\"p{d}\"`\n", .{ f.index, goFieldType(f.param), f.index }));
     }
     try go_out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
         \\    }}{{{s}}})
@@ -712,7 +808,40 @@ test "generate: fixture_get_point flattens struct out-param fields plus the int 
     try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "out_p1.x") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "out_p1.y") != null);
     try std.testing.expect(std.mem.indexOf(u8, go_out.items, "X int32 `json:\"x\"`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, go_out.items, "Result int32 `json:\"result\"`") != null);
+    // `FixtureStatus` (the enum-as-status return) translate-c collapses to
+    // a bare `c_uint`, which is *unsigned* -- Stage 2.9's new width/
+    // signedness-aware marshaling now correctly emits `uint32`, not the
+    // old blind `int32` every earlier stage's own int handling defaulted
+    // to regardless of the real C type's actual signedness.
+    try std.testing.expect(std.mem.indexOf(u8, go_out.items, "Result uint32 `json:\"result\"`") != null);
+}
+
+test "generate: fixture_checksum -- wide unsigned ints marshal correctly and the byte buffer + its paired length collapse into one []byte param" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const desc = try Reflect.describe(fixture_c, "fixture_checksum");
+    var zig_out: std.ArrayList(u8) = .empty;
+    var go_out: std.ArrayList(u8) = .empty;
+    try emitGeneric(allocator, "fixture_c", "fixture_handle_table", &zig_out, &go_out, desc);
+
+    // Zig side: p0 (crc seed) is a real u64, not the old blind i32; p1 is
+    // the byte buffer's own base64-text wire field; p2 (the real C
+    // function's length param) never appears as its own request field at
+    // all -- it's derived from the decoded buffer's real length instead.
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "p0: u64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "p1: []const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "p2:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "std.base64.standard.Decoder.decode(p1_buf, req.p1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "fixture_c.fixture_checksum(req.p0, p1_buf.ptr, @intCast(p1_buf.len))") != null);
+
+    // Go side: the wrapper takes a plain []byte, no redundant length
+    // param; the request body and response both use uint64 for the wide
+    // unsigned crc/result values, not int32.
+    try std.testing.expect(std.mem.indexOf(u8, go_out.items, "func FixtureChecksum(p0 uint64, p1 []byte)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_out.items, "P0 uint64 `json:\"p0\"`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_out.items, "P1 []byte `json:\"p1\"`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_out.items, "Result uint64 `json:\"result\"`") != null);
 }
 
 test "generate: full fixture allowlist produces non-empty, distinct Zig and Go sources" {

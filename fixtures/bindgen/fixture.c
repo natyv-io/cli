@@ -41,3 +41,9 @@ void fixture_trigger(FixtureHandle *handle, int value) {
     if (handle == NULL || handle->callback == NULL) return;
     handle->callback(value, handle->user_data);
 }
+
+unsigned long fixture_checksum(unsigned long seed, const unsigned char *data, unsigned int len) {
+    unsigned long sum = seed;
+    for (unsigned int i = 0; i < len; i++) sum += data[i];
+    return sum;
+}

@@ -44,6 +44,14 @@ pub const ParamKind = enum {
     struct_out_ptr,
     callback_ptr,
     userdata_ptr,
+    /// Stage 2.9: a `const <byte-type> *` param (e.g. zlib's own `const
+    /// Bytef *buf`) -- always paired with an immediately-following
+    /// `int_primitive` length param at the `Codegen.zig` level (natyv has
+    /// no other way to know how many bytes to read), never a standalone
+    /// shape. A non-const byte pointer (a real "out buffer" C convention)
+    /// is a real, deliberately deferred future case -- `classify` rejects
+    /// it explicitly rather than silently mishandling it.
+    byte_buffer_in,
 };
 
 pub const StructFieldDesc = struct {
@@ -84,6 +92,16 @@ pub const Param = struct {
     /// `callback_params[0..callback_params_len]`.
     callback_params: [max_callback_params]ParamKind = undefined,
     callback_params_len: usize = 0,
+    /// Populated only for `.int_primitive` -- the real C integer's own
+    /// width/signedness (e.g. zlib's `uLong`/`uInt` are 64-bit/32-bit
+    /// *unsigned* on this platform, not the `i32` every earlier stage's
+    /// fixture functions happened to use). Stage 2.9: `Codegen.zig` needs
+    /// this to pick a correctly-sized, correctly-signed wire type instead
+    /// of always assuming `i32`/`int32` -- defaults here match that prior
+    /// implicit assumption exactly, so no existing caller's behavior
+    /// changes by not setting these.
+    int_bits: u16 = 32,
+    int_signed: bool = true,
 };
 
 pub const FnDescriptor = struct {
@@ -131,7 +149,7 @@ fn classify(comptime T: type) ReflectError!Param {
     const ti = @typeInfo(T);
     switch (ti) {
         .void => return .{ .kind = .void_kind },
-        .int => return .{ .kind = .int_primitive },
+        .int => |int_info| return .{ .kind = .int_primitive, .int_bits = int_info.bits, .int_signed = int_info.signedness == .signed },
         .float => return .{ .kind = .float_primitive },
         .optional => |opt| {
             if (isAnyopaquePtr(T)) return .{ .kind = .userdata_ptr };
@@ -156,6 +174,18 @@ fn classify(comptime T: type) ReflectError!Param {
             }
         },
         .pointer => |ptr| {
+            // Stage 2.9: a real `const <byte> *` param (zlib's own `const
+            // Bytef *buf` reflects exactly this way -- confirmed via a
+            // real spike) -- checked before the struct-out-param case
+            // below, since `u8`'s own `@typeInfo` is `.int`, not
+            // `.@"struct"`, and would otherwise fall through to the
+            // generic `else => error.UnsupportedType` there. A *non-const*
+            // byte pointer (a real "out buffer" C convention) is a
+            // deliberately deferred future case, not silently mishandled.
+            if (ptr.child == u8) {
+                if (!ptr.is_const) return error.UnsupportedType;
+                return .{ .kind = .byte_buffer_in };
+            }
             const pointee_ti = @typeInfo(ptr.child);
             if (pointee_ti != .@"struct") return error.UnsupportedType;
             const fields_ti = pointee_ti.@"struct".fields;
@@ -269,4 +299,19 @@ test "fixture_trigger: opaque_handle + int params, void return" {
 
 test "describe rejects a translated function-like macro cleanly instead of crashing on a null .type unwrap" {
     try std.testing.expectError(error.GenericFunction, describe(fixture_c, "FIXTURE_DOUBLE"));
+}
+
+test "fixture_checksum: wide unsigned int + byte_buffer_in + wide unsigned int params/return, mirrors real zlib crc32 exactly" {
+    const desc = try describe(fixture_c, "fixture_checksum");
+    try std.testing.expectEqual(@as(usize, 3), desc.params_len);
+    try std.testing.expectEqual(ParamKind.int_primitive, desc.params[0].kind);
+    try std.testing.expectEqual(@as(u16, 64), desc.params[0].int_bits);
+    try std.testing.expect(!desc.params[0].int_signed);
+    try std.testing.expectEqual(ParamKind.byte_buffer_in, desc.params[1].kind);
+    try std.testing.expectEqual(ParamKind.int_primitive, desc.params[2].kind);
+    try std.testing.expectEqual(@as(u16, 32), desc.params[2].int_bits);
+    try std.testing.expect(!desc.params[2].int_signed);
+    try std.testing.expectEqual(ParamKind.int_primitive, desc.@"return".kind);
+    try std.testing.expectEqual(@as(u16, 64), desc.@"return".int_bits);
+    try std.testing.expect(!desc.@"return".int_signed);
 }

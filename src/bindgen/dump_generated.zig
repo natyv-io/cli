@@ -27,6 +27,12 @@ const allowlist = [_][]const u8{
     "fixture_get_point",
     "fixture_set_callback",
     "fixture_trigger",
+    // Stage 2.9's own byte-buffer + wide-unsigned-int marshaling --
+    // including this here means the real `std.base64` decode logic
+    // `Codegen.zig` now emits gets a genuine `zig build test` compile
+    // check, not just the text-level assertions `Codegen.zig`'s own unit
+    // test already covers.
+    "fixture_checksum",
 };
 
 pub fn main(init: std.process.Init) !void {

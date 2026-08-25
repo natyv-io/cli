@@ -47,6 +47,14 @@ FixtureStatus fixture_get_point(FixtureHandle *handle, FixturePoint *out_point);
 void fixture_set_callback(FixtureHandle *handle, FixtureCallback cb, void *user_data);
 void fixture_trigger(FixtureHandle *handle, int value);
 
+// Stage 2.9 regression coverage: mirrors real zlib's own `crc32(uLong,
+// const Bytef*, uInt) -> uLong` shape exactly -- a wide unsigned
+// accumulator in, a const byte buffer + its own length in, a wide
+// unsigned result out. Proves the new byte-buffer-in-param + wide/
+// unsigned-int marshaling machinery against a hermetic fixture before
+// Stage 2.9's own separate real-zlib end-to-end proof.
+unsigned long fixture_checksum(unsigned long seed, const unsigned char *data, unsigned int len);
+
 // Deliberately NOT in `allowlist` (see Reflect.zig) -- exists so
 // Reflect.zig's own tests can prove `describe` rejects a function-like
 // macro cleanly (`error.GenericFunction`) rather than crashing. A
