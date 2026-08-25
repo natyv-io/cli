@@ -1,0 +1,48 @@
+// Small, hand-written fixture for the `natyv get` binding generator's Stage 1
+// (see ~/.claude/plans/lexical-wishing-penguin.md). Deliberately hits exactly
+// the CLAUDE.md-confirmed proof surface and nothing else: an opaque handle
+// (create/destroy), one struct (used as an out-param), one enum-shaped status
+// return, and one callback registration + a real invocation path to prove the
+// round trip. No standard-library includes on purpose -- the generator must
+// work against a bare header, and this project's own reflection spike found
+// that even a completely dependency-free header still produces a handful of
+// platform-injected decls translate-c can't resolve, so the fixture doesn't
+// need to *add* any real-world header noise to prove that case is handled.
+
+typedef struct FixtureHandle FixtureHandle;
+
+typedef enum {
+    FIXTURE_OK = 0,
+    FIXTURE_ERROR = 1,
+} FixtureStatus;
+
+typedef struct {
+    int x;
+    int y;
+} FixturePoint;
+
+typedef void (*FixtureCallback)(int value, void *user_data);
+
+FixtureHandle *fixture_create(int initial);
+void fixture_destroy(FixtureHandle *handle);
+
+// Out-param + enum-shaped return: writes the handle's current value into
+// *out_point (x = current value, y = current value doubled) and reports
+// FIXTURE_ERROR without writing anything if handle is NULL.
+FixtureStatus fixture_get_point(FixtureHandle *handle, FixturePoint *out_point);
+
+// Callback registration: stores cb/user_data on the handle. fixture_trigger
+// invokes the stored callback (if any) with (value, user_data) -- this is
+// the real round trip a generated host<->guest dispatch bridge needs to
+// reproduce, not just a registration call that's never actually invoked.
+void fixture_set_callback(FixtureHandle *handle, FixtureCallback cb, void *user_data);
+void fixture_trigger(FixtureHandle *handle, int value);
+
+// Deliberately NOT in `allowlist` (see Reflect.zig) -- exists so
+// Reflect.zig's own tests can prove `describe` rejects a function-like
+// macro cleanly (`error.GenericFunction`) rather than crashing. A
+// single-expression function-like macro like this one translates into a
+// real, callable Zig `pub inline fn`, but a *generic* one (`anytype`
+// params, since a macro has no concrete parameter types until invoked) --
+// confirmed by a real spike, not assumed.
+#define FIXTURE_DOUBLE(x) ((x) * 2)
