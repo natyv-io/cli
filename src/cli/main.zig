@@ -1,15 +1,19 @@
 //! Entry point for the dev-facing `natyv` CLI (`natyv prepare`, `natyv
-//! build`, `natyv init`) -- see ~/.claude/plans/lexical-wishing-penguin.md
-//! for the full staged plan. Deliberately a separate binary from
-//! natyv-core (`src/main.zig`, the app runtime `natyv build` eventually
-//! bundles a compiled guest into): this one only ever reads/writes files
-//! and spawns the dev's own configured compile command (`Compile.zig`),
-//! so it carries none of natyv-core's SDL3/Extism/Clay dependencies.
+//! build`, `natyv init`, `natyv get`) -- see
+//! ~/.claude/plans/lexical-wishing-penguin.md for the full staged plan.
+//! Deliberately a separate binary from natyv-core (`src/main.zig`, the app
+//! runtime `natyv build` eventually bundles a compiled guest into): this
+//! one only ever reads/writes files and spawns the dev's own configured
+//! compile command (`Compile.zig`), so it carries none of natyv-core's
+//! SDL3/Extism/Clay dependencies.
 //!
 //! `natyv build` runs the full prepare -> wasm_compile -> bundle chain
 //! (skipping straight to bundling when nothing's changed since the last
 //! successful compile), producing a genuinely self-contained binary.
-//! `natyv init` interactively scaffolds a new app in place.
+//! `natyv init` interactively scaffolds a new app in place. `natyv get`
+//! (Stage 2.3 of the binding generator arc) declares one `bindings` entry
+//! in `conf.natyv.json`; `natyv bind`, run automatically as part of
+//! `natyv build` today, is what actually generates from it.
 
 const std = @import("std");
 const Config = @import("Config");
@@ -18,15 +22,16 @@ const Compile = @import("Compile.zig");
 const BuildCache = @import("BuildCache");
 const Bundle = @import("Bundle.zig");
 const Bind = @import("Bind.zig");
+const Get = @import("Get.zig");
 const Init = @import("Init.zig");
 const build_options = @import("build_options");
 
-pub const Subcommand = enum { prepare, build, init };
+pub const Subcommand = enum { prepare, build, init, get };
 
 pub const ParsedArgs = struct {
     subcommand: Subcommand,
-    /// Meaningless for `.init` (see doc comment below) -- always populated
-    /// anyway so callers don't need to special-case reading it.
+    /// Meaningless for `.init`/`.get` (see doc comment below) -- always
+    /// populated anyway so callers don't need to special-case reading it.
     config_path: []const u8,
 };
 
@@ -39,9 +44,13 @@ pub const UsageError = error{
 /// subcommand + config path, defaulting the latter to `conf.natyv.json`
 /// the same way natyv-core's own single positional arg defaults today.
 /// `init` doesn't take a config path at all (it *creates* one, in
-/// whatever directory it's invoked from) -- its second positional arg
-/// slot, if present, is deliberately ignored here rather than
-/// misinterpreted as one.
+/// whatever directory it's invoked from); `get` (Stage 2.3 of
+/// ~/.claude/plans/lexical-wishing-penguin.md) always operates on
+/// `./conf.natyv.json` and takes a `<library>` positional + flags instead
+/// (parsed separately by `parseGetArgs`, since its shape doesn't fit this
+/// function's simple "one optional config path" model at all) -- for
+/// both, `args[1..]` is deliberately ignored/left for the caller to
+/// reinterpret rather than misparsed as a config path here.
 /// Kept as a pure function, separate from `main`, so it's testable without
 /// a real process.
 pub fn parseArgs(args: []const []const u8) UsageError!ParsedArgs {
@@ -52,10 +61,67 @@ pub fn parseArgs(args: []const []const u8) UsageError!ParsedArgs {
         .build
     else if (std.mem.eql(u8, args[0], "init"))
         .init
+    else if (std.mem.eql(u8, args[0], "get"))
+        .get
     else
         return error.UnknownSubcommand;
     const config_path: []const u8 = if (args.len > 1) args[1] else "conf.natyv.json";
     return .{ .subcommand = subcommand, .config_path = config_path };
+}
+
+pub const GetUsageError = error{
+    MissingLibrary,
+    MissingHeader,
+    MissingFuncs,
+    UnknownFlag,
+};
+
+/// Returns the value after `prefix` if `arg` starts with it, else `null`.
+fn parseFlag(arg: []const u8, comptime prefix: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, arg, prefix)) return arg[prefix.len..];
+    return null;
+}
+
+/// Parses `natyv get`'s own flag-heavy shape: `args[0]` is `<library>`,
+/// the rest are `--header=`/`--include-dir=`/`--link=`/`--funcs=` in any
+/// order. `--include-dir=`/`--link=` are repeatable (each occurrence
+/// appends one value); `--funcs=` is a single comma-separated list. Kept
+/// separate from `parseArgs` since prepare/build/init have no flags today
+/// and don't need this machinery -- allocator-backed (unlike `parseArgs`)
+/// since the repeatable flags need real growable storage.
+pub fn parseGetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Get.GetArgs {
+    if (args.len == 0) return error.MissingLibrary;
+    const library = args[0];
+
+    var header: ?[]const u8 = null;
+    var functions: ?[]const []const u8 = null;
+    var include_dirs: std.ArrayList([]const u8) = .empty;
+    var link: std.ArrayList([]const u8) = .empty;
+
+    for (args[1..]) |arg| {
+        if (parseFlag(arg, "--header=")) |v| {
+            header = v;
+        } else if (parseFlag(arg, "--include-dir=")) |v| {
+            try include_dirs.append(allocator, v);
+        } else if (parseFlag(arg, "--link=")) |v| {
+            try link.append(allocator, v);
+        } else if (parseFlag(arg, "--funcs=")) |v| {
+            var list: std.ArrayList([]const u8) = .empty;
+            var it = std.mem.splitScalar(u8, v, ',');
+            while (it.next()) |f| try list.append(allocator, f);
+            functions = list.items;
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+
+    return .{
+        .library = library,
+        .header = header orelse return error.MissingHeader,
+        .include_dirs = include_dirs.items,
+        .link = link.items,
+        .functions = functions orelse return error.MissingFuncs,
+    };
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -63,7 +129,12 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const argv = init.minimal.args.vector;
 
-    var arg_slices: [8][]const u8 = undefined;
+    // 64, not the original 8 -- `natyv get`'s repeatable
+    // `--include-dir=`/`--link=` flags (Stage 2.3) can realistically add
+    // up to more than 8 total args including the subcommand, and the
+    // original bound would have silently truncated anything past it with
+    // no error at all.
+    var arg_slices: [64][]const u8 = undefined;
     var arg_count: usize = 0;
     var i: usize = 1; // argv[0] is this executable's own path.
     while (i < argv.len and arg_count < arg_slices.len) : (i += 1) {
@@ -74,11 +145,40 @@ pub fn main(init: std.process.Init) !void {
 
     const parsed = parseArgs(args) catch |err| {
         switch (err) {
-            error.MissingSubcommand => std.debug.print("usage: natyv <prepare|build|init> [conf.natyv.json path]\n", .{}),
-            error.UnknownSubcommand => std.debug.print("natyv: unknown subcommand '{s}' (expected 'prepare', 'build', or 'init')\n", .{args[0]}),
+            error.MissingSubcommand => std.debug.print("usage: natyv <prepare|build|init|get> [args...]\n", .{}),
+            error.UnknownSubcommand => std.debug.print("natyv: unknown subcommand '{s}' (expected 'prepare', 'build', 'init', or 'get')\n", .{args[0]}),
         }
         return err;
     };
+
+    // `get` only ever declares a `bindings` entry -- it never reads a
+    // guest directory or a compiled wasm, so it deliberately never reaches
+    // any of the `Config.load`/guest-dir logic below either (same
+    // reasoning as `init`, right above).
+    if (parsed.subcommand == .get) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        const get_args = parseGetArgs(arena_alloc, args[1..]) catch |err| {
+            switch (err) {
+                error.MissingLibrary => std.debug.print("usage: natyv get <library> --funcs=fn1,fn2 --header=<header> [--include-dir=<dir>]... [--link=<lib>]...\n", .{}),
+                error.MissingHeader => std.debug.print("natyv get: missing required --header=<header>\n", .{}),
+                error.MissingFuncs => std.debug.print("natyv get: missing required --funcs=fn1,fn2,...\n", .{}),
+                error.UnknownFlag => std.debug.print("natyv get: unrecognized flag (expected --header=, --include-dir=, --link=, or --funcs=)\n", .{}),
+                else => std.debug.print("natyv get: could not parse arguments: {}\n", .{err}),
+            }
+            return err;
+        };
+
+        const outcome = try Get.run(arena_alloc, io, "conf.natyv.json", get_args);
+        if (outcome.err) |e| {
+            std.debug.print("{s}\n", .{e.message});
+            return error.GetFailed;
+        }
+        std.debug.print("natyv get: {s} {s} in conf.natyv.json\n", .{ if (outcome.updated_existing) "updated" else "added", get_args.library });
+        return;
+    }
 
     // `init` creates a config, rather than reading one -- it deliberately
     // never reaches the `Config.load` call below.
@@ -220,7 +320,7 @@ pub fn main(init: std.process.Init) !void {
             }
             std.debug.print("natyv build: {s} -- built {s}/{s}\n", .{ config.value.name, dist_dir_path, config.value.name });
         },
-        .init => unreachable, // handled above
+        .init, .get => unreachable, // both handled above
     }
 }
 
@@ -247,4 +347,67 @@ test "parseArgs: missing subcommand errors clearly" {
 
 test "parseArgs: unknown subcommand errors clearly" {
     try std.testing.expectError(error.UnknownSubcommand, parseArgs(&.{"frobnicate"}));
+}
+
+test "parseArgs: get" {
+    const parsed = try parseArgs(&.{ "get", "zlib" });
+    try std.testing.expectEqual(Subcommand.get, parsed.subcommand);
+}
+
+test "parseGetArgs: a full, valid flag set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const args = try parseGetArgs(arena.allocator(), &.{
+        "zlib",
+        "--header=zlib.h",
+        "--include-dir=/opt/homebrew/include",
+        "--include-dir=/usr/local/include",
+        "--link=z",
+        "--funcs=compress,uncompress,zlibCompileFlags",
+    });
+    try std.testing.expectEqualStrings("zlib", args.library);
+    try std.testing.expectEqualStrings("zlib.h", args.header);
+    try std.testing.expectEqual(@as(usize, 2), args.include_dirs.len);
+    try std.testing.expectEqualStrings("/opt/homebrew/include", args.include_dirs[0]);
+    try std.testing.expectEqualStrings("/usr/local/include", args.include_dirs[1]);
+    try std.testing.expectEqual(@as(usize, 1), args.link.len);
+    try std.testing.expectEqualStrings("z", args.link[0]);
+    try std.testing.expectEqual(@as(usize, 3), args.functions.len);
+    try std.testing.expectEqualStrings("compress", args.functions[0]);
+    try std.testing.expectEqualStrings("zlibCompileFlags", args.functions[2]);
+}
+
+test "parseGetArgs: repeated --link= flags all accumulate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const args = try parseGetArgs(arena.allocator(), &.{
+        "mylib", "--header=my.h", "--funcs=f", "--link=a", "--link=b", "--link=c",
+    });
+    try std.testing.expectEqual(@as(usize, 3), args.link.len);
+    try std.testing.expectEqualStrings("a", args.link[0]);
+    try std.testing.expectEqualStrings("c", args.link[2]);
+}
+
+test "parseGetArgs: missing library is a clear error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.MissingLibrary, parseGetArgs(arena.allocator(), &.{}));
+}
+
+test "parseGetArgs: missing --header= is a clear error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.MissingHeader, parseGetArgs(arena.allocator(), &.{ "zlib", "--funcs=f" }));
+}
+
+test "parseGetArgs: missing --funcs= is a clear error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.MissingFuncs, parseGetArgs(arena.allocator(), &.{ "zlib", "--header=zlib.h" }));
+}
+
+test "parseGetArgs: an unrecognized flag is a clear error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.UnknownFlag, parseGetArgs(arena.allocator(), &.{ "zlib", "--header=zlib.h", "--funcs=f", "--liink=z" }));
 }
