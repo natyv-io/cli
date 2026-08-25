@@ -245,6 +245,114 @@ fn findStructOutParam(params: []const Reflect.Param) ?struct { index: usize, par
     return null;
 }
 
+/// One real `.byte_buffer_out` result `emitGeneric`'s call-args loop found
+/// -- recorded so the response-building code (which runs after the real
+/// call, once the real written length is known) can encode it. Named
+/// (not anonymous) so `emitByteBufferOutParam`'s own return type and
+/// `emitGeneric`'s own `buffer_out_fields` list agree without either
+/// duplicating the shape or the caller reaching into an opaque tuple.
+const BufferOutField = struct { buf_index: usize, len_index: usize };
+
+/// Emits the real base64-decode-into-a-real-byte-slice logic for one
+/// `.byte_buffer_in` param at index `pi` and returns the call-argument
+/// text for it. `collectReqFields` (always run before any of this text
+/// is emitted) already guarantees `pi`'s own paired length param exists,
+/// so this never needs to re-validate that itself -- see this file's own
+/// doc comment for the full base64/wire-format reasoning (Stage 2.9).
+fn emitByteBufferInParam(allocator: std.mem.Allocator, zig_out: *std.ArrayList(u8), pi: usize) ![]const u8 {
+    try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
+        \\    const p{0d}_len = std.base64.standard.Decoder.calcSizeForSlice(req.p{0d}) catch {{
+        \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "invalid base64 for p{0d}", .{{}});
+        \\        return;
+        \\    }};
+        \\    const p{0d}_buf = allocator.alloc(u8, p{0d}_len) catch {{
+        \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory decoding p{0d}", .{{}});
+        \\        return;
+        \\    }};
+        \\    defer allocator.free(p{0d}_buf);
+        \\    std.base64.standard.Decoder.decode(p{0d}_buf, req.p{0d}) catch {{
+        \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "invalid base64 for p{0d}", .{{}});
+        \\        return;
+        \\    }};
+        \\
+    , .{pi}));
+    return std.fmt.allocPrint(allocator, "p{d}_buf.ptr, @intCast(p{d}_buf.len)", .{ pi, pi });
+}
+
+/// Emits the real host-allocation + in/out-length-variable setup for one
+/// `.byte_buffer_out` param at index `pi` -- its paired `.length_ptr_inout`
+/// is guaranteed to be at `pi + 1` by `collectReqFields`'s own
+/// validation. Returns the call-argument text plus the bookkeeping
+/// `emitGeneric` needs to later encode this param's real written output,
+/// once the real call has actually happened (see
+/// `emitByteBufferOutEncodings`, which must only run after that point --
+/// see this file's own doc comment for the full reasoning, Stage 2.10).
+fn emitByteBufferOutParam(allocator: std.mem.Allocator, zig_out: *std.ArrayList(u8), desc: Reflect.FnDescriptor, pi: usize) !struct { call_arg: []const u8, field: BufferOutField } {
+    const len_idx = pi + 1;
+    const len_param = desc.params[len_idx];
+    const len_ty = zigIntType(len_param.int_bits, len_param.int_signed);
+    try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
+        \\    const p{0d}_buf = allocator.alloc(u8, @intCast(req.p{1d})) catch {{
+        \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory allocating p{0d}", .{{}});
+        \\        return;
+        \\    }};
+        \\    defer allocator.free(p{0d}_buf);
+        \\    var p{1d}_len: {2s} = @intCast(req.p{1d});
+        \\
+    , .{ pi, len_idx, len_ty }));
+    return .{
+        .call_arg = try std.fmt.allocPrint(allocator, "p{d}_buf.ptr, &p{d}_len", .{ pi, len_idx }),
+        .field = .{ .buf_index = pi, .len_index = len_idx },
+    };
+}
+
+/// Encodes every real `.byte_buffer_out` result recorded during the
+/// call-args loop -- only valid to call *after* the real C call, since
+/// the real written length (`p{len_index}_len`) isn't known until then.
+fn emitByteBufferOutEncodings(allocator: std.mem.Allocator, zig_out: *std.ArrayList(u8), buffer_out_fields: []const BufferOutField) !void {
+    for (buffer_out_fields) |bof| {
+        try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
+            \\    const p{0d}_encoded_len = std.base64.standard.Encoder.calcSize(p{1d}_len);
+            \\    const p{0d}_encoded_buf = allocator.alloc(u8, p{0d}_encoded_len) catch {{
+            \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory encoding p{0d}", .{{}});
+            \\        return;
+            \\    }};
+            \\    defer allocator.free(p{0d}_encoded_buf);
+            \\    const p{0d}_encoded = std.base64.standard.Encoder.encode(p{0d}_encoded_buf, p{0d}_buf[0..p{1d}_len]);
+            \\
+        , .{ bof.buf_index, bof.len_index }));
+    }
+}
+
+/// Appends one `(json-fragment, fmt-arg)` pair to `resp_fields`/
+/// `fmt_args` together, in lockstep. These two lists are consumed
+/// *positionally* by a single `std.fmt.allocPrint` call in the generated
+/// code (`resp_fields` becomes the format string, `fmt_args` the values
+/// substituted into it in the same order) -- found during the
+/// maintainability pass that followed Stage 2.10 as a real, if
+/// not-yet-triggered, risk: the two lists used to be built via separate,
+/// hand-synchronized passes (struct fields, then buffer-out fields, then
+/// the return value, once each per list), so a future new response-field
+/// kind could easily be added to one list's pass and forgotten in the
+/// other's. This helper makes that impossible by construction -- every
+/// real call site now builds both halves of one pair together.
+fn appendRespField(allocator: std.mem.Allocator, resp_fields: *std.ArrayList(u8), fmt_args: *std.ArrayList(u8), json_fragment: []const u8, fmt_arg_expr: []const u8) !void {
+    if (resp_fields.items.len > 0) try resp_fields.appendSlice(allocator, ", ");
+    try resp_fields.appendSlice(allocator, json_fragment);
+    if (fmt_args.items.len > 0) try fmt_args.appendSlice(allocator, ", ");
+    try fmt_args.appendSlice(allocator, fmt_arg_expr);
+}
+
+fn emitZigRequestStruct(allocator: std.mem.Allocator, zig_out: *std.ArrayList(u8), pascal: []const u8, req_fields: []const ReqField) !void {
+    try zig_out.appendSlice(allocator, "const ");
+    try zig_out.appendSlice(allocator, pascal);
+    try zig_out.appendSlice(allocator, "Request = struct {");
+    for (req_fields) |f| {
+        try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator, " p{d}: {s},", .{ f.index, zigFieldType(f.param) }));
+    }
+    try zig_out.appendSlice(allocator, " };\n\n");
+}
+
 /// Emits one function's Zig host trampoline + Go wrapper via the generic
 /// path described in this file's own doc comment. `is_destroy` triggers
 /// the handle-table-removal convention. `c_alias`/`handle_table_name` are
@@ -262,14 +370,7 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
     const pascal = try pascalCase(allocator, desc.name);
     const camel = try camelCase(allocator, desc.name);
 
-    // --- Zig request struct ---
-    try zig_out.appendSlice(allocator, "const ");
-    try zig_out.appendSlice(allocator, pascal);
-    try zig_out.appendSlice(allocator, "Request = struct {");
-    for (req_fields) |f| {
-        try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator, " p{d}: {s},", .{ f.index, zigFieldType(f.param) }));
-    }
-    try zig_out.appendSlice(allocator, " };\n\n");
+    try emitZigRequestStruct(allocator, zig_out, pascal, req_fields);
 
     // --- Zig host trampoline ---
     try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
@@ -298,13 +399,13 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
     // zero-arg C function was actually bound for the first time.
     if (req_fields.len == 0) try zig_out.appendSlice(allocator, "    _ = req;\n");
 
-    // Stage 2.10: every `.byte_buffer_out` param encountered in the loop
-    // below (paired with its own `.length_ptr_inout`, per
-    // `collectReqFields`'s own validation) is recorded here so the
-    // response-building code further down can emit one base64-encoded
-    // output field per real out-buffer, once the real call (and thus the
-    // real written length) is known.
-    var buffer_out_fields: std.ArrayList(struct { buf_index: usize, len_index: usize }) = .empty;
+    // Every `.byte_buffer_out` param encountered in the loop below is
+    // recorded here so the response-building code further down can emit
+    // one base64-encoded output field per real out-buffer, once the real
+    // call (and thus the real written length) is known -- see
+    // `emitByteBufferOutParam`/`emitByteBufferOutEncodings`'s own doc
+    // comments (Stage 2.10).
+    var buffer_out_fields: std.ArrayList(BufferOutField) = .empty;
 
     var call_args: std.ArrayList(u8) = .empty;
     var pi: usize = 0;
@@ -327,66 +428,22 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
                 try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator, "    var out_p{d}: {s}.{s} = undefined;\n", .{ pi, c_alias, p.type_name }));
                 try call_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "&out_p{d}", .{pi}));
             },
+            // `.byte_buffer_in` never becomes its own request field/Go
+            // parameter for its paired length -- the real, decoded byte
+            // slice's own length is used directly as the C call argument
+            // instead (a real wire-format simplification: the guest only
+            // ever supplies one `[]byte`, matching real Go idiom, not a
+            // redundant buffer+length pair). See
+            // `emitByteBufferInParam`'s own doc comment for the full
+            // base64/wire-format reasoning (Stage 2.9).
             .byte_buffer_in => {
-                // `collectReqFields` (already run above, before any of
-                // this text was emitted) guarantees a `.byte_buffer_in`
-                // param is always immediately followed by an
-                // `.int_primitive` length one -- so the real, decoded
-                // byte slice's own length is used directly as that C
-                // call argument, and the length param itself never
-                // becomes its own request field/Go parameter (a real
-                // wire-format simplification: the guest only ever
-                // supplies one `[]byte`, matching real Go idiom, not a
-                // redundant buffer+length pair). Wire encoding is plain
-                // base64 in the JSON string field -- Go's own
-                // `encoding/json` already marshals/unmarshals a `[]byte`
-                // field as base64 automatically, so the guest side needs
-                // no special-casing at all; only the host side needs a
-                // real decode step, via `std.base64` (this codebase's
-                // first real use of it).
-                try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
-                    \\    const p{0d}_len = std.base64.standard.Decoder.calcSizeForSlice(req.p{0d}) catch {{
-                    \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "invalid base64 for p{0d}", .{{}});
-                    \\        return;
-                    \\    }};
-                    \\    const p{0d}_buf = allocator.alloc(u8, p{0d}_len) catch {{
-                    \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory decoding p{0d}", .{{}});
-                    \\        return;
-                    \\    }};
-                    \\    defer allocator.free(p{0d}_buf);
-                    \\    std.base64.standard.Decoder.decode(p{0d}_buf, req.p{0d}) catch {{
-                    \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "invalid base64 for p{0d}", .{{}});
-                    \\        return;
-                    \\    }};
-                    \\
-                , .{pi}));
-                try call_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "p{d}_buf.ptr, @intCast(p{d}_buf.len)", .{ pi, pi }));
+                try call_args.appendSlice(allocator, try emitByteBufferInParam(allocator, zig_out, pi));
                 pi += 1; // consume the paired length param
             },
             .byte_buffer_out => {
-                // The paired `.length_ptr_inout` (guaranteed present by
-                // `collectReqFields`) is the request field carrying the
-                // guest-supplied *capacity* -- the host allocates a real
-                // buffer of exactly that size (entirely host-owned, the
-                // guest never supplies or sees the buffer itself, only
-                // its capacity going in and its real encoded contents
-                // coming back out) and passes a mutable copy of the
-                // capacity as the real in/out length pointer, since the
-                // real C call may write fewer bytes than the capacity.
-                const len_idx = pi + 1;
-                const len_param = desc.params[len_idx];
-                const len_ty = zigIntType(len_param.int_bits, len_param.int_signed);
-                try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
-                    \\    const p{0d}_buf = allocator.alloc(u8, @intCast(req.p{1d})) catch {{
-                    \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory allocating p{0d}", .{{}});
-                    \\        return;
-                    \\    }};
-                    \\    defer allocator.free(p{0d}_buf);
-                    \\    var p{1d}_len: {2s} = @intCast(req.p{1d});
-                    \\
-                , .{ pi, len_idx, len_ty }));
-                try call_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "p{d}_buf.ptr, &p{d}_len", .{ pi, len_idx }));
-                try buffer_out_fields.append(allocator, .{ .buf_index = pi, .len_index = len_idx });
+                const result = try emitByteBufferOutParam(allocator, zig_out, desc, pi);
+                try call_args.appendSlice(allocator, result.call_arg);
+                try buffer_out_fields.append(allocator, result.field);
                 pi += 1; // consume the paired length_ptr_inout param
             },
             else => return error.UnsupportedShape,
@@ -408,36 +465,25 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
         }
     }
 
-    // Stage 2.10: encode each real `.byte_buffer_out` result -- only now,
-    // after the real call, is `p{len_index}_len` known (the real number
-    // of bytes the call actually wrote, which may be less than the
-    // guest-supplied capacity). Uses `std.base64.standard.Encoder`
-    // (paired with `.byte_buffer_in`'s own `.Decoder` from Stage 2.9) --
-    // Go's own `encoding/json` decodes a `[]byte` response field from
-    // base64 automatically, so the guest side needs no special handling.
-    for (buffer_out_fields.items) |bof| {
-        try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
-            \\    const p{0d}_encoded_len = std.base64.standard.Encoder.calcSize(p{1d}_len);
-            \\    const p{0d}_encoded_buf = allocator.alloc(u8, p{0d}_encoded_len) catch {{
-            \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory encoding p{0d}", .{{}});
-            \\        return;
-            \\    }};
-            \\    defer allocator.free(p{0d}_encoded_buf);
-            \\    const p{0d}_encoded = std.base64.standard.Encoder.encode(p{0d}_encoded_buf, p{0d}_buf[0..p{1d}_len]);
-            \\
-        , .{ bof.buf_index, bof.len_index }));
-    }
+    // Only now, after the real call, is each byte_buffer_out's real
+    // written length known -- see `emitByteBufferOutEncodings`'s own doc
+    // comment.
+    try emitByteBufferOutEncodings(allocator, zig_out, buffer_out_fields.items);
 
+    // `resp_fields` (the generated response's own JSON-with-placeholders
+    // format string) and `fmt_args` (the real runtime values substituted
+    // into it, in the same order) are built together via
+    // `appendRespField` -- see that function's own doc comment for why
+    // this replaced two separately-synchronized passes.
     var resp_fields: std.ArrayList(u8) = .empty;
+    var fmt_args: std.ArrayList(u8) = .empty;
     if (out_param) |op| {
-        for (op.param.struct_fields[0..op.param.struct_fields_len], 0..) |f, fi| {
-            if (fi > 0) try resp_fields.appendSlice(allocator, ", ");
-            try resp_fields.appendSlice(allocator, try std.fmt.allocPrint(allocator, "\\\"{s}\\\":{{d}}", .{f.name}));
+        for (op.param.struct_fields[0..op.param.struct_fields_len]) |f| {
+            try appendRespField(allocator, &resp_fields, &fmt_args, try std.fmt.allocPrint(allocator, "\\\"{s}\\\":{{d}}", .{f.name}), try std.fmt.allocPrint(allocator, "out_p{d}.{s}", .{ op.index, f.name }));
         }
     }
     for (buffer_out_fields.items) |bof| {
-        if (resp_fields.items.len > 0) try resp_fields.appendSlice(allocator, ", ");
-        try resp_fields.appendSlice(allocator, try std.fmt.allocPrint(allocator, "\\\"out{d}\\\":\\\"{{s}}\\\"", .{bof.buf_index}));
+        try appendRespField(allocator, &resp_fields, &fmt_args, try std.fmt.allocPrint(allocator, "\\\"out{d}\\\":\\\"{{s}}\\\"", .{bof.buf_index}), try std.fmt.allocPrint(allocator, "p{d}_encoded", .{bof.buf_index}));
     }
     switch (desc.@"return".kind) {
         .void_kind => {},
@@ -452,40 +498,9 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
                 \\    }};
                 \\
             , .{ handle_table_name, desc.name }));
-            if (resp_fields.items.len > 0) try resp_fields.appendSlice(allocator, ", ");
-            try resp_fields.appendSlice(allocator, "\\\"handle\\\":{d}");
+            try appendRespField(allocator, &resp_fields, &fmt_args, "\\\"handle\\\":{d}", "result_id");
         },
-        else => {
-            if (resp_fields.items.len > 0) try resp_fields.appendSlice(allocator, ", ");
-            try resp_fields.appendSlice(allocator, "\\\"result\\\":{d}");
-        },
-    }
-
-    var fmt_args: std.ArrayList(u8) = .empty;
-    if (out_param) |op| {
-        for (op.param.struct_fields[0..op.param.struct_fields_len], 0..) |f, fi| {
-            if (fi > 0) try fmt_args.appendSlice(allocator, ", ");
-            try fmt_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "out_p{d}.{s}", .{ op.index, f.name }));
-        }
-    }
-    // Same relative position as `resp_fields`' own byte_buffer_out loop
-    // above -- these two lists' entries are matched up positionally by
-    // the runtime `std.fmt.bufPrint` call the generated code makes, so
-    // any reordering here must happen in both places at once.
-    for (buffer_out_fields.items) |bof| {
-        if (fmt_args.items.len > 0) try fmt_args.appendSlice(allocator, ", ");
-        try fmt_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "p{d}_encoded", .{bof.buf_index}));
-    }
-    switch (desc.@"return".kind) {
-        .void_kind => {},
-        .opaque_handle => {
-            if (fmt_args.items.len > 0) try fmt_args.appendSlice(allocator, ", ");
-            try fmt_args.appendSlice(allocator, "result_id");
-        },
-        else => {
-            if (fmt_args.items.len > 0) try fmt_args.appendSlice(allocator, ", ");
-            try fmt_args.appendSlice(allocator, "result");
-        },
+        else => try appendRespField(allocator, &resp_fields, &fmt_args, "\\\"result\\\":{d}", "result"),
     }
 
     if (resp_fields.items.len == 0) {

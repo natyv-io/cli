@@ -195,7 +195,177 @@ fn parseMeta(allocator: std.mem.Allocator, library: []const u8, meta_text: []con
     return .{ .library = library, .host_functions = try host_functions.toOwnedSlice(allocator) };
 }
 
+/// Result of a `vendor_url` entry's own real fetch+vendor+(optional
+/// build) work -- mirrors `BindOneResult`'s own `union(enum)` convention.
+/// Only the fields `bindOne` can't derive any other way: the vendored
+/// source's own real, permanent absolute path drives all three (see
+/// `GeneratedEntry`'s own doc comment on why these can't just be pushed
+/// into `Outcome.include_dirs`/`.lib_dirs` directly for a
+/// `vendor_c_build` entry).
+const VendorModeOutcome = union(enum) {
+    ok: struct {
+        extra_include_dirs: []const []const u8 = &.{},
+        extra_lib_dirs: []const []const u8 = &.{},
+        vendor_c_files: []const []const u8 = &.{},
+    },
+    err: BindError,
+};
+
+/// Handles a `zig_url`-mode entry's own real fetch+discover work (Stage
+/// 2.5) -- extracted from `bindOne` during the post-Stage-2.10
+/// maintainability pass, since that function had grown to stitch three
+/// mutually-exclusive per-entry modes together in one place. Appends this
+/// entry's own real `-I` to both `compile_argv` (the reflector's own
+/// real compile invocation) and `reflector_include_dirs` (Stage 2.8's
+/// translate-c pre-pass, which needs the identical set) on success;
+/// returns a real error on failure. `url`/`pid` are passed in rather than
+/// re-read from `entry`/re-derived, since the caller already has both.
+fn handleZigUrlMode(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, core_dir: Io.Dir, bindgen_dir: Io.Dir, bindgen_abs: []const u8, url: []const u8, compile_argv: *std.ArrayList([]const u8), reflector_include_dirs: *std.ArrayList([]const u8)) !?BindError {
+    const core_fetch = try ZigFetch.fetchSave(allocator, io, core_dir, entry.library, url);
+    if (core_fetch.err) |e| return .{ .message = e.message };
+
+    const artifact = entry.zig_artifact orelse return .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' has zig_url set but no zig_artifact -- this should have been caught by `natyv get`'s own validation", .{entry.library}) };
+    const zig_discover_scratch_name = try std.fmt.allocPrint(allocator, "_natyv_bind_zigdiscover_{s}", .{entry.library});
+    // Registered here, not after the whole function (as this originally
+    // read before extraction), for the same "defer only guards what
+    // follows its own declaration" reason as `handleVendorUrlMode`'s own
+    // cleanup below.
+    defer bindgen_dir.deleteTree(io, zig_discover_scratch_name) catch {};
+    const disc = try ZigFetch.discoverHeader(allocator, io, bindgen_dir, bindgen_abs, entry.library, url, artifact);
+    if (disc.err) |e| return .{ .message = e.message };
+
+    var found_header = false;
+    for (disc.installed_headers) |h| {
+        if (std.mem.eql(u8, h, entry.header)) found_header = true;
+    }
+    if (!found_header) {
+        var listed: std.ArrayList(u8) = .empty;
+        for (disc.installed_headers, 0..) |h, i| {
+            if (i > 0) try listed.appendSlice(allocator, ", ");
+            try listed.appendSlice(allocator, h);
+        }
+        return .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' expects header '{s}', but the fetched package only installed: {s} -- override with --header= in `natyv get`", .{ entry.library, entry.header, listed.items }) };
+    }
+
+    try compile_argv.append(allocator, "-I");
+    try compile_argv.append(allocator, disc.include_dir.?);
+    try reflector_include_dirs.append(allocator, disc.include_dir.?);
+    return null;
+}
+
+/// Handles a `vendor_url`-mode entry's own real fetch+permanent-vendor+
+/// (optional tier-2 build) work (Stage 2.6) -- extracted from `bindOne`
+/// alongside `handleZigUrlMode`, for the same reason. Tier 1
+/// (`vendor_c_build` unset) resolves `entry.vendor_files` directly; tier
+/// 2 runs the dev's own `vendor_c_build` command first, then treats
+/// `entry.include_dirs`/`.lib_dirs` as relative to the vendor root (see
+/// `Config.BindingEntry.vendor_c_build`'s own doc comment).
+fn handleVendorUrlMode(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, bindgen_dir: Io.Dir, bindgen_abs: []const u8, url: []const u8, compile_argv: *std.ArrayList([]const u8), reflector_include_dirs: *std.ArrayList([]const u8)) !VendorModeOutcome {
+    const located = try Vendor.locateSource(allocator, io, bindgen_dir, bindgen_abs, entry.library, url);
+    // Registered here, right after `located` is known -- a `defer` only
+    // guards code *after* its own declaration, so placing it at the end
+    // of this function (as this originally read before extraction) would
+    // skip cleanup on the very next line's early return whenever
+    // `locateSource` itself failed.
+    defer if (located.scratch_dir_name) |n| bindgen_dir.deleteTree(io, n) catch {};
+    if (located.err) |e| return .{ .err = .{ .message = e.message } };
+
+    const permanent_name = try std.fmt.allocPrint(allocator, "_natyv_bind_vendor_{s}", .{entry.library});
+    bindgen_dir.deleteTree(io, permanent_name) catch {};
+    var permanent_dir = bindgen_dir.createDirPathOpen(io, permanent_name, .{}) catch |e| {
+        return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: could not create permanent vendor dir for '{s}': {s}", .{ entry.library, @errorName(e) }) } };
+    };
+    defer permanent_dir.close(io);
+
+    var located_source_dir = std.Io.Dir.cwd().openDir(io, located.source_dir.?, .{ .iterate = true }) catch |e| {
+        return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: could not open '{s}''s located source: {s}", .{ entry.library, @errorName(e) }) } };
+    };
+    defer located_source_dir.close(io);
+    try Vendor.copyTree(allocator, io, located_source_dir, permanent_dir);
+
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const permanent_abs_len = try permanent_dir.realPath(io, &pbuf);
+    const vendor_dir_abs = try allocator.dupe(u8, pbuf[0..permanent_abs_len]);
+
+    var vendor_extra_include_dirs: []const []const u8 = &.{};
+    var vendor_extra_lib_dirs: []const []const u8 = &.{};
+    var vendor_c_files: []const []const u8 = &.{};
+
+    if (entry.vendor_c_build) |cmd| {
+        const build_result = std.process.run(allocator, io, .{
+            .argv = &.{ "/bin/sh", "-c", cmd },
+            .cwd = .{ .dir = permanent_dir },
+        }) catch |e| {
+            return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: could not run '{s}''s vendor_c_build ('{s}'): {s}", .{ entry.library, cmd, @errorName(e) }) } };
+        };
+        defer allocator.free(build_result.stdout);
+        switch (build_result.term) {
+            .exited => |code| {
+                if (code != 0) {
+                    defer allocator.free(build_result.stderr);
+                    return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' vendor_c_build ('{s}') failed (exit code {d}):\n{s}{s}", .{ entry.library, cmd, code, build_result.stdout, build_result.stderr }) } };
+                }
+                allocator.free(build_result.stderr);
+            },
+            else => |term| {
+                defer allocator.free(build_result.stderr);
+                return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' vendor_c_build exited abnormally ({any}):\n{s}{s}", .{ entry.library, term, build_result.stdout, build_result.stderr }) } };
+            },
+        }
+
+        var extra_inc: std.ArrayList([]const u8) = .empty;
+        try extra_inc.append(allocator, vendor_dir_abs);
+        for (entry.include_dirs) |rel| try extra_inc.append(allocator, try std.fs.path.join(allocator, &.{ vendor_dir_abs, rel }));
+        vendor_extra_include_dirs = extra_inc.items;
+
+        var extra_lib: std.ArrayList([]const u8) = .empty;
+        for (entry.lib_dirs) |rel| try extra_lib.append(allocator, try std.fs.path.join(allocator, &.{ vendor_dir_abs, rel }));
+        vendor_extra_lib_dirs = extra_lib.items;
+    } else {
+        var files: std.ArrayList([]const u8) = .empty;
+        for (entry.vendor_files) |rel| try files.append(allocator, try std.fs.path.join(allocator, &.{ vendor_dir_abs, rel }));
+        vendor_c_files = files.items;
+
+        // Unlike tier 2 (which resolves the dev's own manual
+        // `entry.include_dirs`, if any), tier 1 has no equivalent
+        // dev-supplied list -- the vendor dir itself is the only include
+        // path this tier ever needs, both for the vendored `.c` files'
+        // own local `#include`s and for the reflector's own
+        // `@cInclude(header)`. `allocator.dupe`, not a `&.{...}` literal
+        // -- the latter takes the address of a temporary that doesn't
+        // outlive this function, a real dangling-pointer bug caught by a
+        // real segfault in this file's own live test, not predicted
+        // upfront.
+        vendor_extra_include_dirs = try allocator.dupe([]const u8, &.{vendor_dir_abs});
+    }
+
+    try compile_argv.append(allocator, "-I");
+    try compile_argv.append(allocator, vendor_dir_abs);
+    try reflector_include_dirs.append(allocator, vendor_dir_abs);
+
+    return .{ .ok = .{
+        .extra_include_dirs = vendor_extra_include_dirs,
+        .extra_lib_dirs = vendor_extra_lib_dirs,
+        .vendor_c_files = vendor_c_files,
+    } };
+}
+
 fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, core_dir: Io.Dir, bindgen_dir: Io.Dir, bindgen_abs: []const u8, guest_abs: []const u8) !BindOneResult {
+    // Real, found-by-audit correctness gap, fixed here (maintainability
+    // pass, 2026-08-25): `zig_url` and `vendor_url` are documented as
+    // mutually exclusive (`Config.BindingEntry`'s own doc comments), and
+    // `natyv get`'s CLI parsing already refuses to construct a config
+    // with both set -- but nothing below this point ever checked that
+    // invariant itself. The two branches further down are independent
+    // `if` blocks, not `if/else`, so a hand-edited (or otherwise
+    // malformed) `conf.natyv.json` with both fields set would silently
+    // run *both* fetch/discovery paths and likely produce a broken,
+    // hard-to-diagnose build rather than a clear error naming the actual
+    // problem.
+    if (entry.zig_url != null and entry.vendor_url != null) {
+        return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' has both zig_url and vendor_url set -- these are mutually exclusive modes (natyv get's own CLI already prevents this combination; check for a hand-edited or otherwise malformed conf.natyv.json)", .{entry.library}) } };
+    }
+
     // PID-suffixed, not just keyed by `entry.library` -- Stage 2.7 made
     // `bind_module` reachable from more than one independently-running
     // test binary for the first time (`bind_tests` directly, and
@@ -237,144 +407,28 @@ fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, cor
         try reflector_include_dirs.append(allocator, dir);
     }
 
-    // Stage 2.5: a `-zig`-mode entry has no `include_dirs` of its own (see
-    // `Config.BindingEntry.zig_url`'s doc comment) -- the reflector still
-    // needs a real `-I` to resolve `entry.header`, so this discovers one
-    // fresh on every `natyv bind` run via a real, throwaway scratch
-    // install (`ZigFetch.discoverHeader`; see that file's own doc comment
-    // for why there's no cheaper way). Separately (and independently --
-    // this discovery's own scratch project has nothing to do with
-    // natyv-core's real build), `entry.library` is also fetched into
-    // *natyv-core's own* `build.zig.zon` here, since that's what the
-    // final app build's real `b.dependency(entry.library, ...)` call
-    // (`build.zig`'s `-Dbinding-zig-deps` loop) needs to exist there --
-    // confirmed empirically idempotent, so safe to redo every run.
-    if (entry.zig_url) |url| {
-        const core_fetch = try ZigFetch.fetchSave(allocator, io, core_dir, entry.library, url);
-        if (core_fetch.err) |e| return .{ .err = .{ .message = e.message } };
-
-        const artifact = entry.zig_artifact orelse return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' has zig_url set but no zig_artifact -- this should have been caught by `natyv get`'s own validation", .{entry.library}) } };
-        const zig_discover_scratch_name = try std.fmt.allocPrint(allocator, "_natyv_bind_zigdiscover_{s}", .{entry.library});
-        // Registered here, not after the whole `if` block (as this
-        // originally read) -- same "defer only guards what follows its
-        // own declaration" fix as `Vendor.locateSource`'s own cleanup
-        // below, found while auditing that exact shape for the real
-        // Stage 2.6 bug.
-        defer bindgen_dir.deleteTree(io, zig_discover_scratch_name) catch {};
-        const disc = try ZigFetch.discoverHeader(allocator, io, bindgen_dir, bindgen_abs, entry.library, url, artifact);
-        if (disc.err) |e| return .{ .err = .{ .message = e.message } };
-
-        var found_header = false;
-        for (disc.installed_headers) |h| {
-            if (std.mem.eql(u8, h, entry.header)) found_header = true;
-        }
-        if (!found_header) {
-            var listed: std.ArrayList(u8) = .empty;
-            for (disc.installed_headers, 0..) |h, i| {
-                if (i > 0) try listed.appendSlice(allocator, ", ");
-                try listed.appendSlice(allocator, h);
-            }
-            return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' expects header '{s}', but the fetched package only installed: {s} -- override with --header= in `natyv get`", .{ entry.library, entry.header, listed.items }) } };
-        }
-
-        try compile_argv.append(allocator, "-I");
-        try compile_argv.append(allocator, disc.include_dir.?);
-        try reflector_include_dirs.append(allocator, disc.include_dir.?);
-    }
-
-    // Stage 2.6: a `vendor_url` entry fetches raw C source (no build.zig
-    // assumed -- `Vendor.zig`'s own job, genuinely separate from
-    // `ZigFetch.discoverHeader`'s job above) and vendors it permanently
-    // into `<bindgen_dir>/_natyv_bind_vendor_<library>/` (mirroring how
-    // `<library>_bindings_generated.zig` also lives permanently in
-    // `bindgen_dir` -- this is the real, final destination, not scratch).
-    // Tier 1 (`vendor_c_build` unset) compiles `entry.vendor_files`
-    // directly; tier 2 runs the dev's own `vendor_c_build` command first,
-    // then treats `entry.include_dirs`/`.lib_dirs` as relative to the
-    // vendor root (resolved to real absolute paths here, since only this
-    // function knows that root's real path) -- see
-    // `Config.BindingEntry.vendor_c_build`'s own doc comment.
+    // Each mode's own real fetch/discover/vendor work is extracted into
+    // its own dedicated function (`handleZigUrlMode`/`handleVendorUrlMode`,
+    // both above `bindOne`) -- see their own doc comments for the full
+    // per-mode reasoning. `bindOne` itself only dispatches to at most one
+    // (the mutual-exclusivity check at the top of this function
+    // guarantees that) and folds its result into the shared
+    // `compile_argv`/`reflector_include_dirs` state both modes append to.
     var vendor_extra_include_dirs: []const []const u8 = &.{};
     var vendor_extra_lib_dirs: []const []const u8 = &.{};
     var vendor_c_files: []const []const u8 = &.{};
+    if (entry.zig_url) |url| {
+        if (try handleZigUrlMode(allocator, io, entry, core_dir, bindgen_dir, bindgen_abs, url, &compile_argv, &reflector_include_dirs)) |err| return .{ .err = err };
+    }
     if (entry.vendor_url) |url| {
-        const located = try Vendor.locateSource(allocator, io, bindgen_dir, bindgen_abs, entry.library, url);
-        // Registered here, right after `located` is known, not further
-        // down the function -- a `defer` only guards code *after* its own
-        // declaration, so placing it after the whole `if` block (as this
-        // originally read) would skip cleanup on the very next line's
-        // early return whenever `locateSource` itself failed.
-        defer if (located.scratch_dir_name) |n| bindgen_dir.deleteTree(io, n) catch {};
-        if (located.err) |e| return .{ .err = .{ .message = e.message } };
-
-        const permanent_name = try std.fmt.allocPrint(allocator, "_natyv_bind_vendor_{s}", .{entry.library});
-        bindgen_dir.deleteTree(io, permanent_name) catch {};
-        var permanent_dir = bindgen_dir.createDirPathOpen(io, permanent_name, .{}) catch |e| {
-            return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: could not create permanent vendor dir for '{s}': {s}", .{ entry.library, @errorName(e) }) } };
-        };
-        defer permanent_dir.close(io);
-
-        var located_source_dir = std.Io.Dir.cwd().openDir(io, located.source_dir.?, .{ .iterate = true }) catch |e| {
-            return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: could not open '{s}''s located source: {s}", .{ entry.library, @errorName(e) }) } };
-        };
-        defer located_source_dir.close(io);
-        try Vendor.copyTree(allocator, io, located_source_dir, permanent_dir);
-
-        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-        const permanent_abs_len = try permanent_dir.realPath(io, &pbuf);
-        const vendor_dir_abs = try allocator.dupe(u8, pbuf[0..permanent_abs_len]);
-
-        if (entry.vendor_c_build) |cmd| {
-            const build_result = std.process.run(allocator, io, .{
-                .argv = &.{ "/bin/sh", "-c", cmd },
-                .cwd = .{ .dir = permanent_dir },
-            }) catch |e| {
-                return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: could not run '{s}''s vendor_c_build ('{s}'): {s}", .{ entry.library, cmd, @errorName(e) }) } };
-            };
-            defer allocator.free(build_result.stdout);
-            switch (build_result.term) {
-                .exited => |code| {
-                    if (code != 0) {
-                        defer allocator.free(build_result.stderr);
-                        return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' vendor_c_build ('{s}') failed (exit code {d}):\n{s}{s}", .{ entry.library, cmd, code, build_result.stdout, build_result.stderr }) } };
-                    }
-                    allocator.free(build_result.stderr);
-                },
-                else => |term| {
-                    defer allocator.free(build_result.stderr);
-                    return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' vendor_c_build exited abnormally ({any}):\n{s}{s}", .{ entry.library, term, build_result.stdout, build_result.stderr }) } };
-                },
-            }
-
-            var extra_inc: std.ArrayList([]const u8) = .empty;
-            try extra_inc.append(allocator, vendor_dir_abs);
-            for (entry.include_dirs) |rel| try extra_inc.append(allocator, try std.fs.path.join(allocator, &.{ vendor_dir_abs, rel }));
-            vendor_extra_include_dirs = extra_inc.items;
-
-            var extra_lib: std.ArrayList([]const u8) = .empty;
-            for (entry.lib_dirs) |rel| try extra_lib.append(allocator, try std.fs.path.join(allocator, &.{ vendor_dir_abs, rel }));
-            vendor_extra_lib_dirs = extra_lib.items;
-        } else {
-            var files: std.ArrayList([]const u8) = .empty;
-            for (entry.vendor_files) |rel| try files.append(allocator, try std.fs.path.join(allocator, &.{ vendor_dir_abs, rel }));
-            vendor_c_files = files.items;
-
-            // Unlike tier 2 (which resolves the dev's own manual
-            // `entry.include_dirs`, if any), tier 1 has no equivalent
-            // dev-supplied list -- the vendor dir itself is the only
-            // include path this tier ever needs, both for the vendored
-            // `.c` files' own local `#include`s and for the reflector's
-            // `@cInclude(header)`. `allocator.dupe`, not a `&.{...}`
-            // literal -- the latter takes the address of a temporary that
-            // doesn't outlive this function, a real dangling-pointer bug
-            // caught by a real segfault in this file's own live test, not
-            // predicted upfront.
-            vendor_extra_include_dirs = try allocator.dupe([]const u8, &.{vendor_dir_abs});
+        switch (try handleVendorUrlMode(allocator, io, entry, bindgen_dir, bindgen_abs, url, &compile_argv, &reflector_include_dirs)) {
+            .err => |e| return .{ .err = e },
+            .ok => |r| {
+                vendor_extra_include_dirs = r.extra_include_dirs;
+                vendor_extra_lib_dirs = r.extra_lib_dirs;
+                vendor_c_files = r.vendor_c_files;
+            },
         }
-
-        try compile_argv.append(allocator, "-I");
-        try compile_argv.append(allocator, vendor_dir_abs);
-        try reflector_include_dirs.append(allocator, vendor_dir_abs);
     }
 
     // Stage 2.8: a real `zig translate-c` pre-pass, run before the real
@@ -650,6 +704,38 @@ test "a bad NATYV_CORE_SRC is a clear, natyv-attributed error" {
     defer if (outcome.err) |e| allocator.free(e.message);
     try std.testing.expect(outcome.err != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "natyv bind:") != null);
+}
+
+test "maintainability pass: an entry with both zig_url and vendor_url set is rejected with a clear error, not run through both branches" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var guest_dir = try tmp.dir.createDirPathOpen(io, "guest", .{});
+    defer guest_dir.close(io);
+
+    // A real, valid NATYV_CORE_SRC is required here -- `run()` opens
+    // `core_dir`/`bindgen_dir` *before* ever calling `bindOne`, so a fake
+    // path would surface the unrelated "bad NATYV_CORE_SRC" error instead
+    // of ever reaching the new mode-exclusivity check this test exists
+    // to exercise.
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+
+    const bindings = [_]Config.BindingEntry{.{
+        .library = "x",
+        .header = "x.h",
+        .functions = &.{"x"},
+        .zig_url = "https://example.com/does-not-matter.tar.gz",
+        .zig_artifact = "x",
+        .vendor_url = "https://example.com/also-does-not-matter.tar.gz",
+    }};
+    const outcome = try run(allocator, io, &bindings, cwd_path, guest_dir);
+    try std.testing.expect(outcome.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "natyv bind:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "mutually exclusive") != null);
 }
 
 test "an unknown function name is now caught by Stage 2.8's translate-c pre-pass, not a raw compile failure" {
