@@ -1,45 +1,36 @@
-//! `natyv get`'s comptime reflection layer -- Stage 1 of
-//! ~/.claude/plans/lexical-wishing-penguin.md. `@cImport`s the fixture C
-//! header and, for a caller-supplied, comptime-known function name, walks
-//! its real signature via `@field(c, name)` + `@typeInfo` to produce a
-//! plain-data `FnDescriptor` that `Codegen.zig` can turn into Zig
-//! host-trampoline + Go guest-wrapper source text.
+//! `natyv bind`'s comptime reflection layer -- Stage 2.1 of
+//! ~/.claude/plans/lexical-wishing-penguin.md (generalized from Stage 1's
+//! hardcoded-fixture version). `@field`s a caller-supplied `@cImport`
+//! namespace by a caller-supplied, comptime-known function name and walks
+//! its real signature via `@typeInfo` to produce a plain-data
+//! `FnDescriptor` that `Codegen.zig` can turn into Zig host-trampoline +
+//! Go guest-wrapper source text.
 //!
-//! **Never enumerate `@typeInfo(c).@"struct".decls` and reflect every
-//! decl.** A real spike this session found that even this fixture's
-//! completely dependency-free header still produces a `cimport.zig`
-//! containing platform-injected macro decls (`__nonnull` on this machine)
-//! that fail to translate and become `@compileError` stubs -- enumerating
-//! *every* decl forces Zig to evaluate all of them, including the broken
-//! ones, and the whole file fails to compile for a reason that has nothing
-//! to do with the fixture's own real API surface. Referencing a specific,
+//! **Never enumerate `@typeInfo(c_ns).@"struct".decls` and reflect every
+//! decl.** A real spike this session found that even a completely
+//! dependency-free header still produces a `cimport.zig` containing
+//! platform-injected macro decls (`__nonnull` on this machine) that fail
+//! to translate and become `@compileError` stubs -- enumerating *every*
+//! decl forces Zig to evaluate all of them, including the broken ones,
+//! and the whole file fails to compile for a reason that has nothing to
+//! do with the header's own real API surface. Referencing a specific,
 //! known-by-name decl (what `describe` below does) never touches the
 //! broken ones, since Zig's lazy comptime analysis only evaluates
 //! declarations something actually names. This is also a better design on
 //! its own merits, not just a workaround: the dev supplies an explicit
 //! allowlist of exactly which C functions to bind, matching Extism's own
 //! existing allowlist philosophy for network hosts.
+//!
+//! **Generalized in Stage 2.1**: `describe`/`classify` no longer hardcode
+//! a specific `@cImport` namespace or allowlist -- both now take the `c`
+//! namespace as a `comptime type` parameter, so `natyv bind` can generate
+//! a small per-`bindings`-entry scratch program (see `dump_generated.zig`
+//! for the shape this takes) embedding whatever header and function list
+//! a real config entry names, without this file needing to change at all.
+//! Stage 1's own fixture-specific `allowlist` moved to `dump_generated.zig`
+//! and `Codegen.zig`'s own tests, which are the only real remaining
+//! fixture-specific callers.
 const std = @import("std");
-
-// A same-directory relative import, not a duplicate `@cImport` -- two
-// separate `@cImport` blocks over the same header produce two distinct,
-// incompatible Zig types (e.g. two different `FixtureHandle` opaque
-// types), so this file and `Codegen.zig`'s generated output (which
-// imports `fixture.zig` by name, see that file's own doc comment) always
-// agree on exactly one underlying translate-c instance.
-pub const c = @import("fixture.zig").c;
-
-/// The complete, real API surface this fixture proves the generator
-/// against -- exactly the CLAUDE.md-confirmed proof list (opaque handle
-/// create/destroy, one struct out-param, one enum-as-status return, one
-/// callback registration + a real invocation path).
-pub const allowlist = [_][]const u8{
-    "fixture_create",
-    "fixture_destroy",
-    "fixture_get_point",
-    "fixture_set_callback",
-    "fixture_trigger",
-};
 
 /// The four real shapes Stage 1 supports, plus the two building blocks
 /// (plain int/float, and `void` for a function with no return value) they
@@ -180,10 +171,11 @@ fn classify(comptime T: type) ReflectError!Param {
     }
 }
 
-/// `name` must be one of `allowlist`'s own entries, comptime-known --
-/// never call this with a runtime string (see this file's own doc comment
-/// on why blind enumeration is unsafe; a comptime-unknown name would
-/// require exactly that).
+/// `c_ns` is a comptime `@cImport` namespace (a `type`); `name` must be a
+/// comptime-known decl name that's actually present on it -- never call
+/// this with a runtime string (see this file's own doc comment on why
+/// blind enumeration is unsafe; a comptime-unknown name would require
+/// exactly that).
 ///
 /// **`fn_info.is_generic` must be checked before touching `.type`/
 /// `.return_type` on anything** -- confirmed by a real spike (2026-08-25):
@@ -200,8 +192,8 @@ fn classify(comptime T: type) ReflectError!Param {
 /// function wrapper around the macro in their own header instead --
 /// simpler than trying to require the dev to also specify concrete
 /// argument types just to make one macro bindable.
-pub fn describe(comptime name: []const u8) ReflectError!FnDescriptor {
-    const val = @field(c, name);
+pub fn describe(comptime c_ns: type, comptime name: []const u8) ReflectError!FnDescriptor {
+    const val = @field(c_ns, name);
     const fn_info = @typeInfo(@TypeOf(val)).@"fn";
     if (fn_info.is_generic) return error.GenericFunction;
     if (fn_info.params.len > max_params) return error.UnsupportedType;
@@ -214,8 +206,15 @@ pub fn describe(comptime name: []const u8) ReflectError!FnDescriptor {
     return result;
 }
 
+// Test-only: the real fixture's `@cImport` namespace, used to exercise
+// `describe`/`classify` against a real, known surface -- production
+// callers (the scratch reflector `natyv bind` generates per config entry,
+// see `dump_generated.zig`) build their own `c_ns` from whatever header a
+// real `bindings` entry names.
+const fixture_c = @import("fixture.zig").c;
+
 test "fixture_create: one int param, opaque_handle return" {
-    const desc = try describe("fixture_create");
+    const desc = try describe(fixture_c, "fixture_create");
     try std.testing.expectEqualStrings("fixture_create", desc.name);
     try std.testing.expectEqual(@as(usize, 1), desc.params_len);
     try std.testing.expectEqual(ParamKind.int_primitive, desc.params[0].kind);
@@ -224,7 +223,7 @@ test "fixture_create: one int param, opaque_handle return" {
 }
 
 test "fixture_destroy: one opaque_handle param, void return" {
-    const desc = try describe("fixture_destroy");
+    const desc = try describe(fixture_c, "fixture_destroy");
     try std.testing.expectEqual(@as(usize, 1), desc.params_len);
     try std.testing.expectEqual(ParamKind.opaque_handle, desc.params[0].kind);
     try std.testing.expectEqualStrings("FixtureHandle", desc.params[0].type_name);
@@ -232,7 +231,7 @@ test "fixture_destroy: one opaque_handle param, void return" {
 }
 
 test "fixture_get_point: opaque_handle + struct_out_ptr params, int (enum-as-status) return" {
-    const desc = try describe("fixture_get_point");
+    const desc = try describe(fixture_c, "fixture_get_point");
     try std.testing.expectEqual(@as(usize, 2), desc.params_len);
     try std.testing.expectEqual(ParamKind.opaque_handle, desc.params[0].kind);
     try std.testing.expectEqual(ParamKind.struct_out_ptr, desc.params[1].kind);
@@ -249,7 +248,7 @@ test "fixture_get_point: opaque_handle + struct_out_ptr params, int (enum-as-sta
 }
 
 test "fixture_set_callback: opaque_handle + callback_ptr + userdata_ptr params" {
-    const desc = try describe("fixture_set_callback");
+    const desc = try describe(fixture_c, "fixture_set_callback");
     try std.testing.expectEqual(@as(usize, 3), desc.params_len);
     try std.testing.expectEqual(ParamKind.opaque_handle, desc.params[0].kind);
     try std.testing.expectEqual(ParamKind.callback_ptr, desc.params[1].kind);
@@ -261,17 +260,13 @@ test "fixture_set_callback: opaque_handle + callback_ptr + userdata_ptr params" 
 }
 
 test "fixture_trigger: opaque_handle + int params, void return" {
-    const desc = try describe("fixture_trigger");
+    const desc = try describe(fixture_c, "fixture_trigger");
     try std.testing.expectEqual(@as(usize, 2), desc.params_len);
     try std.testing.expectEqual(ParamKind.opaque_handle, desc.params[0].kind);
     try std.testing.expectEqual(ParamKind.int_primitive, desc.params[1].kind);
     try std.testing.expectEqual(ParamKind.void_kind, desc.@"return".kind);
 }
 
-test "allowlist covers every function this fixture proof requires" {
-    try std.testing.expectEqual(@as(usize, 5), allowlist.len);
-}
-
 test "describe rejects a translated function-like macro cleanly instead of crashing on a null .type unwrap" {
-    try std.testing.expectError(error.GenericFunction, describe("FIXTURE_DOUBLE"));
+    try std.testing.expectError(error.GenericFunction, describe(fixture_c, "FIXTURE_DOUBLE"));
 }

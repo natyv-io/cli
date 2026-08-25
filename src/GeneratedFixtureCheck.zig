@@ -26,7 +26,15 @@
 //! real C library, with the right value, for the right handle.
 const std = @import("std");
 const generated = @import("generated_check.zig");
-const fixture = @import("bindgen/fixture.zig").c;
+// Reaches the generated file's *own* `@cImport` instance (`pub const
+// fixture_c` -- see `Codegen.zig`'s own doc comment) rather than a
+// separate `@import("bindgen/fixture.zig")` -- two independent `@cImport`
+// blocks over the same header produce two distinct, incompatible Zig
+// types (the same class of bug `Reflect.zig`'s own doc comment already
+// warns about), which would make `generated.fixture_handle_table.insert`
+// below a real type-mismatch compile error against a separately-imported
+// `fixture.FixtureHandle`.
+const fixture = generated.fixture_c;
 
 test "the real fixture library actually invokes the generated static callback, recording the right value for the right handle" {
     const handle_ptr = fixture.fixture_create(0).?;

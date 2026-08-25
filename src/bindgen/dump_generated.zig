@@ -1,14 +1,27 @@
 //! Tiny helper invoked by `build.zig`'s own codegen step (`bindgen_generated_check`,
-//! see that file's own comment) so Stage 1's "real compile check" can
+//! see that file's own comment) so Stage 1/2.1's "real compile check" can
 //! actually exist as a `zig build test` target: generates the fixture's
-//! full binding output and writes the two halves to the two paths given
-//! as argv, then a separate test module compiles the Zig half for real
-//! against this repo's actual `c.zig`/`host_fn_util.zig`/`HandleTable.zig`.
-//! Not `natyv get` itself (Stage 2's job) -- this only ever runs against
-//! the one hand-written fixture, with no CLI, no arbitrary header input.
+//! full binding output (as the "fixture" library) and writes the two
+//! halves to the two paths given as argv, then a separate test module
+//! compiles the Zig half for real against this repo's actual
+//! `c.zig`/`host_fn_util.zig`/`HandleTable.zig`.
+//! Not `natyv bind` itself (`src/cli/Bind.zig`'s job) -- this only ever
+//! runs against the one hand-written fixture, with no CLI, no arbitrary
+//! header input, matching how `Reflect.zig`/`Codegen.zig` were
+//! deliberately kept generic in Stage 2.1 while this file stayed a fixed,
+//! fixture-specific verification tool.
 const std = @import("std");
 const Reflect = @import("Reflect.zig");
 const Codegen = @import("Codegen.zig");
+const fixture_c = @import("fixture.zig").c;
+
+const allowlist = [_][]const u8{
+    "fixture_create",
+    "fixture_destroy",
+    "fixture_get_point",
+    "fixture_set_callback",
+    "fixture_trigger",
+};
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -24,11 +37,11 @@ pub fn main(init: std.process.Init) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var descs: [Reflect.allowlist.len]Reflect.FnDescriptor = undefined;
-    inline for (Reflect.allowlist, 0..) |name, i| {
-        descs[i] = try Reflect.describe(name);
+    var descs: [allowlist.len]Reflect.FnDescriptor = undefined;
+    inline for (allowlist, 0..) |name, i| {
+        descs[i] = try Reflect.describe(fixture_c, name);
     }
-    const out = try Codegen.generate(allocator, &descs);
+    const out = try Codegen.generate(allocator, "fixture", "fixture.h", &descs);
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zig_out_path, .data = out.zig_source });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = go_out_path, .data = out.go_source });
