@@ -55,3 +55,10 @@ void fixture_trigger(FixtureHandle *handle, int value);
 // params, since a macro has no concrete parameter types until invoked) --
 // confirmed by a real spike, not assumed.
 #define FIXTURE_DOUBLE(x) ((x) * 2)
+
+// Deliberately NOT in `allowlist` -- exists so `TranslateC.zig`'s own
+// Stage 2.8 tests can prove the translate-c pre-pass gives a clean,
+// natyv-attributed "this is a constant, not a function" diagnostic for a
+// plain object-like macro, rather than the confusing "access of inactive
+// union field" a dev would otherwise hit deep inside Reflect.describe.
+#define FIXTURE_VERSION 1

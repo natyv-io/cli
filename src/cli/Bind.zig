@@ -32,12 +32,19 @@
 //! Stage 1's `src/generated_check.zig`. The Go half's destination *is*
 //! real: `guest/<library>_bindings_generated.go`, alongside the guest's
 //! own other generated output (`styletokens_generated.go`).
+//!
+//! **Stage 2.8** added a real `zig translate-c` pre-pass (`TranslateC.zig`)
+//! right before the reflector compile in `bindOne` -- see that file's own
+//! doc comment for why (a hard, unattributed `@compileError` deep inside
+//! a generated `cimport.zig` otherwise, for a name that can't translate
+//! at all).
 
 const std = @import("std");
 const Io = std.Io;
 const Config = @import("Config");
 const ZigFetch = @import("ZigFetch");
 const Vendor = @import("Vendor");
+const TranslateC = @import("TranslateC.zig");
 
 pub const BindError = struct {
     message: []const u8,
@@ -218,9 +225,16 @@ fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, cor
 
     var compile_argv: std.ArrayList([]const u8) = .empty;
     try compile_argv.appendSlice(allocator, &.{ "zig", "build-exe", scratch_name, try std.fmt.allocPrint(allocator, "-femit-bin={s}", .{exe_name}) });
+    // Mirrors `compile_argv`'s own accumulated `-I` flags exactly (a
+    // parallel list rather than re-parsing `compile_argv` after the fact)
+    // -- Stage 2.8's `TranslateC.check` needs the same real include-dir
+    // set the reflector's own `@cInclude(entry.header)` will resolve
+    // against, so a header found by one is guaranteed found by the other.
+    var reflector_include_dirs: std.ArrayList([]const u8) = .empty;
     for (entry.include_dirs) |dir| {
         try compile_argv.append(allocator, "-I");
         try compile_argv.append(allocator, dir);
+        try reflector_include_dirs.append(allocator, dir);
     }
 
     // Stage 2.5: a `-zig`-mode entry has no `include_dirs` of its own (see
@@ -265,6 +279,7 @@ fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, cor
 
         try compile_argv.append(allocator, "-I");
         try compile_argv.append(allocator, disc.include_dir.?);
+        try reflector_include_dirs.append(allocator, disc.include_dir.?);
     }
 
     // Stage 2.6: a `vendor_url` entry fetches raw C source (no build.zig
@@ -359,7 +374,23 @@ fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, cor
 
         try compile_argv.append(allocator, "-I");
         try compile_argv.append(allocator, vendor_dir_abs);
+        try reflector_include_dirs.append(allocator, vendor_dir_abs);
     }
+
+    // Stage 2.8: a real `zig translate-c` pre-pass, run before the real
+    // reflector compile below -- referencing an untranslatable/non-function
+    // name via `@field` inside that compile is either a hard,
+    // unattributed `@compileError` from deep inside a generated
+    // `cimport.zig`, or (for a macro that translates but only into a
+    // generic function) a real but generic reflector-runtime error. This
+    // catches every such case up front with one clean, natyv-attributed
+    // diagnostic per bad name -- see `TranslateC.zig`'s own doc comment
+    // for the real, empirically-confirmed dividing lines. Confirmed cheap
+    // to run unconditionally (~0.2s warm on this machine), not just on a
+    // prior failure.
+    const tc_scratch_name = try std.fmt.allocPrint(allocator, "_natyv_bind_tc_check_{s}_{x}.c", .{ entry.library, pid });
+    const tc_check = try TranslateC.check(allocator, io, bindgen_dir, entry.header, reflector_include_dirs.items, entry.functions, tc_scratch_name);
+    if (!tc_check.ok) return .{ .err = .{ .message = tc_check.err.?.message } };
 
     const compile_result = std.process.run(allocator, io, .{
         .argv = compile_argv.items,
@@ -621,7 +652,7 @@ test "a bad NATYV_CORE_SRC is a clear, natyv-attributed error" {
     try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "natyv bind:") != null);
 }
 
-test "a real compile failure (unknown function name) surfaces a clear, real, natyv-attributed error" {
+test "an unknown function name is now caught by Stage 2.8's translate-c pre-pass, not a raw compile failure" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const io = std.testing.io;
@@ -645,7 +676,39 @@ test "a real compile failure (unknown function name) surfaces a clear, real, nat
     const outcome = try run(allocator, io, &bindings, cwd_path, guest_dir);
     try std.testing.expect(outcome.err != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "natyv bind:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "fixture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "not found in the header") != null);
+}
+
+test "Stage 2.8: a macro-derived generic function and a plain constant are both caught before the real reflector compile, with one combined message" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var guest_dir = try tmp.dir.createDirPathOpen(io, "guest", .{});
+    defer guest_dir.close(io);
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    const fixture_include_dir = try std.fs.path.join(allocator, &.{ cwd_path, "fixtures/bindgen" });
+
+    const bindings = [_]Config.BindingEntry{.{
+        .library = "fixture",
+        .header = "fixture.h",
+        .include_dirs = &.{fixture_include_dir},
+        .functions = &.{ "fixture_create", "FIXTURE_DOUBLE", "FIXTURE_VERSION" },
+    }};
+
+    const outcome = try run(allocator, io, &bindings, cwd_path, guest_dir);
+    try std.testing.expect(outcome.err != null);
+    const msg = outcome.err.?.message;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "natyv bind:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "fixture_create") == null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "FIXTURE_DOUBLE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "generic function") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "FIXTURE_VERSION") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "constant, not a function") != null);
 }
 
 test "Stage 2.6 tier 1: a real, live vendored entry fetches, permanently vendors, and compiles for real" {
