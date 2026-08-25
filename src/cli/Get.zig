@@ -29,6 +29,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Config = @import("Config");
+const PkgConfig = @import("PkgConfig.zig");
 
 pub const GetError = struct {
     message: []const u8,
@@ -42,19 +43,55 @@ pub const Outcome = struct {
     err: ?GetError,
 };
 
+/// `-c`/`-zig` discovery mode (Stage 2.4 of
+/// ~/.claude/plans/lexical-wishing-penguin.md) -- `.manual` (the default)
+/// is Stage 2.3's original fully-manual behavior, unchanged. `-zig` has no
+/// variant here at all: `main.zig`'s `parseGetArgs` rejects it with a
+/// clear "not built yet" error before ever constructing a `GetArgs`, so
+/// `Get.zig` itself never needs to know about it.
+pub const Mode = enum { manual, c };
+
 /// The CLI's own input contract -- kept as its own type rather than a
 /// re-export of `Config.BindingEntry`, even though the fields currently
 /// match one-for-one, since this represents "what the dev typed," not
-/// "what gets persisted."
+/// "what gets persisted." `header` is optional at this type's own level
+/// even though `.manual` mode requires it -- that requirement is enforced
+/// by `main.zig`'s `parseGetArgs` (CLI-level validation, mode-aware),
+/// since `.c` mode legitimately has no required `header` at all (defaults
+/// to `"<library>.h"`, see `run` below).
 pub const GetArgs = struct {
     library: []const u8,
-    header: []const u8,
+    mode: Mode = .manual,
+    header: ?[]const u8 = null,
     include_dirs: []const []const u8 = &.{},
+    lib_dirs: []const []const u8 = &.{},
     link: []const []const u8 = &.{},
     functions: []const []const u8,
 };
 
 pub fn run(allocator: std.mem.Allocator, io: Io, config_path: []const u8, args: GetArgs) !Outcome {
+    var header = args.header;
+    var include_dirs = args.include_dirs;
+    var lib_dirs = args.lib_dirs;
+    var link = args.link;
+
+    if (args.mode == .c) {
+        const disc = try PkgConfig.discover(allocator, io, args.library);
+        if (disc.err) |e| return .{ .updated_existing = false, .err = .{ .message = e.message } };
+        const d = disc.discovery.?;
+        // The dev's own `--header=` always overrides the `<library>.h`
+        // guess (pkg-config's own `.pc` format has no field naming which
+        // header is the public one) -- matches the confirmed design's own
+        // wording exactly. Discovered include_dirs/lib_dirs/link come
+        // first, with anything the dev *also* passed manually appended
+        // after -- an escape hatch to add one more path pkg-config didn't
+        // know about, not a replacement of the discovered set.
+        header = args.header orelse try std.fmt.allocPrint(allocator, "{s}.h", .{args.library});
+        include_dirs = try std.mem.concat(allocator, []const u8, &.{ d.include_dirs, args.include_dirs });
+        lib_dirs = try std.mem.concat(allocator, []const u8, &.{ d.lib_dirs, args.lib_dirs });
+        link = try std.mem.concat(allocator, []const u8, &.{ d.link, args.link });
+    }
+
     const parsed = Config.load(allocator, io, config_path) catch |e| {
         return .{ .updated_existing = false, .err = .{
             .message = try std.fmt.allocPrint(allocator, "natyv get: failed to load {s}: {s}", .{ config_path, @errorName(e) }),
@@ -67,9 +104,10 @@ pub fn run(allocator: std.mem.Allocator, io: Io, config_path: []const u8, args: 
 
     const new_entry = Config.BindingEntry{
         .library = args.library,
-        .header = args.header,
-        .include_dirs = args.include_dirs,
-        .link = args.link,
+        .header = header.?, // guaranteed non-null: required in `.manual` mode (main.zig), defaulted above in `.c` mode
+        .include_dirs = include_dirs,
+        .lib_dirs = lib_dirs,
+        .link = link,
         .functions = args.functions,
     };
 
@@ -231,6 +269,103 @@ test "a missing config file is a clear, natyv-attributed error" {
     const allocator = std.testing.allocator;
 
     const outcome = try run(allocator, io, "/definitely/not/a/real/conf.natyv.json", .{ .library = "zlib", .header = "zlib.h", .functions = &.{"zlibCompileFlags"} });
+    defer if (outcome.err) |e| allocator.free(e.message);
+    try std.testing.expect(outcome.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "natyv get:") != null);
+}
+
+test "-c mode: real pkg-config discovery fills in header/link, no --header= given" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    const abs_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}/conf.natyv.json", .{ cwd_path, tmp.sub_path });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = abs_path, .data = "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}" });
+
+    const outcome = try run(allocator, io, abs_path, .{
+        .library = "zlib",
+        .mode = .c,
+        .functions = &.{"zlibCompileFlags"},
+    });
+    try std.testing.expect(outcome.err == null);
+
+    const reparsed = try Config.load(allocator, io, abs_path);
+    const entry = reparsed.value.bindings[0];
+    try std.testing.expectEqualStrings("zlib.h", entry.header); // the <library>.h default guess
+    try std.testing.expect(entry.link.len >= 1);
+    try std.testing.expectEqualStrings("z", entry.link[0]); // real pkg-config output, not hand-typed
+}
+
+test "-c mode: an explicit --header= overrides the <library>.h default guess" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    const abs_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}/conf.natyv.json", .{ cwd_path, tmp.sub_path });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = abs_path, .data = "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}" });
+
+    _ = try run(allocator, io, abs_path, .{
+        .library = "zlib",
+        .mode = .c,
+        .header = "zconf.h",
+        .functions = &.{"zlibCompileFlags"},
+    });
+
+    const reparsed = try Config.load(allocator, io, abs_path);
+    try std.testing.expectEqualStrings("zconf.h", reparsed.value.bindings[0].header);
+}
+
+test "-c mode: a manually-supplied --link= is appended after the discovered ones, not replacing them" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    const abs_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}/conf.natyv.json", .{ cwd_path, tmp.sub_path });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = abs_path, .data = "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}" });
+
+    _ = try run(allocator, io, abs_path, .{
+        .library = "zlib",
+        .mode = .c,
+        .link = &.{"extrastub"},
+        .functions = &.{"zlibCompileFlags"},
+    });
+
+    const reparsed = try Config.load(allocator, io, abs_path);
+    const link = reparsed.value.bindings[0].link;
+    try std.testing.expectEqual(@as(usize, 2), link.len);
+    try std.testing.expectEqualStrings("z", link[0]); // discovered, comes first
+    try std.testing.expectEqualStrings("extrastub", link[1]); // manual, appended after
+}
+
+test "-c mode: an unknown pkg-config module surfaces pkg-config's own real error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd_path);
+    const abs_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}/conf.natyv.json", .{ cwd_path, tmp.sub_path });
+    defer allocator.free(abs_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = abs_path, .data = "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}" });
+
+    const outcome = try run(allocator, io, abs_path, .{
+        .library = "this_pkgconfig_module_does_not_exist",
+        .mode = .c,
+        .functions = &.{"f"},
+    });
     defer if (outcome.err) |e| allocator.free(e.message);
     try std.testing.expect(outcome.err != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "natyv get:") != null);

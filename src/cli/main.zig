@@ -74,6 +74,9 @@ pub const GetUsageError = error{
     MissingHeader,
     MissingFuncs,
     UnknownFlag,
+    ConflictingMode,
+    ZigFetchNotYetSupported,
+    VendoringNotYetSupported,
 };
 
 /// Returns the value after `prefix` if `arg` starts with it, else `null`.
@@ -83,26 +86,52 @@ fn parseFlag(arg: []const u8, comptime prefix: []const u8) ?[]const u8 {
 }
 
 /// Parses `natyv get`'s own flag-heavy shape: `args[0]` is `<library>`,
-/// the rest are `--header=`/`--include-dir=`/`--link=`/`--funcs=` in any
-/// order. `--include-dir=`/`--link=` are repeatable (each occurrence
-/// appends one value); `--funcs=` is a single comma-separated list. Kept
-/// separate from `parseArgs` since prepare/build/init have no flags today
-/// and don't need this machinery -- allocator-backed (unlike `parseArgs`)
-/// since the repeatable flags need real growable storage.
+/// the rest are `-c`/`-zig` (bare mode-selector flags, optional -- mode
+/// defaults to `.manual`, Stage 2.3's original behavior) and
+/// `--header=`/`--include-dir=`/`--lib-dir=`/`--link=`/`--funcs=` (`=`-
+/// valued, `--include-dir=`/`--lib-dir=`/`--link=` repeatable, each
+/// occurrence appending one value) in any order. Kept separate from
+/// `parseArgs` since prepare/build/init have no flags today and don't
+/// need this machinery -- allocator-backed (unlike `parseArgs`) since the
+/// repeatable flags need real growable storage.
+///
+/// `-zig` is recognized but always errors (`error.ZigFetchNotYetSupported`
+/// -- Stage 2.5) rather than falling through to the generic
+/// `error.UnknownFlag`, which would otherwise be a confusing message for a
+/// flag that *is* part of the confirmed design, just not built yet.
+/// `-c`'s own target reuses `args[0]` (`<library>`) rather than a separate
+/// positional -- the confirmed design already treats the library name and
+/// the discovery target as the same value. A `-c` target containing `/`
+/// is a URL (vendoring, Stage 2.6, also not yet built) rather than a bare
+/// pkg-config module name (real pkg-config module names never contain
+/// one) -- `error.VendoringNotYetSupported` rather than silently
+/// misinterpreting it as a module name pkg-config will just fail to find.
+///
+/// `--header=` is required only in `.manual` mode -- `.c` mode legitimately
+/// has none (defaults to `"<library>.h"`, see `Get.run`).
 pub fn parseGetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Get.GetArgs {
     if (args.len == 0) return error.MissingLibrary;
     const library = args[0];
 
+    var mode: Get.Mode = .manual;
     var header: ?[]const u8 = null;
     var functions: ?[]const []const u8 = null;
     var include_dirs: std.ArrayList([]const u8) = .empty;
+    var lib_dirs: std.ArrayList([]const u8) = .empty;
     var link: std.ArrayList([]const u8) = .empty;
 
     for (args[1..]) |arg| {
-        if (parseFlag(arg, "--header=")) |v| {
+        if (std.mem.eql(u8, arg, "-zig")) {
+            return error.ZigFetchNotYetSupported;
+        } else if (std.mem.eql(u8, arg, "-c")) {
+            if (mode != .manual) return error.ConflictingMode;
+            mode = .c;
+        } else if (parseFlag(arg, "--header=")) |v| {
             header = v;
         } else if (parseFlag(arg, "--include-dir=")) |v| {
             try include_dirs.append(allocator, v);
+        } else if (parseFlag(arg, "--lib-dir=")) |v| {
+            try lib_dirs.append(allocator, v);
         } else if (parseFlag(arg, "--link=")) |v| {
             try link.append(allocator, v);
         } else if (parseFlag(arg, "--funcs=")) |v| {
@@ -115,10 +144,15 @@ pub fn parseGetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Get
         }
     }
 
+    if (mode == .c and std.mem.indexOfScalar(u8, library, '/') != null) return error.VendoringNotYetSupported;
+    if (mode == .manual and header == null) return error.MissingHeader;
+
     return .{
         .library = library,
-        .header = header orelse return error.MissingHeader,
+        .mode = mode,
+        .header = header,
         .include_dirs = include_dirs.items,
+        .lib_dirs = lib_dirs.items,
         .link = link.items,
         .functions = functions orelse return error.MissingFuncs,
     };
@@ -162,10 +196,13 @@ pub fn main(init: std.process.Init) !void {
 
         const get_args = parseGetArgs(arena_alloc, args[1..]) catch |err| {
             switch (err) {
-                error.MissingLibrary => std.debug.print("usage: natyv get <library> --funcs=fn1,fn2 --header=<header> [--include-dir=<dir>]... [--link=<lib>]...\n", .{}),
-                error.MissingHeader => std.debug.print("natyv get: missing required --header=<header>\n", .{}),
+                error.MissingLibrary => std.debug.print("usage: natyv get <library> [-c] --funcs=fn1,fn2 [--header=<header>] [--include-dir=<dir>]... [--lib-dir=<dir>]... [--link=<lib>]...\n", .{}),
+                error.MissingHeader => std.debug.print("natyv get: missing required --header=<header> (only optional in -c mode, where it defaults to <library>.h)\n", .{}),
                 error.MissingFuncs => std.debug.print("natyv get: missing required --funcs=fn1,fn2,...\n", .{}),
-                error.UnknownFlag => std.debug.print("natyv get: unrecognized flag (expected --header=, --include-dir=, --link=, or --funcs=)\n", .{}),
+                error.UnknownFlag => std.debug.print("natyv get: unrecognized flag (expected -c, --header=, --include-dir=, --lib-dir=, --link=, or --funcs=)\n", .{}),
+                error.ConflictingMode => std.debug.print("natyv get: -c can only be given once\n", .{}),
+                error.ZigFetchNotYetSupported => std.debug.print("natyv get: -zig (Zig package fetch) isn't built yet (Stage 2.5) -- use manual mode (no -c/-zig flag) instead\n", .{}),
+                error.VendoringNotYetSupported => std.debug.print("natyv get: -c with a URL/path target (vendoring a C source from an arbitrary URL) isn't built yet (Stage 2.6) -- -c only supports a bare pkg-config module name today\n", .{}),
                 else => std.debug.print("natyv get: could not parse arguments: {}\n", .{err}),
             }
             return err;
@@ -267,6 +304,7 @@ pub fn main(init: std.process.Init) !void {
             // one; this is the minimum real wiring needed to prove a
             // generated binding actually works end to end.
             var binding_include_dirs: []const u8 = "";
+            var binding_lib_dirs: []const u8 = "";
             var binding_link: []const u8 = "";
             if (config.value.bindings.len > 0) {
                 const bind_outcome = try Bind.run(arena_alloc, io, config.value.bindings, natyv_core_src, guest_dir);
@@ -275,6 +313,7 @@ pub fn main(init: std.process.Init) !void {
                     return error.BindFailed;
                 }
                 binding_include_dirs = try std.mem.join(arena_alloc, ",", bind_outcome.include_dirs);
+                binding_lib_dirs = try std.mem.join(arena_alloc, ",", bind_outcome.lib_dirs);
                 binding_link = try std.mem.join(arena_alloc, ",", bind_outcome.link);
             }
 
@@ -313,7 +352,7 @@ pub fn main(init: std.process.Init) !void {
             const wasm_full_path = try std.fs.path.join(arena_alloc, &.{ guest_dir_path, wasm_basename });
 
             std.debug.print("natyv build: {s} -- bundling...\n", .{config.value.name});
-            const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_link);
+            const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link);
             if (bundle_result.err) |e| {
                 std.debug.print("{s}\n", .{e.message});
                 return error.BundleFailed;
@@ -366,7 +405,7 @@ test "parseGetArgs: a full, valid flag set" {
         "--funcs=compress,uncompress,zlibCompileFlags",
     });
     try std.testing.expectEqualStrings("zlib", args.library);
-    try std.testing.expectEqualStrings("zlib.h", args.header);
+    try std.testing.expectEqualStrings("zlib.h", args.header.?);
     try std.testing.expectEqual(@as(usize, 2), args.include_dirs.len);
     try std.testing.expectEqualStrings("/opt/homebrew/include", args.include_dirs[0]);
     try std.testing.expectEqualStrings("/usr/local/include", args.include_dirs[1]);
@@ -410,4 +449,51 @@ test "parseGetArgs: an unrecognized flag is a clear error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(error.UnknownFlag, parseGetArgs(arena.allocator(), &.{ "zlib", "--header=zlib.h", "--funcs=f", "--liink=z" }));
+}
+
+test "parseGetArgs: -c mode does not require --header=" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const args = try parseGetArgs(arena.allocator(), &.{ "zlib", "-c", "--funcs=zlibCompileFlags" });
+    try std.testing.expectEqual(Get.Mode.c, args.mode);
+    try std.testing.expectEqual(@as(?[]const u8, null), args.header);
+}
+
+test "parseGetArgs: -c mode still honors an explicit --header= override" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const args = try parseGetArgs(arena.allocator(), &.{ "zlib", "-c", "--header=zconf.h", "--funcs=f" });
+    try std.testing.expectEqualStrings("zconf.h", args.header.?);
+}
+
+test "parseGetArgs: --lib-dir= is repeatable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const args = try parseGetArgs(arena.allocator(), &.{ "zlib", "--header=zlib.h", "--funcs=f", "--lib-dir=/a", "--lib-dir=/b" });
+    try std.testing.expectEqual(@as(usize, 2), args.lib_dirs.len);
+    try std.testing.expectEqualStrings("/a", args.lib_dirs[0]);
+    try std.testing.expectEqualStrings("/b", args.lib_dirs[1]);
+}
+
+test "parseGetArgs: -zig is recognized but errors clearly (Stage 2.5 not built yet)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.ZigFetchNotYetSupported, parseGetArgs(arena.allocator(), &.{ "github.com/foo/bar", "-zig", "--funcs=f" }));
+}
+
+test "parseGetArgs: -c given twice is a clear conflicting-mode error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // -zig always short-circuits with its own more specific error the
+    // moment it's seen (checked first in the parse loop), regardless of
+    // whether -c already set the mode -- so `-c -zig` together surfaces
+    // as ZigFetchNotYetSupported, not this one. `-c -c` is the real,
+    // reachable trigger for ConflictingMode.
+    try std.testing.expectError(error.ConflictingMode, parseGetArgs(arena.allocator(), &.{ "zlib", "-c", "-c", "--funcs=f" }));
+}
+
+test "parseGetArgs: -c with a URL-shaped target is a clear vendoring-not-yet-supported error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.VendoringNotYetSupported, parseGetArgs(arena.allocator(), &.{ "github.com/madler/zlib", "-c", "--funcs=f" }));
 }

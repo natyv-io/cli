@@ -44,15 +44,17 @@ pub const BindError = struct {
 pub const Outcome = struct {
     /// Number of `bindings` entries successfully processed.
     processed: usize,
-    /// Every `entry.include_dirs`/`entry.link` value across all processed
-    /// entries, concatenated (not deduped -- harmless duplicate `-I`/`-l`
-    /// flags cost nothing) -- `cli/main.zig` joins these into the
-    /// `-Dbinding-include-dirs`/`-Dbinding-link` values `Bundle.zig` passes
-    /// to natyv-core's own `zig build`, since `src/BindingsGenerated.zig`'s
-    /// per-entry `@cInclude`s and the real library symbols they call need
-    /// the exact same include paths/linker flags the reflector's own
+    /// Every `entry.include_dirs`/`entry.lib_dirs`/`entry.link` value
+    /// across all processed entries, concatenated (not deduped -- harmless
+    /// duplicate `-I`/`-L`/`-l` flags cost nothing) -- `cli/main.zig` joins
+    /// these into the `-Dbinding-include-dirs`/`-Dbinding-lib-dirs`/
+    /// `-Dbinding-link` values `Bundle.zig` passes to natyv-core's own
+    /// `zig build`, since `src/BindingsGenerated.zig`'s per-entry
+    /// `@cInclude`s and the real library symbols they call need the exact
+    /// same include/library paths and linker flags the reflector's own
     /// scratch compile already used.
     include_dirs: []const []const u8 = &.{},
+    lib_dirs: []const []const u8 = &.{},
     link: []const []const u8 = &.{},
     err: ?BindError,
 };
@@ -302,6 +304,7 @@ pub fn run(allocator: std.mem.Allocator, io: Io, bindings: []const Config.Bindin
 
     var generated: std.ArrayList(GeneratedEntry) = .empty;
     var include_dirs: std.ArrayList([]const u8) = .empty;
+    var lib_dirs: std.ArrayList([]const u8) = .empty;
     var link: std.ArrayList([]const u8) = .empty;
     var processed: usize = 0;
     for (bindings) |entry| {
@@ -311,13 +314,14 @@ pub fn run(allocator: std.mem.Allocator, io: Io, bindings: []const Config.Bindin
             .ok => |ge| try generated.append(allocator, ge),
         }
         try include_dirs.appendSlice(allocator, entry.include_dirs);
+        try lib_dirs.appendSlice(allocator, entry.lib_dirs);
         try link.appendSlice(allocator, entry.link);
         processed += 1;
     }
 
     try writeAggregator(allocator, io, core_dir, generated.items);
 
-    return .{ .processed = processed, .include_dirs = include_dirs.items, .link = link.items, .err = null };
+    return .{ .processed = processed, .include_dirs = include_dirs.items, .lib_dirs = lib_dirs.items, .link = link.items, .err = null };
 }
 
 test "binds the real fixture against a real config entry, producing correct Go output in the guest dir" {
