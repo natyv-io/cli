@@ -37,7 +37,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const ZigFetch = @import("ZigFetch.zig");
+const ZigFetch = @import("ZigFetch");
 
 pub const VendorError = struct {
     message: []const u8,

@@ -30,7 +30,7 @@ const std = @import("std");
 const Io = std.Io;
 const Config = @import("Config");
 const PkgConfig = @import("PkgConfig.zig");
-const Vendor = @import("Vendor.zig");
+const Vendor = @import("Vendor");
 
 pub const GetError = struct {
     message: []const u8,

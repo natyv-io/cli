@@ -36,6 +36,24 @@
 //! before this: no error, no styletokens_generated.go, an empty token
 //! slice handed to `Codegen.generateGo` exactly as it was hardcoded to
 //! before.
+//!
+//! **Stage 2.7 of the binding generator arc** (~/.claude/plans/lexical-wishing-penguin.md):
+//! `natyv bind` now runs as this function's own first step (via `Bind.run`),
+//! not just a separate step `cli/main.zig`'s `.build` case ran in front of
+//! this file on its own -- so the LSP's own confirmed design (reusing this
+//! exact transpile logic in-process for virtual documents, see CLAUDE.md)
+//! gets binding freshness for free, with zero special-casing. `mode:
+//! .codegen_only` (the real `--codegen` flag's own effect) limits this to
+//! just the stylesheet pass + bind, skipping the `.ntx` walk/transpile
+//! entirely -- Quinn's own reasoning: running real `.ntx` transpilation on
+//! every fast-path invocation would write real `.natyv.go` files into the
+//! dev's guest directory speculatively/frequently, making the codebase
+//! harder to mentally model (which files are hand-written vs. generated)
+//! and slowing down anything calling this often. `natyv build`'s own
+//! pipeline picks `mode` from its existing `BuildCache` freshness check
+//! (`.codegen_only` when fresh, `.full` otherwise) so bind always runs
+//! exactly once per invocation regardless -- it never skips, only the
+//! `.ntx` transpile + `wasm_compile` pair does.
 
 const std = @import("std");
 const Io = std.Io;
@@ -45,6 +63,8 @@ const Validate = @import("Validate");
 const Resolver = @import("Resolver");
 const Stylesheet = @import("Stylesheet");
 const StylingCodegen = @import("StylingCodegen");
+const Config = @import("Config");
+const Bind = @import("Bind");
 
 pub const PrepareError = struct {
     message: []const u8,
@@ -96,9 +116,29 @@ fn extractPackageName(src: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Limits `run` to just the stylesheet pass + `natyv bind` (the real
+/// `--codegen` flag's own effect) when `.codegen_only`; `.full` (the
+/// default, matching this function's pre-Stage-2.7 behavior) also does
+/// the `.ntx` walk/transpile + validation pass.
+pub const Mode = enum { full, codegen_only };
+
 pub const Outcome = struct {
-    /// Number of `.ntx` files successfully transpiled.
+    /// Number of `.ntx` files successfully transpiled -- always 0 in
+    /// `.codegen_only` mode, since that mode never reaches the `.ntx`
+    /// walk at all.
     processed: usize,
+    /// Stage 2.7: `natyv bind`'s own aggregated output (see
+    /// `Bind.Outcome`'s own doc comment on each field) -- surfaced here so
+    /// `cli/main.zig`'s `.build` case can build `Bundle.run`'s flags
+    /// without a separate `Bind.run` call of its own. Empty/default when
+    /// there are no `bindings` entries at all (`Bind.run` itself is never
+    /// called in that case, matching its own established "empty list is a
+    /// real no-op" behavior).
+    binding_include_dirs: []const []const u8 = &.{},
+    binding_lib_dirs: []const []const u8 = &.{},
+    binding_link: []const []const u8 = &.{},
+    binding_zig_deps: []const Bind.ZigDepInfo = &.{},
+    binding_vendor_c_files: []const []const u8 = &.{},
     err: ?PrepareError,
 };
 
@@ -160,10 +200,48 @@ fn findStyleTokens(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir) !Sty
 /// design (see its own tests), and this only ever runs once per real CLI
 /// invocation, so bulk-freeing on process exit is the correct, simplest
 /// choice, not a leak.
-pub fn run(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir) !Outcome {
+///
+/// `bindings`/`natyv_core_src` feed `Bind.run` (Stage 2.7's own fold-in,
+/// see this file's doc comment) -- `natyv_core_src` is unused and may be
+/// anything (e.g. `""`) when `bindings.len == 0`, mirroring `Bind.run`'s
+/// own "empty list is a real no-op, `natyv_core_src` never opened" shape.
+pub fn run(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir, bindings: []const Config.BindingEntry, natyv_core_src: []const u8, mode: Mode) !Outcome {
+    var binding_include_dirs: []const []const u8 = &.{};
+    var binding_lib_dirs: []const []const u8 = &.{};
+    var binding_link: []const []const u8 = &.{};
+    var binding_zig_deps: []const Bind.ZigDepInfo = &.{};
+    var binding_vendor_c_files: []const []const u8 = &.{};
+    if (bindings.len > 0) {
+        const bind_outcome = try Bind.run(allocator, io, bindings, natyv_core_src, guest_dir);
+        if (bind_outcome.err) |e| return .{ .processed = 0, .err = .{ .message = e.message } };
+        binding_include_dirs = bind_outcome.include_dirs;
+        binding_lib_dirs = bind_outcome.lib_dirs;
+        binding_link = bind_outcome.link;
+        binding_zig_deps = bind_outcome.zig_deps;
+        binding_vendor_c_files = bind_outcome.vendor_c_files;
+    }
+
     const style_result = try findStyleTokens(allocator, io, guest_dir);
-    if (style_result.err) |e| return .{ .processed = 0, .err = e };
+    if (style_result.err) |e| return .{
+        .processed = 0,
+        .binding_include_dirs = binding_include_dirs,
+        .binding_lib_dirs = binding_lib_dirs,
+        .binding_link = binding_link,
+        .binding_zig_deps = binding_zig_deps,
+        .binding_vendor_c_files = binding_vendor_c_files,
+        .err = e,
+    };
     const style_tokens = style_result.tokens;
+
+    if (mode == .codegen_only) return .{
+        .processed = 0,
+        .binding_include_dirs = binding_include_dirs,
+        .binding_lib_dirs = binding_lib_dirs,
+        .binding_link = binding_link,
+        .binding_zig_deps = binding_zig_deps,
+        .binding_vendor_c_files = binding_vendor_c_files,
+        .err = null,
+    };
 
     var walker = try guest_dir.walk(allocator);
     defer walker.deinit();
@@ -220,7 +298,15 @@ pub fn run(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir) !Outcome {
         if (!validated.ok) return .{ .processed = processed, .err = .{ .message = validated.err.?.message } };
     }
 
-    return .{ .processed = processed, .err = null };
+    return .{
+        .processed = processed,
+        .binding_include_dirs = binding_include_dirs,
+        .binding_lib_dirs = binding_lib_dirs,
+        .binding_link = binding_link,
+        .binding_zig_deps = binding_zig_deps,
+        .binding_vendor_c_files = binding_vendor_c_files,
+        .err = null,
+    };
 }
 
 test "extractPackageName finds the real leading package declaration" {
@@ -265,7 +351,7 @@ test "transpiles a single .go.ntx file in place and validates cleanly" {
         \\}
     });
 
-    const outcome = try run(allocator, io, tmp.dir);
+    const outcome = try run(allocator, io, tmp.dir, &.{}, "", .full);
     try std.testing.expect(outcome.err == null);
     try std.testing.expectEqual(@as(usize, 1), outcome.processed);
 
@@ -328,7 +414,7 @@ test "transpiles nested .go.ntx files across sub-packages, output lands in each 
         \\}
     });
 
-    const outcome = try run(allocator, io, tmp.dir);
+    const outcome = try run(allocator, io, tmp.dir, &.{}, "", .full);
     try std.testing.expect(outcome.err == null);
     try std.testing.expectEqual(@as(usize, 2), outcome.processed);
 
@@ -351,7 +437,7 @@ test "reports a clear, path-attributed error on a malformed .ntx file, without t
         \\expose Missing
     });
 
-    const outcome = try run(allocator, io, tmp.dir);
+    const outcome = try run(allocator, io, tmp.dir, &.{}, "", .full);
     try std.testing.expect(outcome.err != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "bad.go.ntx") != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "Missing") != null);
@@ -366,7 +452,7 @@ test "a non-.go.ntx extension is a clear, natyv-attributed 'not supported yet' e
     const allocator = arena.allocator();
     try tmp.dir.writeFile(io, .{ .sub_path = "widget.rs.ntx", .data = "package main\n" });
 
-    const outcome = try run(allocator, io, tmp.dir);
+    const outcome = try run(allocator, io, tmp.dir, &.{}, "", .full);
     try std.testing.expect(outcome.err != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "widget.rs.ntx") != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "supported") != null);
@@ -381,7 +467,7 @@ test "a directory with no .ntx files at all processes zero files, no error" {
     const allocator = arena.allocator();
     try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data = "package main\n\nfunc main() {}\n" });
 
-    const outcome = try run(allocator, io, tmp.dir);
+    const outcome = try run(allocator, io, tmp.dir, &.{}, "", .full);
     try std.testing.expect(outcome.err == null);
     try std.testing.expectEqual(@as(usize, 0), outcome.processed);
 }
@@ -410,7 +496,7 @@ test "a real .ntss stylesheet is discovered, resolved, and applied to both real 
         \\}
     });
 
-    const outcome = try run(allocator, io, tmp.dir);
+    const outcome = try run(allocator, io, tmp.dir, &.{}, "", .full);
     try std.testing.expect(outcome.err == null);
     try std.testing.expectEqual(@as(usize, 1), outcome.processed);
 
@@ -446,7 +532,7 @@ test "no .ntss file anywhere in the tree: unchanged behavior, no styletokens_gen
         \\}
     });
 
-    const outcome = try run(allocator, io, tmp.dir);
+    const outcome = try run(allocator, io, tmp.dir, &.{}, "", .full);
     try std.testing.expect(outcome.err == null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(io, "styletokens_generated.go", allocator, .unlimited));
 }
@@ -464,7 +550,7 @@ test "a second .ntss file anywhere in the tree is a clear, natyv-attributed erro
     defer sub.close(io);
     try sub.writeFile(io, .{ .sub_path = "more.ntss", .data = "other { margin: 8 }" });
 
-    const outcome = try run(allocator, io, tmp.dir);
+    const outcome = try run(allocator, io, tmp.dir, &.{}, "", .full);
     try std.testing.expect(outcome.err != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "styles.ntss") != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "more.ntss") != null);
@@ -480,7 +566,7 @@ test "a malformed .ntss stylesheet is a clear, path-attributed parse error" {
 
     try tmp.dir.writeFile(io, .{ .sub_path = "styles.ntss", .data = "broken {\n  margin 4\n}\n" });
 
-    const outcome = try run(allocator, io, tmp.dir);
+    const outcome = try run(allocator, io, tmp.dir, &.{}, "", .full);
     try std.testing.expect(outcome.err != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "styles.ntss") != null);
 }
@@ -495,8 +581,138 @@ test "a .ntss stylesheet with an unrecognized field is a clear, path-attributed 
 
     try tmp.dir.writeFile(io, .{ .sub_path = "styles.ntss", .data = "bad { boarder: 4 }" });
 
-    const outcome = try run(allocator, io, tmp.dir);
+    const outcome = try run(allocator, io, tmp.dir, &.{}, "", .full);
     try std.testing.expect(outcome.err != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "styles.ntss") != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "boarder") != null);
+}
+
+test "Stage 2.7: natyv bind runs as run()'s own first step, real fixture entry produces real Go output" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    const fixture_include_dir = try std.fs.path.join(allocator, &.{ cwd_path, "fixtures/bindgen" });
+    const bindings = [_]Config.BindingEntry{.{
+        .library = "fixture",
+        .header = "fixture.h",
+        .include_dirs = &.{fixture_include_dir},
+        .functions = &.{"fixture_ping"},
+    }};
+
+    const outcome = try run(allocator, io, tmp.dir, &bindings, cwd_path, .full);
+    defer {
+        var bg = std.Io.Dir.cwd().openDir(io, "src/bindgen", .{}) catch unreachable;
+        defer bg.close(io);
+        bg.deleteFile(io, "fixture_bindings_generated.zig") catch {};
+    }
+    var src_dir_cleanup = try std.Io.Dir.cwd().openDir(io, "src", .{});
+    defer {
+        src_dir_cleanup.deleteFile(io, "BindingsGenerated.zig") catch {};
+        src_dir_cleanup.close(io);
+    }
+    try std.testing.expect(outcome.err == null);
+    try std.testing.expectEqual(@as(usize, 1), outcome.binding_include_dirs.len);
+
+    const go_out = try tmp.dir.readFileAlloc(io, "fixture_bindings_generated.go", allocator, .unlimited);
+    try std.testing.expect(std.mem.indexOf(u8, go_out, "func FixturePing(") != null);
+}
+
+test "Stage 2.7: .codegen_only mode runs bind but skips .ntx transpile entirely" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    const fixture_include_dir = try std.fs.path.join(allocator, &.{ cwd_path, "fixtures/bindgen" });
+    const bindings = [_]Config.BindingEntry{.{
+        .library = "fixture",
+        .header = "fixture.h",
+        .include_dirs = &.{fixture_include_dir},
+        .functions = &.{"fixture_ping"},
+    }};
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "go.mod", .data = "module preptest\n\ngo 1.23\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "page.go.ntx", .data =
+        \\package main
+        \\
+        \\expose Page
+        \\
+        \\func Page(parent widgets.Container) error {
+        \\  <Label>hi</Label>
+        \\}
+    });
+
+    const outcome = try run(allocator, io, tmp.dir, &bindings, cwd_path, .codegen_only);
+    defer {
+        var bg = std.Io.Dir.cwd().openDir(io, "src/bindgen", .{}) catch unreachable;
+        defer bg.close(io);
+        bg.deleteFile(io, "fixture_bindings_generated.zig") catch {};
+    }
+    var src_dir_cleanup = try std.Io.Dir.cwd().openDir(io, "src", .{});
+    defer {
+        src_dir_cleanup.deleteFile(io, "BindingsGenerated.zig") catch {};
+        src_dir_cleanup.close(io);
+    }
+    try std.testing.expect(outcome.err == null);
+    try std.testing.expectEqual(@as(usize, 0), outcome.processed);
+    try std.testing.expectEqual(@as(usize, 1), outcome.binding_include_dirs.len);
+
+    // Real bind output still lands (bind is never skipped by `.codegen_only`).
+    _ = try tmp.dir.readFileAlloc(io, "fixture_bindings_generated.go", allocator, .unlimited);
+    // But the .ntx file is genuinely untouched -- no .natyv.go/.go split at all.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(io, "page.natyv.go", allocator, .unlimited));
+}
+
+test "Stage 2.7: a real bind failure surfaces as a clear PrepareError before any .ntx work happens" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    const fixture_include_dir = try std.fs.path.join(allocator, &.{ cwd_path, "fixtures/bindgen" });
+    const bindings = [_]Config.BindingEntry{.{
+        .library = "fixture",
+        .header = "fixture.h",
+        .include_dirs = &.{fixture_include_dir},
+        .functions = &.{"this_function_does_not_exist"},
+    }};
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "go.mod", .data = "module preptest\n\ngo 1.23\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "page.go.ntx", .data =
+        \\package main
+        \\
+        \\expose Page
+        \\
+        \\func Page(parent widgets.Container) error {
+        \\  <Label>hi</Label>
+        \\}
+    });
+
+    const outcome = try run(allocator, io, tmp.dir, &bindings, cwd_path, .full);
+    try std.testing.expect(outcome.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "natyv bind:") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(io, "page.natyv.go", allocator, .unlimited));
+}
+
+test "Stage 2.7: an empty bindings list is a real no-op, run() behaves exactly as before" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const outcome = try run(allocator, io, tmp.dir, &.{}, "", .codegen_only);
+    try std.testing.expect(outcome.err == null);
+    try std.testing.expectEqual(@as(usize, 0), outcome.processed);
+    try std.testing.expectEqual(@as(usize, 0), outcome.binding_include_dirs.len);
 }

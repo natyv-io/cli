@@ -12,8 +12,19 @@
 //! successful compile), producing a genuinely self-contained binary.
 //! `natyv init` interactively scaffolds a new app in place. `natyv get`
 //! (Stage 2.3 of the binding generator arc) declares one `bindings` entry
-//! in `conf.natyv.json`; `natyv bind`, run automatically as part of
-//! `natyv build` today, is what actually generates from it.
+//! in `conf.natyv.json`; `natyv bind` is what actually generates from it --
+//! Stage 2.7 folded that generation step into `Prepare.run` itself (its
+//! own first step, real Bind.zig import via the named "Bind" module, not
+//! this file directly -- see `Prepare.zig`'s own doc comment for why: a
+//! plain `@import("Bind.zig")` here would conflict with `Prepare`'s own
+//! named "Bind" import once both land in this same executable's build
+//! graph, confirmed the hard way via a real "file exists in modules
+//! 'root' and 'Bind'" compile error). `natyv prepare --codegen` limits
+//! `Prepare.run` to just the stylesheet pass + bind, skipping `.ntx`
+//! transpilation -- `natyv build`'s own pipeline picks the equivalent
+//! mode from its existing `BuildCache` freshness check instead of a CLI
+//! flag, so bind always runs exactly once per invocation regardless of
+//! freshness, while `.ntx` transpile + `wasm_compile` stay skippable.
 
 const std = @import("std");
 const Config = @import("Config");
@@ -21,7 +32,6 @@ const Prepare = @import("Prepare");
 const Compile = @import("Compile.zig");
 const BuildCache = @import("BuildCache");
 const Bundle = @import("Bundle.zig");
-const Bind = @import("Bind.zig");
 const Get = @import("Get.zig");
 const Init = @import("Init.zig");
 const build_options = @import("build_options");
@@ -33,6 +43,12 @@ pub const ParsedArgs = struct {
     /// Meaningless for `.init`/`.get` (see doc comment below) -- always
     /// populated anyway so callers don't need to special-case reading it.
     config_path: []const u8,
+    /// Only meaningful for `.prepare` (Stage 2.7) -- limits it to the
+    /// stylesheet pass + `natyv bind`, skipping `.ntx` transpilation.
+    /// Always `false` for every other subcommand; `.build` computes its
+    /// own equivalent mode from `BuildCache`'s freshness check instead of
+    /// reading this field.
+    codegen: bool = false,
 };
 
 pub const UsageError = error{
@@ -51,6 +67,12 @@ pub const UsageError = error{
 /// function's simple "one optional config path" model at all) -- for
 /// both, `args[1..]` is deliberately ignored/left for the caller to
 /// reinterpret rather than misparsed as a config path here.
+///
+/// `--codegen` (Stage 2.7, only meaningful for `.prepare`) can appear
+/// anywhere in `args[1..]`, in either order relative to an optional config
+/// path -- the first non-flag argument is still taken as `config_path`,
+/// exactly matching pre-Stage-2.7 behavior when `--codegen` is absent.
+///
 /// Kept as a pure function, separate from `main`, so it's testable without
 /// a real process.
 pub fn parseArgs(args: []const []const u8) UsageError!ParsedArgs {
@@ -65,8 +87,17 @@ pub fn parseArgs(args: []const []const u8) UsageError!ParsedArgs {
         .get
     else
         return error.UnknownSubcommand;
-    const config_path: []const u8 = if (args.len > 1) args[1] else "conf.natyv.json";
-    return .{ .subcommand = subcommand, .config_path = config_path };
+
+    var config_path: []const u8 = "conf.natyv.json";
+    var codegen = false;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--codegen")) {
+            codegen = true;
+        } else {
+            config_path = arg;
+        }
+    }
+    return .{ .subcommand = subcommand, .config_path = config_path, .codegen = codegen };
 }
 
 pub const GetUsageError = error{
@@ -306,7 +337,15 @@ pub fn main(init: std.process.Init) !void {
 
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
-            const outcome = try Prepare.run(arena.allocator(), io, guest_dir);
+
+            // Stage 2.7: `natyv bind` runs as `Prepare.run`'s own first
+            // step now -- `NATYV_CORE_SRC` resolved here (never needed by
+            // this subcommand before) the same way `.build`'s case
+            // already does, since bind needs it whenever there are any
+            // `bindings` entries at all.
+            const natyv_core_src = init.environ_map.get("NATYV_CORE_SRC") orelse build_options.natyv_core_src_default;
+            const mode: Prepare.Mode = if (parsed.codegen) .codegen_only else .full;
+            const outcome = try Prepare.run(arena.allocator(), io, guest_dir, config.value.bindings, natyv_core_src, mode);
             if (outcome.err) |e| {
                 std.debug.print("{s}\n", .{e.message});
                 return error.PrepareFailed;
@@ -329,66 +368,60 @@ pub fn main(init: std.process.Init) !void {
             // root for a local dev build, or wherever a real packaging
             // wrapper installs natyv-core's source for a real install)
             // when set, but a real install never needs to set it at all.
-            // Resolved early (not just before bundling, as originally
-            // written) since Stage 2.2's `Bind.run` below also needs it.
+            // Resolved early since `Prepare.run` below needs it whenever
+            // there are any `bindings` entries.
             const natyv_core_src = init.environ_map.get("NATYV_CORE_SRC") orelse build_options.natyv_core_src_default;
-
-            // Stage 2.2 of the binding generator arc
-            // (~/.claude/plans/lexical-wishing-penguin.md): a real, if
-            // provisional, integration point ahead of the
-            // freshness/prepare/compile sequence below -- folding `natyv
-            // bind` properly into `natyv prepare` itself (with its own
-            // `--codegen` fast-path flag) is Stage 2.7's job, not this
-            // one; this is the minimum real wiring needed to prove a
-            // generated binding actually works end to end.
-            var binding_include_dirs: []const u8 = "";
-            var binding_lib_dirs: []const u8 = "";
-            var binding_link: []const u8 = "";
-            var binding_zig_deps: []const u8 = "";
-            var binding_vendor_c_files: []const u8 = "";
-            if (config.value.bindings.len > 0) {
-                const bind_outcome = try Bind.run(arena_alloc, io, config.value.bindings, natyv_core_src, guest_dir);
-                if (bind_outcome.err) |e| {
-                    std.debug.print("{s}\n", .{e.message});
-                    return error.BindFailed;
-                }
-                binding_include_dirs = try std.mem.join(arena_alloc, ",", bind_outcome.include_dirs);
-                binding_lib_dirs = try std.mem.join(arena_alloc, ",", bind_outcome.lib_dirs);
-                binding_link = try std.mem.join(arena_alloc, ",", bind_outcome.link);
-
-                // Stage 2.5: `name:artifact` pairs for `build.zig`'s own
-                // `-Dbinding-zig-deps` loop (see that file's comment on
-                // why a `-zig`-mode entry needs `b.dependency(...).artifact(...)`
-                // + `linkLibrary`, not flags like the other three above).
-                var zig_deps_parts: std.ArrayList(u8) = .empty;
-                for (bind_outcome.zig_deps, 0..) |zd, zi| {
-                    if (zi > 0) try zig_deps_parts.append(arena_alloc, ',');
-                    try zig_deps_parts.appendSlice(arena_alloc, try std.fmt.allocPrint(arena_alloc, "{s}:{s}", .{ zd.name, zd.artifact }));
-                }
-                binding_zig_deps = zig_deps_parts.items;
-
-                // Stage 2.6: absolute `.c` file paths (tier-1 default
-                // vendoring) for `build.zig`'s own `-Dbinding-vendor-c-files`
-                // -- a plain comma list, unlike `zig_deps` above, since
-                // `build.zig` doesn't need to know which library a file
-                // belongs to, only that it's part of `bindings_mod`.
-                binding_vendor_c_files = try std.mem.join(arena_alloc, ",", bind_outcome.vendor_c_files);
-            }
 
             // Checked once, up front, before running anything -- Quinn's
             // own design: if nothing that affects the compiled wasm has
             // changed since the last successful wasm_compile, skip
-            // straight to bundling instead of redoing prepare/compile.
+            // straight to `.ntx` transpile + wasm_compile in favor of
+            // going straight to bundling. Stage 2.7: this now picks
+            // `Prepare.run`'s own `Mode` instead of gating a separate call
+            // to it entirely -- `natyv bind` (folded into `Prepare.run`'s
+            // own first step) must always run regardless, since
+            // `Bundle.run` below needs its aggregated output on every
+            // invocation, fresh or not; only the `.ntx` walk/transpile
+            // itself (and, further down, `wasm_compile`) are skippable.
             const wasm_basename = try config.value.wasmFilename(arena_alloc);
-            if (try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename)) {
+            const fresh = try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename);
+            const mode: Prepare.Mode = if (fresh) .codegen_only else .full;
+
+            const outcome = try Prepare.run(arena_alloc, io, guest_dir, config.value.bindings, natyv_core_src, mode);
+            if (outcome.err) |e| {
+                std.debug.print("{s}\n", .{e.message});
+                return error.PrepareFailed;
+            }
+
+            // Stage 2.2/2.5/2.6: `Bundle.run`'s own build.zig flags, now
+            // read from `Prepare.run`'s own `Outcome` (which folds in
+            // `Bind.run`'s aggregated output as of Stage 2.7) instead of a
+            // separate `Bind.run` call this case used to make itself.
+            const binding_include_dirs = try std.mem.join(arena_alloc, ",", outcome.binding_include_dirs);
+            const binding_lib_dirs = try std.mem.join(arena_alloc, ",", outcome.binding_lib_dirs);
+            const binding_link = try std.mem.join(arena_alloc, ",", outcome.binding_link);
+
+            // Stage 2.5: `name:artifact` pairs for `build.zig`'s own
+            // `-Dbinding-zig-deps` loop (see that file's comment on why a
+            // `-zig`-mode entry needs `b.dependency(...).artifact(...)` +
+            // `linkLibrary`, not flags like the other three above).
+            var zig_deps_parts: std.ArrayList(u8) = .empty;
+            for (outcome.binding_zig_deps, 0..) |zd, zi| {
+                if (zi > 0) try zig_deps_parts.append(arena_alloc, ',');
+                try zig_deps_parts.appendSlice(arena_alloc, try std.fmt.allocPrint(arena_alloc, "{s}:{s}", .{ zd.name, zd.artifact }));
+            }
+            const binding_zig_deps = zig_deps_parts.items;
+
+            // Stage 2.6: absolute `.c` file paths (tier-1 default
+            // vendoring) for `build.zig`'s own `-Dbinding-vendor-c-files`
+            // -- a plain comma list, unlike `zig_deps` above, since
+            // `build.zig` doesn't need to know which library a file
+            // belongs to, only that it's part of `bindings_mod`.
+            const binding_vendor_c_files = try std.mem.join(arena_alloc, ",", outcome.binding_vendor_c_files);
+
+            if (fresh) {
                 std.debug.print("natyv build: {s} -- wasm is already up to date, skipping prepare/wasm_compile\n", .{config.value.name});
             } else {
-                const outcome = try Prepare.run(arena_alloc, io, guest_dir);
-                if (outcome.err) |e| {
-                    std.debug.print("{s}\n", .{e.message});
-                    return error.PrepareFailed;
-                }
-
                 std.debug.print("natyv build: {s} -- running wasm_compile...\n", .{config.value.name});
                 const compile_result = try Compile.run(arena_alloc, io, config.value.wasm_compile, guest_dir);
                 if (compile_result.err) |e| {

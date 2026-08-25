@@ -36,8 +36,8 @@
 const std = @import("std");
 const Io = std.Io;
 const Config = @import("Config");
-const ZigFetch = @import("ZigFetch.zig");
-const Vendor = @import("Vendor.zig");
+const ZigFetch = @import("ZigFetch");
+const Vendor = @import("Vendor");
 
 pub const BindError = struct {
     message: []const u8,
@@ -189,9 +189,18 @@ fn parseMeta(allocator: std.mem.Allocator, library: []const u8, meta_text: []con
 }
 
 fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, core_dir: Io.Dir, bindgen_dir: Io.Dir, bindgen_abs: []const u8, guest_abs: []const u8) !BindOneResult {
-    const scratch_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}.zig", .{entry.library});
-    const exe_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_exe", .{entry.library});
-    const meta_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}.meta", .{entry.library});
+    // PID-suffixed, not just keyed by `entry.library` -- Stage 2.7 made
+    // `bind_module` reachable from more than one independently-running
+    // test binary for the first time (`bind_tests` directly, and
+    // `ntx_prepare_tests` via `Prepare`'s new named "Bind" import), and
+    // both binaries' own real fixture-library tests (`library = "fixture"`)
+    // raced on this exact fixed path, reproduced as a real, non-flaky
+    // failure -- the identical root cause already found and fixed for
+    // `ZigFetch.zig`/`Vendor.zig`'s own scratch dirs.
+    const pid = std.c.getpid();
+    const scratch_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_{x}.zig", .{ entry.library, pid });
+    const exe_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_{x}_exe", .{ entry.library, pid });
+    const meta_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_{x}.meta", .{ entry.library, pid });
     defer bindgen_dir.deleteFile(io, scratch_name) catch {};
     defer bindgen_dir.deleteFile(io, exe_name) catch {};
     defer bindgen_dir.deleteFile(io, meta_name) catch {};
