@@ -17,6 +17,7 @@ const Prepare = @import("Prepare");
 const Compile = @import("Compile.zig");
 const BuildCache = @import("BuildCache");
 const Bundle = @import("Bundle.zig");
+const Bind = @import("Bind.zig");
 const Init = @import("Init.zig");
 const build_options = @import("build_options");
 
@@ -148,6 +149,35 @@ pub fn main(init: std.process.Init) !void {
             defer arena.deinit();
             const arena_alloc = arena.allocator();
 
+            // `NATYV_CORE_SRC` overrides the compile-time-baked default
+            // (`build_options.natyv_core_src_default` -- this repo's own
+            // root for a local dev build, or wherever a real packaging
+            // wrapper installs natyv-core's source for a real install)
+            // when set, but a real install never needs to set it at all.
+            // Resolved early (not just before bundling, as originally
+            // written) since Stage 2.2's `Bind.run` below also needs it.
+            const natyv_core_src = init.environ_map.get("NATYV_CORE_SRC") orelse build_options.natyv_core_src_default;
+
+            // Stage 2.2 of the binding generator arc
+            // (~/.claude/plans/lexical-wishing-penguin.md): a real, if
+            // provisional, integration point ahead of the
+            // freshness/prepare/compile sequence below -- folding `natyv
+            // bind` properly into `natyv prepare` itself (with its own
+            // `--codegen` fast-path flag) is Stage 2.7's job, not this
+            // one; this is the minimum real wiring needed to prove a
+            // generated binding actually works end to end.
+            var binding_include_dirs: []const u8 = "";
+            var binding_link: []const u8 = "";
+            if (config.value.bindings.len > 0) {
+                const bind_outcome = try Bind.run(arena_alloc, io, config.value.bindings, natyv_core_src, guest_dir);
+                if (bind_outcome.err) |e| {
+                    std.debug.print("{s}\n", .{e.message});
+                    return error.BindFailed;
+                }
+                binding_include_dirs = try std.mem.join(arena_alloc, ",", bind_outcome.include_dirs);
+                binding_link = try std.mem.join(arena_alloc, ",", bind_outcome.link);
+            }
+
             // Checked once, up front, before running anything -- Quinn's
             // own design: if nothing that affects the compiled wasm has
             // changed since the last successful wasm_compile, skip
@@ -176,14 +206,6 @@ pub fn main(init: std.process.Init) !void {
             // Bundling always runs regardless of freshness -- freshness
             // only ever skips prepare/wasm_compile, never the final
             // bundle step, per Quinn's own explicit design.
-            //
-            // `NATYV_CORE_SRC` overrides the compile-time-baked default
-            // (`build_options.natyv_core_src_default` -- this repo's own
-            // root for a local dev build, or wherever a real packaging
-            // wrapper installs natyv-core's source for a real install)
-            // when set, but a real install never needs to set it at all.
-            const natyv_core_src = init.environ_map.get("NATYV_CORE_SRC") orelse build_options.natyv_core_src_default;
-
             const dist_dir_path = try std.fs.path.join(arena_alloc, &.{ config_dir, "dist" });
             var dist_dir = try std.Io.Dir.cwd().createDirPathOpen(io, dist_dir_path, .{});
             defer dist_dir.close(io);
@@ -191,7 +213,7 @@ pub fn main(init: std.process.Init) !void {
             const wasm_full_path = try std.fs.path.join(arena_alloc, &.{ guest_dir_path, wasm_basename });
 
             std.debug.print("natyv build: {s} -- bundling...\n", .{config.value.name});
-            const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, dist_dir, config.value.name);
+            const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_link);
             if (bundle_result.err) |e| {
                 std.debug.print("{s}\n", .{e.message});
                 return error.BundleFailed;

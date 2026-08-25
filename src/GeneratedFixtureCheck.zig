@@ -1,10 +1,10 @@
 //! Stage 1's real compile check for the binding generator
 //! (~/.claude/plans/lexical-wishing-penguin.md) -- `build.zig`'s
 //! `bindgen_generated_check` test target points its root module directly
-//! at this file, which in turn `@import`s `generated_check.zig`, a real
-//! file `Codegen.generate`'s output gets written to fresh on every `zig
-//! build test` (gitignored -- see `.gitignore`, `build.zig`'s own comment
-//! on why a real path rather than an opaque build-cache one). Zig
+//! at this file, which in turn `@import`s `bindgen/generated_check.zig`, a
+//! real file `Codegen.generate`'s output gets written to fresh on every
+//! `zig build test` (gitignored -- see `.gitignore`, `build.zig`'s own
+//! comment on why a real path rather than an opaque build-cache one). Zig
 //! transitively compiles and runs tests from every file it actually
 //! analyzes (an established, already-documented behavior in this
 //! project's own CLAUDE.md Toolchain section), so this file existing at
@@ -25,7 +25,7 @@
 //! static callback natyv registers really is being called back by the
 //! real C library, with the right value, for the right handle.
 const std = @import("std");
-const generated = @import("generated_check.zig");
+const generated = @import("bindgen/generated_check.zig");
 // Reaches the generated file's *own* `@cImport` instance (`pub const
 // fixture_c` -- see `Codegen.zig`'s own doc comment) rather than a
 // separate `@import("bindgen/fixture.zig")` -- two independent `@cImport`

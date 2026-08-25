@@ -44,6 +44,16 @@ pub const BindError = struct {
 pub const Outcome = struct {
     /// Number of `bindings` entries successfully processed.
     processed: usize,
+    /// Every `entry.include_dirs`/`entry.link` value across all processed
+    /// entries, concatenated (not deduped -- harmless duplicate `-I`/`-l`
+    /// flags cost nothing) -- `cli/main.zig` joins these into the
+    /// `-Dbinding-include-dirs`/`-Dbinding-link` values `Bundle.zig` passes
+    /// to natyv-core's own `zig build`, since `src/BindingsGenerated.zig`'s
+    /// per-entry `@cInclude`s and the real library symbols they call need
+    /// the exact same include paths/linker flags the reflector's own
+    /// scratch compile already used.
+    include_dirs: []const []const u8 = &.{},
+    link: []const []const u8 = &.{},
     err: ?BindError,
 };
 
@@ -71,12 +81,13 @@ fn buildReflectorSource(allocator: std.mem.Allocator, entry: Config.BindingEntry
         \\pub fn main(init: std.process.Init) !void {{
         \\    const io = init.io;
         \\    const argv = init.minimal.args.vector;
-        \\    if (argv.len != 3) {{
-        \\        std.debug.print("usage: <scratch-reflector> <zig-out-path> <go-out-path>\n", .{{}});
+        \\    if (argv.len != 4) {{
+        \\        std.debug.print("usage: <scratch-reflector> <zig-out-path> <go-out-path> <meta-out-path>\n", .{{}});
         \\        return error.BadArgs;
         \\    }}
         \\    const zig_out_path = std.mem.span(argv[1]);
         \\    const go_out_path = std.mem.span(argv[2]);
+        \\    const meta_out_path = std.mem.span(argv[3]);
         \\
         \\    var arena = std.heap.ArenaAllocator.init(init.gpa);
         \\    defer arena.deinit();
@@ -90,16 +101,66 @@ fn buildReflectorSource(allocator: std.mem.Allocator, entry: Config.BindingEntry
         \\
         \\    try std.Io.Dir.cwd().writeFile(io, .{{ .sub_path = zig_out_path, .data = out.zig_source }});
         \\    try std.Io.Dir.cwd().writeFile(io, .{{ .sub_path = go_out_path, .data = out.go_source }});
+        \\
+        \\    // Simple "extism_name|zig_fn_name" lines -- read back by the
+        \\    // real `natyv bind` process to build the aggregator registrar
+        \\    // (`BindingsGenerated.zig`), since the reflector runs as a
+        \\    // separate subprocess and can't hand structured data back any
+        \\    // other way.
+        \\    var meta: std.ArrayList(u8) = .empty;
+        \\    for (out.host_functions) |hf| {{
+        \\        try meta.appendSlice(allocator, hf.extism_name);
+        \\        try meta.append(allocator, '|');
+        \\        try meta.appendSlice(allocator, hf.zig_fn_name);
+        \\        try meta.append(allocator, '\n');
+        \\    }}
+        \\    try std.Io.Dir.cwd().writeFile(io, .{{ .sub_path = meta_out_path, .data = meta.items }});
         \\}}
         \\
     , .{ entry.header, funcs_list.items, entry.library, entry.header });
 }
 
-fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, bindgen_dir: Io.Dir, bindgen_abs: []const u8, guest_abs: []const u8) !?BindError {
+/// Plain local mirror of `src/bindgen/Codegen.zig`'s own
+/// `HostFunctionInfo` -- deliberately not a cross-module import of that
+/// type (would need a whole new named "Codegen" build.zig module just
+/// for one small struct shape); this file only ever reads the meta lines
+/// the scratch reflector wrote, it never touches `Codegen.zig` directly.
+const HostFunctionInfo = struct {
+    extism_name: []const u8,
+    zig_fn_name: []const u8,
+};
+
+const GeneratedEntry = struct {
+    library: []const u8,
+    host_functions: []const HostFunctionInfo,
+};
+
+const BindOneResult = union(enum) {
+    ok: GeneratedEntry,
+    err: BindError,
+};
+
+fn parseMeta(allocator: std.mem.Allocator, library: []const u8, meta_text: []const u8) !GeneratedEntry {
+    var host_functions: std.ArrayList(HostFunctionInfo) = .empty;
+    var lines = std.mem.splitScalar(u8, meta_text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const sep = std.mem.indexOfScalar(u8, line, '|') orelse continue;
+        try host_functions.append(allocator, .{
+            .extism_name = try allocator.dupe(u8, line[0..sep]),
+            .zig_fn_name = try allocator.dupe(u8, line[sep + 1 ..]),
+        });
+    }
+    return .{ .library = library, .host_functions = try host_functions.toOwnedSlice(allocator) };
+}
+
+fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, bindgen_dir: Io.Dir, bindgen_abs: []const u8, guest_abs: []const u8) !BindOneResult {
     const scratch_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}.zig", .{entry.library});
     const exe_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_exe", .{entry.library});
+    const meta_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}.meta", .{entry.library});
     defer bindgen_dir.deleteFile(io, scratch_name) catch {};
     defer bindgen_dir.deleteFile(io, exe_name) catch {};
+    defer bindgen_dir.deleteFile(io, meta_name) catch {};
 
     const reflector_src = try buildReflectorSource(allocator, entry);
     try bindgen_dir.writeFile(io, .{ .sub_path = scratch_name, .data = reflector_src });
@@ -115,20 +176,20 @@ fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, bin
         .argv = compile_argv.items,
         .cwd = .{ .dir = bindgen_dir },
     }) catch |e| {
-        return .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: could not run 'zig build-exe' for '{s}': {s}", .{ entry.library, @errorName(e) }) };
+        return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: could not run 'zig build-exe' for '{s}': {s}", .{ entry.library, @errorName(e) }) } };
     };
     defer allocator.free(compile_result.stdout);
     switch (compile_result.term) {
         .exited => |code| {
             if (code != 0) {
                 defer allocator.free(compile_result.stderr);
-                return .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' failed to compile against '{s}' (exit code {d}):\n{s}{s}", .{ entry.library, entry.header, code, compile_result.stdout, compile_result.stderr }) };
+                return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' failed to compile against '{s}' (exit code {d}):\n{s}{s}", .{ entry.library, entry.header, code, compile_result.stdout, compile_result.stderr }) } };
             }
             allocator.free(compile_result.stderr);
         },
         else => |term| {
             defer allocator.free(compile_result.stderr);
-            return .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' compile exited abnormally ({any}):\n{s}{s}", .{ entry.library, term, compile_result.stdout, compile_result.stderr }) };
+            return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' compile exited abnormally ({any}):\n{s}{s}", .{ entry.library, term, compile_result.stdout, compile_result.stderr }) } };
         },
     }
 
@@ -136,29 +197,81 @@ fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, bin
     const zig_out_abs = try std.fs.path.join(allocator, &.{ bindgen_abs, zig_out_name });
     const go_out_name = try std.fmt.allocPrint(allocator, "{s}_bindings_generated.go", .{entry.library});
     const go_out_abs = try std.fs.path.join(allocator, &.{ guest_abs, go_out_name });
+    const meta_abs = try std.fs.path.join(allocator, &.{ bindgen_abs, meta_name });
     const exe_abs = try std.fs.path.join(allocator, &.{ bindgen_abs, exe_name });
 
     const run_result = std.process.run(allocator, io, .{
-        .argv = &.{ exe_abs, zig_out_abs, go_out_abs },
+        .argv = &.{ exe_abs, zig_out_abs, go_out_abs, meta_abs },
     }) catch |e| {
-        return .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: could not run the compiled reflector for '{s}': {s}", .{ entry.library, @errorName(e) }) };
+        return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: could not run the compiled reflector for '{s}': {s}", .{ entry.library, @errorName(e) }) } };
     };
     defer allocator.free(run_result.stdout);
     switch (run_result.term) {
         .exited => |code| {
             if (code != 0) {
                 defer allocator.free(run_result.stderr);
-                return .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' reflector failed (exit code {d}):\n{s}{s}", .{ entry.library, code, run_result.stdout, run_result.stderr }) };
+                return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' reflector failed (exit code {d}):\n{s}{s}", .{ entry.library, code, run_result.stdout, run_result.stderr }) } };
             }
             allocator.free(run_result.stderr);
         },
         else => |term| {
             defer allocator.free(run_result.stderr);
-            return .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' reflector exited abnormally ({any}):\n{s}{s}", .{ entry.library, term, run_result.stdout, run_result.stderr }) };
+            return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' reflector exited abnormally ({any}):\n{s}{s}", .{ entry.library, term, run_result.stdout, run_result.stderr }) } };
         },
     }
 
-    return null;
+    const meta_text = bindgen_dir.readFileAlloc(io, meta_name, allocator, .unlimited) catch |e| {
+        return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' reflector didn't produce its metadata file: {s}", .{ entry.library, @errorName(e) }) } };
+    };
+    return .{ .ok = try parseMeta(allocator, entry.library, meta_text) };
+}
+
+/// The aggregator `Runtime.zig` actually links against via the
+/// `-Dhas-bindings`-swapped `Bindings` named import (see build.zig) --
+/// imports each entry's own `<library>_bindings_generated.zig` by real
+/// relative filename (a downward subdirectory import from `src/`, always
+/// fine -- only `../`-escaping upward is restricted, confirmed in Stage
+/// 2.1) and combines every one of their host functions into one
+/// `registerInto`, matching `WidgetHost.registerInto`'s own exact
+/// `extism_function_new` call shape. `user_data`/the free-function arg
+/// are always `null` -- unlike WidgetHost/Sqlite, a generated binding
+/// closes over its own module-level handle table directly, it never
+/// needs a capability-instance pointer threaded through.
+fn writeAggregator(allocator: std.mem.Allocator, io: Io, core_dir: Io.Dir, generated: []const GeneratedEntry) !void {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(allocator,
+        \\// Code generated by natyv bind. DO NOT EDIT.
+        \\const c = @import("bindgen/BindingsC.zig").c;
+        \\
+    );
+    for (generated) |g| {
+        try out.appendSlice(allocator, try std.fmt.allocPrint(allocator, "const {s}_bindings = @import(\"bindgen/{s}_bindings_generated.zig\");\n", .{ g.library, g.library }));
+    }
+
+    var total: usize = 0;
+    for (generated) |g| total += g.host_functions.len;
+    try out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
+        \\
+        \\pub const host_function_count = {d};
+        \\
+        \\pub fn registerInto(funcs_out: []?*anyopaque) usize {{
+        \\    const in_types = [_]c.ExtismValType{{c.ExtismValType_I64}};
+        \\    const out_types = [_]c.ExtismValType{{c.ExtismValType_I64}};
+        \\    var n: usize = 0;
+        \\
+    , .{total}));
+    for (generated) |g| {
+        for (g.host_functions) |hf| {
+            try out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
+                \\    funcs_out[n] = @ptrCast(c.extism_function_new("{s}", &in_types[0], 1, &out_types[0], 1, {s}_bindings.{s}, null, null));
+                \\    n += 1;
+                \\
+            , .{ hf.extism_name, g.library, hf.zig_fn_name }));
+        }
+    }
+    try out.appendSlice(allocator, "    return n;\n}\n");
+
+    try core_dir.writeFile(io, .{ .sub_path = "src/BindingsGenerated.zig", .data = out.items });
 }
 
 /// `natyv_core_src` locates `src/bindgen/` the same way `Bundle.zig`
@@ -187,15 +300,24 @@ pub fn run(allocator: std.mem.Allocator, io: Io, bindings: []const Config.Bindin
     const guest_abs_len = try guest_dir.realPath(io, &buf2);
     const guest_abs = try allocator.dupe(u8, buf2[0..guest_abs_len]);
 
+    var generated: std.ArrayList(GeneratedEntry) = .empty;
+    var include_dirs: std.ArrayList([]const u8) = .empty;
+    var link: std.ArrayList([]const u8) = .empty;
     var processed: usize = 0;
     for (bindings) |entry| {
-        if (try bindOne(allocator, io, entry, bindgen_dir, bindgen_abs, guest_abs)) |e| {
-            return .{ .processed = processed, .err = e };
+        const result = try bindOne(allocator, io, entry, bindgen_dir, bindgen_abs, guest_abs);
+        switch (result) {
+            .err => |e| return .{ .processed = processed, .err = e },
+            .ok => |ge| try generated.append(allocator, ge),
         }
+        try include_dirs.appendSlice(allocator, entry.include_dirs);
+        try link.appendSlice(allocator, entry.link);
         processed += 1;
     }
 
-    return .{ .processed = processed, .err = null };
+    try writeAggregator(allocator, io, core_dir, generated.items);
+
+    return .{ .processed = processed, .include_dirs = include_dirs.items, .link = link.items, .err = null };
 }
 
 test "binds the real fixture against a real config entry, producing correct Go output in the guest dir" {
@@ -216,7 +338,11 @@ test "binds the real fixture against a real config entry, producing correct Go o
         .library = "fixture",
         .header = "fixture.h",
         .include_dirs = &.{fixture_include_dir},
-        .functions = &.{ "fixture_create", "fixture_destroy" },
+        // `fixture_ping` (zero parameters) proves the config-driven
+        // pipeline handles the same real shape Stage 2.2's own zlib
+        // end-to-end proof needed (`zlibCompileFlags(void)`) -- a
+        // zero-arg bound function.
+        .functions = &.{ "fixture_create", "fixture_destroy", "fixture_ping" },
     }};
 
     const outcome = try run(allocator, io, &bindings, cwd_path, guest_dir);
@@ -224,23 +350,36 @@ test "binds the real fixture against a real config entry, producing correct Go o
     try std.testing.expectEqual(@as(usize, 1), outcome.processed);
 
     const go_out = try guest_dir.readFileAlloc(io, "fixture_bindings_generated.go", allocator, .unlimited);
-    try std.testing.expect(std.mem.indexOf(u8, go_out, "package fixture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_out, "package main") != null);
     try std.testing.expect(std.mem.indexOf(u8, go_out, "func FixtureCreate(") != null);
     try std.testing.expect(std.mem.indexOf(u8, go_out, "func FixtureDestroy(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_out, "func FixturePing(") != null);
 
     // The scratch reflector's own compile step above already really
     // compiled and ran `Reflect.describe`/`Codegen.generate` (not a
-    // mock) -- Stage 1's own `GeneratedFixtureCheck.zig` already proves
-    // output shaped like this compiles for real against `c.zig`/
-    // `host_fn_util.zig`, so this test only checks the emitted Zig text
-    // directly. The Zig half lands in src/bindgen/ itself (this stage's
-    // own scratch/verification location, see this file's doc comment);
-    // clean it up so it doesn't linger as a stray real file.
+    // mock) -- `build.zig`'s own `bindgen_generated_check` test already
+    // proves output shaped like this compiles for real against
+    // `BindingsC.zig`/`BindingsHostFnUtil.zig`, so this test only checks
+    // the emitted Zig text directly. The Zig half lands in src/bindgen/
+    // itself (this stage's own real, final destination, see this file's
+    // doc comment); clean it up so it doesn't linger as a stray real file.
     var bindgen_dir = try std.Io.Dir.cwd().openDir(io, "src/bindgen", .{});
     defer bindgen_dir.close(io);
     defer bindgen_dir.deleteFile(io, "fixture_bindings_generated.zig") catch {};
     const zig_out = try bindgen_dir.readFileAlloc(io, "fixture_bindings_generated.zig", allocator, .unlimited);
     try std.testing.expect(std.mem.indexOf(u8, zig_out, "pub fn fixtureCreateHostFn") != null);
+
+    // The real aggregator `Runtime.zig` links against -- same "real file,
+    // cleaned up by the test" treatment as the per-library output above.
+    var src_dir = try std.Io.Dir.cwd().openDir(io, "src", .{});
+    defer src_dir.close(io);
+    defer src_dir.deleteFile(io, "BindingsGenerated.zig") catch {};
+    const aggregator = try src_dir.readFileAlloc(io, "BindingsGenerated.zig", allocator, .unlimited);
+    try std.testing.expect(std.mem.indexOf(u8, aggregator, "fixture_bindings_generated.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregator, "pub const host_function_count = 3;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregator, "extism_function_new(\"fixture_create\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregator, "extism_function_new(\"fixture_ping\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregator, "fixture_bindings.fixtureCreateHostFn") != null);
 }
 
 test "an empty bindings list is a real no-op, no error" {

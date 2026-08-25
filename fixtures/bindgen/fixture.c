@@ -20,6 +20,10 @@ void fixture_destroy(FixtureHandle *handle) {
     free(handle);
 }
 
+int fixture_ping(void) {
+    return 42;
+}
+
 FixtureStatus fixture_get_point(FixtureHandle *handle, FixturePoint *out_point) {
     if (handle == NULL || out_point == NULL) return FIXTURE_ERROR;
     out_point->x = handle->value;

@@ -26,6 +26,15 @@ typedef void (*FixtureCallback)(int value, void *user_data);
 FixtureHandle *fixture_create(int initial);
 void fixture_destroy(FixtureHandle *handle);
 
+// Zero-parameter function -- Stage 2.2 regression coverage for a real bug
+// found while binding real zlib's `zlibCompileFlags(void)`: a bound
+// function with no parameters has an empty generated Request struct, so
+// naively always declaring `const req = parsed.value;` produced a real
+// "unused local constant" compile error the first time a genuine
+// zero-arg C function was ever bound (every prior fixture function took
+// at least one parameter, so this case was never exercised before).
+int fixture_ping(void);
+
 // Out-param + enum-shaped return: writes the handle's current value into
 // *out_point (x = current value, y = current value doubled) and reports
 // FIXTURE_ERROR without writing anything if handle is NULL.

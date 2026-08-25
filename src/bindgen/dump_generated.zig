@@ -18,6 +18,12 @@ const fixture_c = @import("fixture.zig").c;
 const allowlist = [_][]const u8{
     "fixture_create",
     "fixture_destroy",
+    // Zero-parameter function -- real regression coverage for Stage 2.2's
+    // "unused local constant" bug (see fixture.h's own doc comment on
+    // `fixture_ping`): this whole file's output gets really compiled by
+    // `build.zig`'s `bindgen_generated_check` test, so including it here
+    // means that bug class can never silently reappear.
+    "fixture_ping",
     "fixture_get_point",
     "fixture_set_callback",
     "fixture_trigger",

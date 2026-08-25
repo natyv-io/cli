@@ -52,7 +52,19 @@ pub const Result = struct {
 /// renamed to there (dropping Zig's own default `bin/<exe-name>`
 /// nesting -- a real end-user distributable should be one flat,
 /// sensibly-named file, not a path a dev has to go hunting for).
-pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, wasm_path: []const u8, dist_dir: Io.Dir, output_name: []const u8) !Result {
+/// `has_bindings` passes `-Dhas-bindings=true` (Stage 2.2 of the binding
+/// generator arc) so this build picks up the real `src/BindingsGenerated.zig`
+/// `natyv bind` already wrote, instead of the empty `BindingsAbsent.zig`
+/// stub -- same "app-specific option, only when actually needed" shape as
+/// `-Dembed-app-wasm` itself. `binding_include_dirs`/`binding_link` are
+/// already comma-joined (built by `cli/main.zig` from `Bind.Outcome`'s own
+/// aggregated per-entry values) -- passed through verbatim as
+/// `-Dbinding-include-dirs=`/`-Dbinding-link=` so `build.zig` can apply the
+/// exact same include paths/linker flags the reflector's own scratch
+/// compile already used against `src/BindingsGenerated.zig`'s per-entry
+/// `@cInclude`s and real library symbol calls. Empty strings mean "add
+/// nothing" and are simply omitted from argv.
+pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, wasm_path: []const u8, dist_dir: Io.Dir, output_name: []const u8, has_bindings: bool, binding_include_dirs: []const u8, binding_link: []const u8) !Result {
     var core_dir = std.Io.Dir.cwd().openDir(io, natyv_core_src, .{}) catch |e| {
         return .{ .ok = false, .err = .{
             .message = try std.fmt.allocPrint(allocator, "natyv build: could not open NATYV_CORE_SRC ('{s}'): {s}", .{ natyv_core_src, @errorName(e) }),
@@ -84,14 +96,19 @@ pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, was
     const dist_abs_len = try dist_dir.realPath(io, &path_buf);
     const dist_abs = path_buf[0..dist_abs_len];
 
+    var argv: std.ArrayList([]const u8) = .empty;
+    // `install-core`, not the bare default step -- the default "install"
+    // step installs every artifact in natyv-core's build graph, including
+    // the `natyv` CLI itself, which would leave a stray, useless second
+    // binary inside the app's own bundled output (confirmed by actually
+    // running a bundle and inspecting what came out).
+    try argv.appendSlice(allocator, &.{ "zig", "build", "install-core", "-Dembed-app-wasm=true", "--prefix", dist_abs });
+    if (has_bindings) try argv.append(allocator, "-Dhas-bindings=true");
+    if (binding_include_dirs.len > 0) try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dbinding-include-dirs={s}", .{binding_include_dirs}));
+    if (binding_link.len > 0) try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dbinding-link={s}", .{binding_link}));
+
     const result = std.process.run(allocator, io, .{
-        // `install-core`, not the bare default step -- the default
-        // "install" step installs every artifact in natyv-core's build
-        // graph, including the `natyv` CLI itself, which would leave a
-        // stray, useless second binary inside the app's own bundled
-        // output (confirmed by actually running a bundle and inspecting
-        // what came out).
-        .argv = &.{ "zig", "build", "install-core", "-Dembed-app-wasm=true", "--prefix", dist_abs },
+        .argv = argv.items,
         .cwd = .{ .dir = core_dir },
     }) catch |e| {
         return .{ .ok = false, .err = .{
@@ -144,7 +161,7 @@ test "a NATYV_CORE_SRC that doesn't exist is a clear error" {
     defer tmp.cleanup();
     const io = std.testing.io;
 
-    const result = try run(std.testing.allocator, io, "/definitely/not/a/real/path", "app.wasm", tmp.dir, "myapp");
+    const result = try run(std.testing.allocator, io, "/definitely/not/a/real/path", "app.wasm", tmp.dir, "myapp", false, "", "");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "NATYV_CORE_SRC") != null);
@@ -166,7 +183,7 @@ test "a NATYV_CORE_SRC with no build.zig is a clear error" {
     const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/not-natyv-core", .{ cwd_path, tmp.sub_path });
     defer std.testing.allocator.free(abs_path);
 
-    const result = try run(std.testing.allocator, io, abs_path, "app.wasm", tmp.dir, "myapp");
+    const result = try run(std.testing.allocator, io, abs_path, "app.wasm", tmp.dir, "myapp", false, "", "");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "build.zig") != null);
@@ -184,7 +201,7 @@ test "a missing compiled wasm file is a clear error" {
     const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_path, tmp.sub_path });
     defer std.testing.allocator.free(abs_path);
 
-    const result = try run(std.testing.allocator, io, abs_path, "/definitely/not/a/real/wasm/path.wasm", tmp.dir, "myapp");
+    const result = try run(std.testing.allocator, io, abs_path, "/definitely/not/a/real/wasm/path.wasm", tmp.dir, "myapp", false, "", "");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "compiled wasm") != null);
