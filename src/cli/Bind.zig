@@ -36,6 +36,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Config = @import("Config");
+const ZigFetch = @import("ZigFetch.zig");
 
 pub const BindError = struct {
     message: []const u8,
@@ -56,7 +57,20 @@ pub const Outcome = struct {
     include_dirs: []const []const u8 = &.{},
     lib_dirs: []const []const u8 = &.{},
     link: []const []const u8 = &.{},
+    /// One `{name, artifact}` per Stage 2.5 `-zig`-mode entry -- `natyv
+    /// build`'s own `.build` case joins these into a
+    /// `-Dbinding-zig-deps=name1:artifact1,...` flag for `build.zig`'s own
+    /// `b.dependency(name, ...).artifact(artifact)` +
+    /// `bindings_mod.linkLibrary(...)` loop (see `build.zig`'s own
+    /// comment on why this can't be flag-based like `include_dirs`/
+    /// `lib_dirs`/`link`).
+    zig_deps: []const ZigDepInfo = &.{},
     err: ?BindError,
+};
+
+pub const ZigDepInfo = struct {
+    name: []const u8,
+    artifact: []const u8,
 };
 
 fn buildReflectorSource(allocator: std.mem.Allocator, entry: Config.BindingEntry) ![]const u8 {
@@ -156,7 +170,7 @@ fn parseMeta(allocator: std.mem.Allocator, library: []const u8, meta_text: []con
     return .{ .library = library, .host_functions = try host_functions.toOwnedSlice(allocator) };
 }
 
-fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, bindgen_dir: Io.Dir, bindgen_abs: []const u8, guest_abs: []const u8) !BindOneResult {
+fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, core_dir: Io.Dir, bindgen_dir: Io.Dir, bindgen_abs: []const u8, guest_abs: []const u8) !BindOneResult {
     const scratch_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}.zig", .{entry.library});
     const exe_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_exe", .{entry.library});
     const meta_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}.meta", .{entry.library});
@@ -173,6 +187,46 @@ fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, bin
         try compile_argv.append(allocator, "-I");
         try compile_argv.append(allocator, dir);
     }
+
+    // Stage 2.5: a `-zig`-mode entry has no `include_dirs` of its own (see
+    // `Config.BindingEntry.zig_url`'s doc comment) -- the reflector still
+    // needs a real `-I` to resolve `entry.header`, so this discovers one
+    // fresh on every `natyv bind` run via a real, throwaway scratch
+    // install (`ZigFetch.discoverHeader`; see that file's own doc comment
+    // for why there's no cheaper way). Separately (and independently --
+    // this discovery's own scratch project has nothing to do with
+    // natyv-core's real build), `entry.library` is also fetched into
+    // *natyv-core's own* `build.zig.zon` here, since that's what the
+    // final app build's real `b.dependency(entry.library, ...)` call
+    // (`build.zig`'s `-Dbinding-zig-deps` loop) needs to exist there --
+    // confirmed empirically idempotent, so safe to redo every run.
+    var zig_discover_scratch_name: ?[]const u8 = null;
+    if (entry.zig_url) |url| {
+        const core_fetch = try ZigFetch.fetchSave(allocator, io, core_dir, entry.library, url);
+        if (core_fetch.err) |e| return .{ .err = .{ .message = e.message } };
+
+        const artifact = entry.zig_artifact orelse return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' has zig_url set but no zig_artifact -- this should have been caught by `natyv get`'s own validation", .{entry.library}) } };
+        zig_discover_scratch_name = try std.fmt.allocPrint(allocator, "_natyv_bind_zigdiscover_{s}", .{entry.library});
+        const disc = try ZigFetch.discoverHeader(allocator, io, bindgen_dir, bindgen_abs, entry.library, url, artifact);
+        if (disc.err) |e| return .{ .err = .{ .message = e.message } };
+
+        var found_header = false;
+        for (disc.installed_headers) |h| {
+            if (std.mem.eql(u8, h, entry.header)) found_header = true;
+        }
+        if (!found_header) {
+            var listed: std.ArrayList(u8) = .empty;
+            for (disc.installed_headers, 0..) |h, i| {
+                if (i > 0) try listed.appendSlice(allocator, ", ");
+                try listed.appendSlice(allocator, h);
+            }
+            return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' expects header '{s}', but the fetched package only installed: {s} -- override with --header= in `natyv get`", .{ entry.library, entry.header, listed.items }) } };
+        }
+
+        try compile_argv.append(allocator, "-I");
+        try compile_argv.append(allocator, disc.include_dir.?);
+    }
+    defer if (zig_discover_scratch_name) |n| bindgen_dir.deleteTree(io, n) catch {};
 
     const compile_result = std.process.run(allocator, io, .{
         .argv = compile_argv.items,
@@ -306,9 +360,10 @@ pub fn run(allocator: std.mem.Allocator, io: Io, bindings: []const Config.Bindin
     var include_dirs: std.ArrayList([]const u8) = .empty;
     var lib_dirs: std.ArrayList([]const u8) = .empty;
     var link: std.ArrayList([]const u8) = .empty;
+    var zig_deps: std.ArrayList(ZigDepInfo) = .empty;
     var processed: usize = 0;
     for (bindings) |entry| {
-        const result = try bindOne(allocator, io, entry, bindgen_dir, bindgen_abs, guest_abs);
+        const result = try bindOne(allocator, io, entry, core_dir, bindgen_dir, bindgen_abs, guest_abs);
         switch (result) {
             .err => |e| return .{ .processed = processed, .err = e },
             .ok => |ge| try generated.append(allocator, ge),
@@ -316,12 +371,13 @@ pub fn run(allocator: std.mem.Allocator, io: Io, bindings: []const Config.Bindin
         try include_dirs.appendSlice(allocator, entry.include_dirs);
         try lib_dirs.appendSlice(allocator, entry.lib_dirs);
         try link.appendSlice(allocator, entry.link);
+        if (entry.zig_url != null) try zig_deps.append(allocator, .{ .name = entry.library, .artifact = entry.zig_artifact.? });
         processed += 1;
     }
 
     try writeAggregator(allocator, io, core_dir, generated.items);
 
-    return .{ .processed = processed, .include_dirs = include_dirs.items, .lib_dirs = lib_dirs.items, .link = link.items, .err = null };
+    return .{ .processed = processed, .include_dirs = include_dirs.items, .lib_dirs = lib_dirs.items, .link = link.items, .zig_deps = zig_deps.items, .err = null };
 }
 
 test "binds the real fixture against a real config entry, producing correct Go output in the guest dir" {

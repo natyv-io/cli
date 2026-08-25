@@ -43,13 +43,20 @@ pub const Outcome = struct {
     err: ?GetError,
 };
 
-/// `-c`/`-zig` discovery mode (Stage 2.4 of
-/// ~/.claude/plans/lexical-wishing-penguin.md) -- `.manual` (the default)
-/// is Stage 2.3's original fully-manual behavior, unchanged. `-zig` has no
-/// variant here at all: `main.zig`'s `parseGetArgs` rejects it with a
-/// clear "not built yet" error before ever constructing a `GetArgs`, so
-/// `Get.zig` itself never needs to know about it.
-pub const Mode = enum { manual, c };
+/// `-c`/`-zig` discovery mode -- `.manual` (Stage 2.3) is the original
+/// fully-manual behavior; `.c` (Stage 2.4) is real `pkg-config` discovery;
+/// `.zig` (Stage 2.5) is a real Zig package fetch (see `ZigFetch.zig`).
+/// `natyv get` itself does *not* run the real fetch/discovery subprocess
+/// for `.zig` mode -- unlike `.c`, which is a single cheap `pkg-config`
+/// call, a Zig package's real discovery means fetching + compiling, which
+/// is expensive to do twice (once at `get`, once at `bind`) and would tie
+/// a checked-in `conf.natyv.json` to an ephemeral local scratch path that
+/// won't survive `git clone`/CI. So `.zig` mode here only writes
+/// `zig_url`/`zig_artifact` into the entry (`--header=` still defaults to
+/// `<library>.h`, same guess as `.c` mode, just unvalidated) -- the real
+/// fetch+discovery happens once, for real, every `natyv bind` run
+/// (`Bind.zig`'s job).
+pub const Mode = enum { manual, c, zig };
 
 /// The CLI's own input contract -- kept as its own type rather than a
 /// re-export of `Config.BindingEntry`, even though the fields currently
@@ -67,6 +74,10 @@ pub const GetArgs = struct {
     lib_dirs: []const []const u8 = &.{},
     link: []const []const u8 = &.{},
     functions: []const []const u8,
+    /// `.zig` mode only -- required alongside it (enforced by `main.zig`'s
+    /// `parseGetArgs`).
+    zig_url: ?[]const u8 = null,
+    zig_artifact: ?[]const u8 = null,
 };
 
 pub fn run(allocator: std.mem.Allocator, io: Io, config_path: []const u8, args: GetArgs) !Outcome {
@@ -90,6 +101,11 @@ pub fn run(allocator: std.mem.Allocator, io: Io, config_path: []const u8, args: 
         include_dirs = try std.mem.concat(allocator, []const u8, &.{ d.include_dirs, args.include_dirs });
         lib_dirs = try std.mem.concat(allocator, []const u8, &.{ d.lib_dirs, args.lib_dirs });
         link = try std.mem.concat(allocator, []const u8, &.{ d.link, args.link });
+    } else if (args.mode == .zig) {
+        // Same `<library>.h` default-guess convention as `.c` mode, just
+        // unvalidated here -- see this file's `Mode` doc comment on why
+        // `.zig` mode doesn't run real discovery at `get` time.
+        header = args.header orelse try std.fmt.allocPrint(allocator, "{s}.h", .{args.library});
     }
 
     const parsed = Config.load(allocator, io, config_path) catch |e| {
@@ -104,11 +120,13 @@ pub fn run(allocator: std.mem.Allocator, io: Io, config_path: []const u8, args: 
 
     const new_entry = Config.BindingEntry{
         .library = args.library,
-        .header = header.?, // guaranteed non-null: required in `.manual` mode (main.zig), defaulted above in `.c` mode
+        .header = header.?, // guaranteed non-null: required in `.manual` mode (main.zig), defaulted above in `.c`/`.zig` mode
         .include_dirs = include_dirs,
         .lib_dirs = lib_dirs,
         .link = link,
         .functions = args.functions,
+        .zig_url = if (args.mode == .zig) args.zig_url else null,
+        .zig_artifact = if (args.mode == .zig) args.zig_artifact else null,
     };
 
     var updated_existing = false;
@@ -347,6 +365,61 @@ test "-c mode: a manually-supplied --link= is appended after the discovered ones
     try std.testing.expectEqual(@as(usize, 2), link.len);
     try std.testing.expectEqualStrings("z", link[0]); // discovered, comes first
     try std.testing.expectEqualStrings("extrastub", link[1]); // manual, appended after
+}
+
+test "-zig mode: writes zig_url/zig_artifact and the <library>.h default guess, no real fetch performed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    const abs_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}/conf.natyv.json", .{ cwd_path, tmp.sub_path });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = abs_path, .data = "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}" });
+
+    const outcome = try run(allocator, io, abs_path, .{
+        .library = "zlib",
+        .mode = .zig,
+        .zig_url = "https://github.com/allyourcodebase/zlib/archive/refs/heads/main.tar.gz",
+        .zig_artifact = "z",
+        .functions = &.{"zlibCompileFlags"},
+    });
+    try std.testing.expect(outcome.err == null);
+
+    const reparsed = try Config.load(allocator, io, abs_path);
+    const entry = reparsed.value.bindings[0];
+    try std.testing.expectEqualStrings("zlib.h", entry.header);
+    try std.testing.expectEqualStrings("https://github.com/allyourcodebase/zlib/archive/refs/heads/main.tar.gz", entry.zig_url.?);
+    try std.testing.expectEqualStrings("z", entry.zig_artifact.?);
+    try std.testing.expectEqual(@as(usize, 0), entry.include_dirs.len);
+    try std.testing.expectEqual(@as(usize, 0), entry.link.len);
+}
+
+test "-zig mode: an explicit --header= overrides the <library>.h default guess" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    const abs_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}/conf.natyv.json", .{ cwd_path, tmp.sub_path });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = abs_path, .data = "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}" });
+
+    _ = try run(allocator, io, abs_path, .{
+        .library = "zlib",
+        .mode = .zig,
+        .header = "zconf.h",
+        .zig_url = "https://github.com/allyourcodebase/zlib/archive/refs/heads/main.tar.gz",
+        .zig_artifact = "z",
+        .functions = &.{"zlibCompileFlags"},
+    });
+
+    const reparsed = try Config.load(allocator, io, abs_path);
+    try std.testing.expectEqualStrings("zconf.h", reparsed.value.bindings[0].header);
 }
 
 test "-c mode: an unknown pkg-config module surfaces pkg-config's own real error" {
