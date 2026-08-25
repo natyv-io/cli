@@ -48,10 +48,23 @@ pub const ParamKind = enum {
     /// Bytef *buf`) -- always paired with an immediately-following
     /// `int_primitive` length param at the `Codegen.zig` level (natyv has
     /// no other way to know how many bytes to read), never a standalone
-    /// shape. A non-const byte pointer (a real "out buffer" C convention)
-    /// is a real, deliberately deferred future case -- `classify` rejects
-    /// it explicitly rather than silently mishandling it.
+    /// shape.
     byte_buffer_in,
+    /// Stage 2.10: a *non-const* `<byte-type> *` param (e.g. zlib's own
+    /// `Bytef *dest` in `compress`/`uncompress`) -- real C out-buffer
+    /// convention, always paired with an immediately-following
+    /// `.length_ptr_inout` param (the buffer's own real capacity/actual-
+    /// length pointer -- zlib always shapes it this exact way: buffer,
+    /// then its own length pointer, right after).
+    byte_buffer_out,
+    /// Stage 2.10: a non-const pointer to an integer (e.g. zlib's own
+    /// `uLongf *destLen`) that's genuinely both an input (the caller-
+    /// supplied buffer capacity) and an output (the real number of bytes
+    /// the call actually wrote) -- a real, distinct shape from
+    /// `struct_out_ptr` (write-only, never read by the caller first).
+    /// `int_bits`/`int_signed` (below) are populated from the *pointee's*
+    /// own real int type, not the pointer itself.
+    length_ptr_inout,
 };
 
 pub const StructFieldDesc = struct {
@@ -174,19 +187,32 @@ fn classify(comptime T: type) ReflectError!Param {
             }
         },
         .pointer => |ptr| {
-            // Stage 2.9: a real `const <byte> *` param (zlib's own `const
-            // Bytef *buf` reflects exactly this way -- confirmed via a
-            // real spike) -- checked before the struct-out-param case
-            // below, since `u8`'s own `@typeInfo` is `.int`, not
-            // `.@"struct"`, and would otherwise fall through to the
-            // generic `else => error.UnsupportedType` there. A *non-const*
-            // byte pointer (a real "out buffer" C convention) is a
-            // deliberately deferred future case, not silently mishandled.
+            // Stage 2.9/2.10: a real `<byte> *` param (zlib's own `const
+            // Bytef *buf`/non-const `Bytef *dest` both reflect exactly
+            // this way -- confirmed via real spikes) -- checked before
+            // the struct-out-param case below, since `u8`'s own
+            // `@typeInfo` is `.int`, not `.@"struct"`, and would otherwise
+            // fall through to the generic `else => error.UnsupportedType`
+            // there. const -> an in-only buffer (Stage 2.9); non-const ->
+            // a real C out-buffer convention (Stage 2.10, e.g.
+            // `compress`/`uncompress`'s own `dest`).
             if (ptr.child == u8) {
-                if (!ptr.is_const) return error.UnsupportedType;
-                return .{ .kind = .byte_buffer_in };
+                return .{ .kind = if (ptr.is_const) .byte_buffer_in else .byte_buffer_out };
             }
+            // Stage 2.10: a non-const pointer to an integer (zlib's own
+            // `uLongf *destLen`) -- genuinely both an input (caller-
+            // supplied capacity) and an output (the real byte count
+            // written), always paired with an immediately-preceding
+            // `.byte_buffer_out` param at the `Codegen.zig` level. Checked
+            // before the struct case below for the same reason as above
+            // (an int pointee isn't a struct). A *const* pointer to an
+            // int is a real, deliberately unhandled shape -- falls
+            // through to the struct check and errors there, not silently
+            // mishandled.
             const pointee_ti = @typeInfo(ptr.child);
+            if (pointee_ti == .int and !ptr.is_const) {
+                return .{ .kind = .length_ptr_inout, .int_bits = pointee_ti.int.bits, .int_signed = pointee_ti.int.signedness == .signed };
+            }
             if (pointee_ti != .@"struct") return error.UnsupportedType;
             const fields_ti = pointee_ti.@"struct".fields;
             if (fields_ti.len > max_struct_fields) return error.UnsupportedType;
@@ -314,4 +340,17 @@ test "fixture_checksum: wide unsigned int + byte_buffer_in + wide unsigned int p
     try std.testing.expectEqual(ParamKind.int_primitive, desc.@"return".kind);
     try std.testing.expectEqual(@as(u16, 64), desc.@"return".int_bits);
     try std.testing.expect(!desc.@"return".int_signed);
+}
+
+test "fixture_pack: byte_buffer_out + length_ptr_inout + byte_buffer_in + int_primitive params, mirrors real zlib compress/uncompress exactly" {
+    const desc = try describe(fixture_c, "fixture_pack");
+    try std.testing.expectEqual(@as(usize, 4), desc.params_len);
+    try std.testing.expectEqual(ParamKind.byte_buffer_out, desc.params[0].kind);
+    try std.testing.expectEqual(ParamKind.length_ptr_inout, desc.params[1].kind);
+    try std.testing.expectEqual(@as(u16, 64), desc.params[1].int_bits);
+    try std.testing.expect(!desc.params[1].int_signed);
+    try std.testing.expectEqual(ParamKind.byte_buffer_in, desc.params[2].kind);
+    try std.testing.expectEqual(ParamKind.int_primitive, desc.params[3].kind);
+    try std.testing.expectEqual(@as(u16, 64), desc.params[3].int_bits);
+    try std.testing.expectEqual(ParamKind.int_primitive, desc.@"return".kind);
 }

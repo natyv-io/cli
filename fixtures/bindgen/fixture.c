@@ -47,3 +47,11 @@ unsigned long fixture_checksum(unsigned long seed, const unsigned char *data, un
     for (unsigned int i = 0; i < len; i++) sum += data[i];
     return sum;
 }
+
+int fixture_pack(unsigned char *dest, unsigned long *dest_len, const unsigned char *source, unsigned long source_len) {
+    if (*dest_len == 0) return -1;
+    unsigned long n = source_len < *dest_len ? source_len : *dest_len;
+    for (unsigned long i = 0; i < n; i++) dest[i] = (unsigned char)(source[i] * 2);
+    *dest_len = n;
+    return 0;
+}

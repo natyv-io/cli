@@ -15,20 +15,22 @@
 //! separately, against the emitted output).
 //!
 //! **Generic path** covers any function whose params are only
-//! `int_primitive`/`float_primitive`/`opaque_handle`/`byte_buffer_in`,
-//! with at most one `struct_out_ptr` param, and whose return is
+//! `int_primitive`/`float_primitive`/`opaque_handle`/`byte_buffer_in`/
+//! `byte_buffer_out`/`length_ptr_inout`, with at most one `struct_out_ptr`
+//! param, and whose return is
 //! `void_kind`/`int_primitive`/`float_primitive`/`opaque_handle` --
 //! `fixture_create`/`fixture_destroy`/`fixture_get_point` all go through
 //! this path unmodified, and it generalizes to real zlib functions
-//! (Stage 2.9's own `crc32`) without new per-function code. Every
-//! non-out-param becomes a positional JSON request field (`p0`, `p1`, ...
-//! -- C's type system doesn't preserve parameter names, so this is a real,
-//! accepted limitation, not an oversight); an `opaque_handle` param is
-//! actually a `u32` id resolved through `HandleTable.zig`, never a raw
-//! pointer crossing the wire; a `struct_out_ptr` param's fields are
-//! flattened directly into the response object; an `opaque_handle` return
-//! becomes a new id inserted into the same table (`"handle"` response
-//! field), a primitive return becomes a `"result"` field. `int_primitive`
+//! (Stage 2.9's own `crc32`, Stage 2.10's own `compress`/`uncompress`)
+//! without new per-function code. Every non-out-param becomes a
+//! positional JSON request field (`p0`, `p1`, ... -- C's type system
+//! doesn't preserve parameter names, so this is a real, accepted
+//! limitation, not an oversight); an `opaque_handle` param is actually a
+//! `u32` id resolved through `HandleTable.zig`, never a raw pointer
+//! crossing the wire; a `struct_out_ptr` param's fields are flattened
+//! directly into the response object; an `opaque_handle` return becomes a
+//! new id inserted into the same table (`"handle"` response field), a
+//! primitive return becomes a `"result"` field. `int_primitive`
 //! params/returns carry their own real C width/signedness (Stage 2.9 --
 //! `zlibCompileFlags`-style trivial functions happened to make `i32`/
 //! `int32` look like a universal default, but real ones like `uLong`
@@ -40,6 +42,16 @@
 //! decoded byte count instead (Go's own `[]byte` <-> JSON already
 //! base64-encodes automatically, so the guest side needs no special
 //! handling at all -- only the host side runs a real `std.base64` decode).
+//! A `byte_buffer_out` param (Stage 2.10 -- a *non-const* `<byte> *`,
+//! e.g. `compress`'s own `dest`, always paired with an immediately-
+//! following `length_ptr_inout`, e.g. `destLen`) is the mirror image: the
+//! guest supplies only a plain int *capacity* request field (the buffer
+//! itself is entirely host-allocated and never crosses the wire inbound
+//! at all), and gets back one base64-encoded response field holding
+//! exactly the real bytes the call wrote (sized by the real post-call
+//! length, which may be less than the requested capacity) -- alongside
+//! the function's normal `"result"`/struct-field response data, not
+//! instead of it.
 //!
 //! **A function name containing "destroy" additionally removes its first
 //! `opaque_handle` argument from the handle table after a successful
@@ -147,7 +159,11 @@ fn zigFieldType(p: Reflect.Param) []const u8 {
     return switch (p.kind) {
         .opaque_handle => "u32",
         .byte_buffer_in => "[]const u8",
-        .int_primitive => zigIntType(p.int_bits, p.int_signed),
+        // Stage 2.10: on the wire, a `.length_ptr_inout` is always the
+        // guest-supplied *capacity* value for its paired `.byte_buffer_out`
+        // -- a plain int field, using its own real pointee width/
+        // signedness exactly like `.int_primitive` does.
+        .int_primitive, .length_ptr_inout => zigIntType(p.int_bits, p.int_signed),
         .float_primitive => "f32",
         else => unreachable,
     };
@@ -157,7 +173,7 @@ fn goFieldType(p: Reflect.Param) []const u8 {
     return switch (p.kind) {
         .opaque_handle => "uint32",
         .byte_buffer_in => "[]byte",
-        .int_primitive => goIntType(p.int_bits, p.int_signed),
+        .int_primitive, .length_ptr_inout => goIntType(p.int_bits, p.int_signed),
         .float_primitive => "float32",
         else => unreachable,
     };
@@ -200,6 +216,20 @@ fn collectReqFields(allocator: std.mem.Allocator, params: []const Reflect.Param)
                 if (i + 1 >= params.len or params[i + 1].kind != .int_primitive) return error.UnsupportedShape;
                 try fields.append(allocator, .{ .index = i, .param = p });
                 i += 1; // the paired length param is consumed here, not its own field
+            },
+            // Stage 2.10: `.byte_buffer_out` (e.g. zlib's own `Bytef
+            // *dest`) must be immediately followed by a `.length_ptr_inout`
+            // param (its own real capacity/actual-length pointer -- real
+            // C convention, no other shape zlib or any similar library
+            // uses). Unlike `.byte_buffer_in`'s pairing, the request
+            // field here represents the *length* param, not the buffer --
+            // the buffer itself is never guest-supplied at all (it's a
+            // pure out-param, entirely host-allocated), only its real
+            // capacity is, as a plain int value.
+            .byte_buffer_out => {
+                if (i + 1 >= params.len or params[i + 1].kind != .length_ptr_inout) return error.UnsupportedShape;
+                try fields.append(allocator, .{ .index = i + 1, .param = params[i + 1] });
+                i += 1; // the paired length_ptr_inout param is consumed here
             },
             .struct_out_ptr => {},
             else => return error.UnsupportedShape,
@@ -268,6 +298,14 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
     // zero-arg C function was actually bound for the first time.
     if (req_fields.len == 0) try zig_out.appendSlice(allocator, "    _ = req;\n");
 
+    // Stage 2.10: every `.byte_buffer_out` param encountered in the loop
+    // below (paired with its own `.length_ptr_inout`, per
+    // `collectReqFields`'s own validation) is recorded here so the
+    // response-building code further down can emit one base64-encoded
+    // output field per real out-buffer, once the real call (and thus the
+    // real written length) is known.
+    var buffer_out_fields: std.ArrayList(struct { buf_index: usize, len_index: usize }) = .empty;
+
     var call_args: std.ArrayList(u8) = .empty;
     var pi: usize = 0;
     while (pi < desc.params_len) : (pi += 1) {
@@ -325,6 +363,32 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
                 try call_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "p{d}_buf.ptr, @intCast(p{d}_buf.len)", .{ pi, pi }));
                 pi += 1; // consume the paired length param
             },
+            .byte_buffer_out => {
+                // The paired `.length_ptr_inout` (guaranteed present by
+                // `collectReqFields`) is the request field carrying the
+                // guest-supplied *capacity* -- the host allocates a real
+                // buffer of exactly that size (entirely host-owned, the
+                // guest never supplies or sees the buffer itself, only
+                // its capacity going in and its real encoded contents
+                // coming back out) and passes a mutable copy of the
+                // capacity as the real in/out length pointer, since the
+                // real C call may write fewer bytes than the capacity.
+                const len_idx = pi + 1;
+                const len_param = desc.params[len_idx];
+                const len_ty = zigIntType(len_param.int_bits, len_param.int_signed);
+                try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
+                    \\    const p{0d}_buf = allocator.alloc(u8, @intCast(req.p{1d})) catch {{
+                    \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory allocating p{0d}", .{{}});
+                    \\        return;
+                    \\    }};
+                    \\    defer allocator.free(p{0d}_buf);
+                    \\    var p{1d}_len: {2s} = @intCast(req.p{1d});
+                    \\
+                , .{ pi, len_idx, len_ty }));
+                try call_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "p{d}_buf.ptr, &p{d}_len", .{ pi, len_idx }));
+                try buffer_out_fields.append(allocator, .{ .buf_index = pi, .len_index = len_idx });
+                pi += 1; // consume the paired length_ptr_inout param
+            },
             else => return error.UnsupportedShape,
         }
     }
@@ -344,12 +408,36 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
         }
     }
 
+    // Stage 2.10: encode each real `.byte_buffer_out` result -- only now,
+    // after the real call, is `p{len_index}_len` known (the real number
+    // of bytes the call actually wrote, which may be less than the
+    // guest-supplied capacity). Uses `std.base64.standard.Encoder`
+    // (paired with `.byte_buffer_in`'s own `.Decoder` from Stage 2.9) --
+    // Go's own `encoding/json` decodes a `[]byte` response field from
+    // base64 automatically, so the guest side needs no special handling.
+    for (buffer_out_fields.items) |bof| {
+        try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
+            \\    const p{0d}_encoded_len = std.base64.standard.Encoder.calcSize(p{1d}_len);
+            \\    const p{0d}_encoded_buf = allocator.alloc(u8, p{0d}_encoded_len) catch {{
+            \\        host_fn_util.writeErrorJson(plugin, &outputs[0], "out of memory encoding p{0d}", .{{}});
+            \\        return;
+            \\    }};
+            \\    defer allocator.free(p{0d}_encoded_buf);
+            \\    const p{0d}_encoded = std.base64.standard.Encoder.encode(p{0d}_encoded_buf, p{0d}_buf[0..p{1d}_len]);
+            \\
+        , .{ bof.buf_index, bof.len_index }));
+    }
+
     var resp_fields: std.ArrayList(u8) = .empty;
     if (out_param) |op| {
         for (op.param.struct_fields[0..op.param.struct_fields_len], 0..) |f, fi| {
             if (fi > 0) try resp_fields.appendSlice(allocator, ", ");
             try resp_fields.appendSlice(allocator, try std.fmt.allocPrint(allocator, "\\\"{s}\\\":{{d}}", .{f.name}));
         }
+    }
+    for (buffer_out_fields.items) |bof| {
+        if (resp_fields.items.len > 0) try resp_fields.appendSlice(allocator, ", ");
+        try resp_fields.appendSlice(allocator, try std.fmt.allocPrint(allocator, "\\\"out{d}\\\":\\\"{{s}}\\\"", .{bof.buf_index}));
     }
     switch (desc.@"return".kind) {
         .void_kind => {},
@@ -380,6 +468,14 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
             try fmt_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "out_p{d}.{s}", .{ op.index, f.name }));
         }
     }
+    // Same relative position as `resp_fields`' own byte_buffer_out loop
+    // above -- these two lists' entries are matched up positionally by
+    // the runtime `std.fmt.bufPrint` call the generated code makes, so
+    // any reordering here must happen in both places at once.
+    for (buffer_out_fields.items) |bof| {
+        if (fmt_args.items.len > 0) try fmt_args.appendSlice(allocator, ", ");
+        try fmt_args.appendSlice(allocator, try std.fmt.allocPrint(allocator, "p{d}_encoded", .{bof.buf_index}));
+    }
     switch (desc.@"return".kind) {
         .void_kind => {},
         .opaque_handle => {
@@ -395,9 +491,15 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
     if (resp_fields.items.len == 0) {
         try zig_out.appendSlice(allocator, "    host_fn_util.writeGuestBytes(plugin, &outputs[0], \"{}\");\n}\n\n");
     } else {
+        // Stage 2.10: a heap-allocated buffer via `allocPrint`, not the
+        // old fixed `[256]u8` stack array via `bufPrint` -- a real
+        // response can now legitimately exceed 256 bytes (a base64-
+        // encoded `.byte_buffer_out` result, e.g. real compressed/
+        // decompressed data, has no fixed upper bound the way a handful
+        // of scalar/struct fields always did).
         try zig_out.appendSlice(allocator, try std.fmt.allocPrint(allocator,
-            \\    var out_buf: [256]u8 = undefined;
-            \\    const json_out = std.fmt.bufPrint(&out_buf, "{{{{{s}}}}}", .{{{s}}}) catch return;
+            \\    const json_out = std.fmt.allocPrint(allocator, "{{{{{s}}}}}", .{{{s}}}) catch return;
+            \\    defer allocator.free(json_out);
             \\    host_fn_util.writeGuestBytes(plugin, &outputs[0], json_out);
             \\}}
             \\
@@ -427,6 +529,14 @@ fn emitGeneric(allocator: std.mem.Allocator, c_alias: []const u8, handle_table_n
             const field_pascal = try pascalCase(allocator, f.name);
             try go_decode_fields.appendSlice(allocator, try std.fmt.allocPrint(allocator, "\t{s} {s} `json:\"{s}\"`\n", .{ field_pascal, if (f.is_float) "float32" else "int32", f.name }));
         }
+    }
+    // Stage 2.10: one `[]byte` field per real `.byte_buffer_out` result --
+    // Go's own `encoding/json` decodes a `[]byte` struct field from a
+    // base64 JSON string automatically, matching exactly how a `[]byte`
+    // *request* field already encodes automatically (Stage 2.9) -- no
+    // special-casing needed on this side at all.
+    for (buffer_out_fields.items) |bof| {
+        try go_decode_fields.appendSlice(allocator, try std.fmt.allocPrint(allocator, "\tOut{d} []byte `json:\"out{d}\"`\n", .{ bof.buf_index, bof.buf_index }));
     }
     switch (desc.@"return".kind) {
         .void_kind => {},
@@ -842,6 +952,44 @@ test "generate: fixture_checksum -- wide unsigned ints marshal correctly and the
     try std.testing.expect(std.mem.indexOf(u8, go_out.items, "P0 uint64 `json:\"p0\"`") != null);
     try std.testing.expect(std.mem.indexOf(u8, go_out.items, "P1 []byte `json:\"p1\"`") != null);
     try std.testing.expect(std.mem.indexOf(u8, go_out.items, "Result uint64 `json:\"result\"`") != null);
+}
+
+test "generate: fixture_pack -- byte_buffer_out + length_ptr_inout, mirrors real zlib compress/uncompress's own out-buffer shape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const desc = try Reflect.describe(fixture_c, "fixture_pack");
+    var zig_out: std.ArrayList(u8) = .empty;
+    var go_out: std.ArrayList(u8) = .empty;
+    try emitGeneric(allocator, "fixture_c", "fixture_handle_table", &zig_out, &go_out, desc);
+
+    // Zig side: p1 (dest's own real length pointer) is the guest-supplied
+    // *capacity* value (a plain u64 request field) -- p0 (the dest buffer
+    // itself) never appears as its own request field at all, since it's
+    // entirely host-allocated. p2/p3 (source + its length) behave exactly
+    // like Stage 2.9's own byte_buffer_in pairing already proved.
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "p1: u64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "p0:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "p3:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "const p0_buf = allocator.alloc(u8, @intCast(req.p1))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "var p1_len: u64 = @intCast(req.p1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "fixture_c.fixture_pack(p0_buf.ptr, &p1_len, p2_buf.ptr, @intCast(p2_buf.len))") != null);
+    // The real out-buffer result is base64-encoded only *after* the real
+    // call, using the real written length (p1_len), not the guest's
+    // original capacity request -- proves the encode step reads the
+    // in/out value's post-call state, not its pre-call one.
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "std.base64.standard.Encoder.calcSize(p1_len)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "std.base64.standard.Encoder.encode(p0_encoded_buf, p0_buf[0..p1_len])") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_out.items, "\\\"out0\\\":\\\"{s}\\\"") != null);
+
+    // Go side: the wrapper takes the capacity as a plain uint64 (p1) and
+    // the source as a plain []byte (p2) -- never the raw dest/destLen/
+    // source/sourceLen 1:1 C signature. The response decodes the real
+    // out-buffer as a plain []byte (Go's own encoding/json base64-decodes
+    // it automatically) alongside the real int status code.
+    try std.testing.expect(std.mem.indexOf(u8, go_out.items, "func FixturePack(p1 uint64, p2 []byte)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_out.items, "Out0 []byte `json:\"out0\"`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_out.items, "Result int32 `json:\"result\"`") != null);
 }
 
 test "generate: full fixture allowlist produces non-empty, distinct Zig and Go sources" {

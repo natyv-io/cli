@@ -33,6 +33,11 @@ const allowlist = [_][]const u8{
     // check, not just the text-level assertions `Codegen.zig`'s own unit
     // test already covers.
     "fixture_checksum",
+    // Stage 2.10's own byte_buffer_out + length_ptr_inout marshaling --
+    // same reasoning as `fixture_checksum` above, but for the real
+    // `std.base64.standard.Encoder` emission (Decoder's own counterpart)
+    // this stage adds.
+    "fixture_pack",
 };
 
 pub fn main(init: std.process.Init) !void {

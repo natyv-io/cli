@@ -55,6 +55,18 @@ void fixture_trigger(FixtureHandle *handle, int value);
 // Stage 2.9's own separate real-zlib end-to-end proof.
 unsigned long fixture_checksum(unsigned long seed, const unsigned char *data, unsigned int len);
 
+// Stage 2.10 regression coverage: mirrors real zlib's own
+// `compress(Bytef *dest, uLongf *destLen, const Bytef *source, uLong
+// sourceLen) -> int` shape exactly -- a non-const out-buffer + its own
+// in/out capacity/length pointer, then a const in-buffer + its own plain
+// length. Writes each of the first `min(*dest_len, source_len)` bytes of
+// `source`, each doubled mod 256 (a trivial, easy-to-verify-independently
+// transform -- this fixture isn't trying to compress anything for real),
+// into `dest`, and sets `*dest_len` to the real number of bytes actually
+// written. Returns 0 normally, -1 if `*dest_len` is 0 on entry (mirrors
+// a real C function reporting a real error via its return code).
+int fixture_pack(unsigned char *dest, unsigned long *dest_len, const unsigned char *source, unsigned long source_len);
+
 // Deliberately NOT in `allowlist` (see Reflect.zig) -- exists so
 // Reflect.zig's own tests can prove `describe` rejects a function-like
 // macro cleanly (`error.GenericFunction`) rather than crashing. A
