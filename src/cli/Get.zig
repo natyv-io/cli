@@ -115,7 +115,10 @@ pub fn run(allocator: std.mem.Allocator, io: Io, config_path: []const u8, args: 
             // partially-extracted files yanked out from under it by the
             // other's cleanup) -- confirmed empirically, not just a
             // theoretical concern, so real uniqueness is required, not
-            // just table stakes.
+            // just table stakes. Correct as-is; see `Bind.zig`'s own
+            // fuller `getpid()` doc comment (`bindOne`) for why, and for a
+            // possible future UUID/random-suffix alternative Quinn flagged
+            // as worth reconsidering later.
             const scratch_parent_name = try std.fmt.allocPrint(allocator, ".natyv-vendor-discover-{x}", .{std.c.getpid()});
             var scratch_parent = std.Io.Dir.cwd().createDirPathOpen(io, scratch_parent_name, .{}) catch |e| {
                 return .{ .updated_existing = false, .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv get: could not create scratch vendor-discovery dir: {s}", .{@errorName(e)}) } };

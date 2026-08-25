@@ -196,7 +196,15 @@ fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, cor
     // both binaries' own real fixture-library tests (`library = "fixture"`)
     // raced on this exact fixed path, reproduced as a real, non-flaky
     // failure -- the identical root cause already found and fixed for
-    // `ZigFetch.zig`/`Vendor.zig`'s own scratch dirs.
+    // `ZigFetch.zig`/`Vendor.zig`'s own scratch dirs. Correct as-is (two
+    // processes alive at the same moment can never share a PID, and stale
+    // files from a since-recycled PID just get clobbered by the
+    // delete-then-create below), but Quinn flagged the raw OS-process
+    // concept sitting in application logic as worth reconsidering later --
+    // a UUID/random-suffix scheme would express the same "just make this
+    // unique" intent without reaching for `getpid()` specifically. Not
+    // changed now; noted for a future revisit if this file gets touched
+    // again.
     const pid = std.c.getpid();
     const scratch_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_{x}.zig", .{ entry.library, pid });
     const exe_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_{x}_exe", .{ entry.library, pid });

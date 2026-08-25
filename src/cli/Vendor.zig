@@ -83,11 +83,13 @@ fn runOrError(allocator: std.mem.Allocator, io: Io, argv: []const []const u8, cw
 
 /// Creates a real, throwaway scratch Zig project under `parent_dir` named
 /// `_natyv_vendor_locate_<name>_<pid>` (PID-suffixed -- see
-/// `LocateResult.scratch_dir_name`'s own doc comment on why), fetches
-/// `url` as dependency `name` into it, and reports the real extraction
-/// path. Does not clean up after itself -- the caller is responsible for
-/// deleting the returned `scratch_dir_name` subtree once it's done
-/// reading from `source_dir`.
+/// `LocateResult.scratch_dir_name`'s own doc comment on why, and
+/// `Bind.zig`'s own `bindOne` doc comment for the fuller reliability
+/// reasoning plus a possible future UUID/random-suffix alternative Quinn
+/// flagged as worth reconsidering later), fetches `url` as dependency
+/// `name` into it, and reports the real extraction path. Does not clean
+/// up after itself -- the caller is responsible for deleting the returned
+/// `scratch_dir_name` subtree once it's done reading from `source_dir`.
 pub fn locateSource(allocator: std.mem.Allocator, io: Io, parent_dir: Io.Dir, parent_dir_abs: []const u8, name: []const u8, url: []const u8) !LocateResult {
     const scratch_name = try std.fmt.allocPrint(allocator, "_natyv_vendor_locate_{s}_{x}", .{ name, std.c.getpid() });
     parent_dir.deleteTree(io, scratch_name) catch {};
