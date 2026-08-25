@@ -70,7 +70,7 @@ pub const Result = struct {
 /// `name:artifact,...` list -- a `-zig`-mode entry links via the fetched
 /// package's own build.zig (`b.dependency(name, ...).artifact(artifact)` +
 /// `linkLibrary`, see `build.zig`), which flags alone can't express.
-pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, wasm_path: []const u8, dist_dir: Io.Dir, output_name: []const u8, has_bindings: bool, binding_include_dirs: []const u8, binding_lib_dirs: []const u8, binding_link: []const u8, binding_zig_deps: []const u8) !Result {
+pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, wasm_path: []const u8, dist_dir: Io.Dir, output_name: []const u8, has_bindings: bool, binding_include_dirs: []const u8, binding_lib_dirs: []const u8, binding_link: []const u8, binding_zig_deps: []const u8, binding_vendor_c_files: []const u8) !Result {
     var core_dir = std.Io.Dir.cwd().openDir(io, natyv_core_src, .{}) catch |e| {
         return .{ .ok = false, .err = .{
             .message = try std.fmt.allocPrint(allocator, "natyv build: could not open NATYV_CORE_SRC ('{s}'): {s}", .{ natyv_core_src, @errorName(e) }),
@@ -114,6 +114,7 @@ pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, was
     if (binding_lib_dirs.len > 0) try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dbinding-lib-dirs={s}", .{binding_lib_dirs}));
     if (binding_link.len > 0) try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dbinding-link={s}", .{binding_link}));
     if (binding_zig_deps.len > 0) try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dbinding-zig-deps={s}", .{binding_zig_deps}));
+    if (binding_vendor_c_files.len > 0) try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dbinding-vendor-c-files={s}", .{binding_vendor_c_files}));
 
     const result = std.process.run(allocator, io, .{
         .argv = argv.items,
@@ -169,7 +170,7 @@ test "a NATYV_CORE_SRC that doesn't exist is a clear error" {
     defer tmp.cleanup();
     const io = std.testing.io;
 
-    const result = try run(std.testing.allocator, io, "/definitely/not/a/real/path", "app.wasm", tmp.dir, "myapp", false, "", "", "", "");
+    const result = try run(std.testing.allocator, io, "/definitely/not/a/real/path", "app.wasm", tmp.dir, "myapp", false, "", "", "", "", "");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "NATYV_CORE_SRC") != null);
@@ -191,7 +192,7 @@ test "a NATYV_CORE_SRC with no build.zig is a clear error" {
     const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/not-natyv-core", .{ cwd_path, tmp.sub_path });
     defer std.testing.allocator.free(abs_path);
 
-    const result = try run(std.testing.allocator, io, abs_path, "app.wasm", tmp.dir, "myapp", false, "", "", "", "");
+    const result = try run(std.testing.allocator, io, abs_path, "app.wasm", tmp.dir, "myapp", false, "", "", "", "", "");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "build.zig") != null);
@@ -209,7 +210,7 @@ test "a missing compiled wasm file is a clear error" {
     const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_path, tmp.sub_path });
     defer std.testing.allocator.free(abs_path);
 
-    const result = try run(std.testing.allocator, io, abs_path, "/definitely/not/a/real/wasm/path.wasm", tmp.dir, "myapp", false, "", "", "", "");
+    const result = try run(std.testing.allocator, io, abs_path, "/definitely/not/a/real/wasm/path.wasm", tmp.dir, "myapp", false, "", "", "", "", "");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "compiled wasm") != null);

@@ -30,6 +30,7 @@ const std = @import("std");
 const Io = std.Io;
 const Config = @import("Config");
 const PkgConfig = @import("PkgConfig.zig");
+const Vendor = @import("Vendor.zig");
 
 pub const GetError = struct {
     message: []const u8,
@@ -78,6 +79,14 @@ pub const GetArgs = struct {
     /// `parseGetArgs`).
     zig_url: ?[]const u8 = null,
     zig_artifact: ?[]const u8 = null,
+    /// `.c` mode, Stage 2.6's URL-vendoring variant -- non-null means the
+    /// `-c` target was a URL (`-c=<url>`), not a bare pkg-config module
+    /// name. `vendor_c_build` (opt-in tier 2) is independent of this
+    /// field's own presence at the type level, but `main.zig`'s own
+    /// `parseGetArgs` never constructs one without the other (enforced
+    /// there via `error.CBuildRequiresVendorUrl`).
+    vendor_url: ?[]const u8 = null,
+    vendor_c_build: ?[]const u8 = null,
 };
 
 pub fn run(allocator: std.mem.Allocator, io: Io, config_path: []const u8, args: GetArgs) !Outcome {
@@ -85,8 +94,54 @@ pub fn run(allocator: std.mem.Allocator, io: Io, config_path: []const u8, args: 
     var include_dirs = args.include_dirs;
     var lib_dirs = args.lib_dirs;
     var link = args.link;
+    var vendor_files: []const []const u8 = &.{};
 
-    if (args.mode == .c) {
+    if (args.mode == .c and args.vendor_url != null) {
+        header = args.header orelse try std.fmt.allocPrint(allocator, "{s}.h", .{args.library});
+        if (args.vendor_c_build == null) {
+            // Tier 1 (default): a real fetch+walk, right now, to compute
+            // `vendor_files` -- unlike `.zig` mode's own deferred-to-`bind`
+            // discovery, this result (a list of relative filenames) is
+            // fully portable and safe to persist in checked-in
+            // `conf.natyv.json`, so there's no reason to defer it. Scratch
+            // work happens under a hidden dir in the app's own cwd,
+            // cleaned up immediately after -- `get` still never touches
+            // NATYV_CORE_SRC (the real, permanent vendored copy is
+            // `natyv bind`'s own job, at real `bind` time).
+            // Unique per invocation (not a fixed name) -- a fixed scratch
+            // dir name real-collided during this stage's own live test
+            // suite (two `zig build` subprocess invocations racing on the
+            // same `zig-pkg/` cache subtree, one of them getting its own
+            // partially-extracted files yanked out from under it by the
+            // other's cleanup) -- confirmed empirically, not just a
+            // theoretical concern, so real uniqueness is required, not
+            // just table stakes.
+            const scratch_parent_name = try std.fmt.allocPrint(allocator, ".natyv-vendor-discover-{x}", .{std.c.getpid()});
+            var scratch_parent = std.Io.Dir.cwd().createDirPathOpen(io, scratch_parent_name, .{}) catch |e| {
+                return .{ .updated_existing = false, .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv get: could not create scratch vendor-discovery dir: {s}", .{@errorName(e)}) } };
+            };
+            defer scratch_parent.close(io);
+            defer std.Io.Dir.cwd().deleteTree(io, scratch_parent_name) catch {};
+
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const scratch_parent_abs_len = try scratch_parent.realPath(io, &buf);
+            const scratch_parent_abs = try allocator.dupe(u8, buf[0..scratch_parent_abs_len]);
+
+            const locate_scratch_name = try std.fmt.allocPrint(allocator, "_natyv_vendor_locate_{s}", .{args.library});
+            const located = try Vendor.locateSource(allocator, io, scratch_parent, scratch_parent_abs, args.library, args.vendor_url.?);
+            defer scratch_parent.deleteTree(io, locate_scratch_name) catch {};
+            if (located.err) |e| return .{ .updated_existing = false, .err = .{ .message = e.message } };
+
+            var source_dir = std.Io.Dir.cwd().openDir(io, located.source_dir.?, .{ .iterate = true }) catch |e| {
+                return .{ .updated_existing = false, .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv get: could not open the fetched source at '{s}': {s}", .{ located.source_dir.?, @errorName(e) }) } };
+            };
+            defer source_dir.close(io);
+            vendor_files = try Vendor.findCSourceFiles(allocator, io, source_dir);
+            if (vendor_files.len == 0) {
+                return .{ .updated_existing = false, .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv get: found no real .c files in the fetched source at '{s}' (skipping any test/tests/example/examples path) -- if this library needs its own build system, use --c-build=<command> instead", .{args.vendor_url.?}) } };
+            }
+        }
+    } else if (args.mode == .c) {
         const disc = try PkgConfig.discover(allocator, io, args.library);
         if (disc.err) |e| return .{ .updated_existing = false, .err = .{ .message = e.message } };
         const d = disc.discovery.?;
@@ -127,6 +182,9 @@ pub fn run(allocator: std.mem.Allocator, io: Io, config_path: []const u8, args: 
         .functions = args.functions,
         .zig_url = if (args.mode == .zig) args.zig_url else null,
         .zig_artifact = if (args.mode == .zig) args.zig_artifact else null,
+        .vendor_url = args.vendor_url,
+        .vendor_files = vendor_files,
+        .vendor_c_build = args.vendor_c_build,
     };
 
     var updated_existing = false;
@@ -420,6 +478,73 @@ test "-zig mode: an explicit --header= overrides the <library>.h default guess" 
 
     const reparsed = try Config.load(allocator, io, abs_path);
     try std.testing.expectEqualStrings("zconf.h", reparsed.value.bindings[0].header);
+}
+
+test "-c=<url> mode (tier 1): a real, live fetch+walk populates vendor_files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    const abs_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}/conf.natyv.json", .{ cwd_path, tmp.sub_path });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = abs_path, .data = "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}" });
+
+    const outcome = try run(allocator, io, abs_path, .{
+        .library = "zlibsrc",
+        .mode = .c,
+        .vendor_url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz",
+        .functions = &.{"zlibCompileFlags"},
+    });
+    if (outcome.err) |e| {
+        std.debug.print("vendoring get failed: {s}\n", .{e.message});
+        return error.SkipZigTest;
+    }
+
+    const reparsed = try Config.load(allocator, io, abs_path);
+    const entry = reparsed.value.bindings[0];
+    try std.testing.expectEqualStrings("zlibsrc.h", entry.header);
+    try std.testing.expectEqualStrings("https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz", entry.vendor_url.?);
+    try std.testing.expect(entry.vendor_files.len > 5); // real zlib has ~15 top-level .c files
+    var found_deflate = false;
+    for (entry.vendor_files) |f| {
+        if (std.mem.eql(u8, f, "deflate.c")) found_deflate = true;
+    }
+    try std.testing.expect(found_deflate);
+}
+
+test "-c=<url> mode (tier 2, --c-build=): declares vendor_c_build + manual link with no real fetch at get time" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    const abs_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}/conf.natyv.json", .{ cwd_path, tmp.sub_path });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = abs_path, .data = "{\"wasm_compile\":\"tinygo build -o app.wasm .\"}" });
+
+    // A deliberately unreachable URL -- proves tier 2 never fetches at
+    // `get` time (would otherwise fail on a real network call).
+    const outcome = try run(allocator, io, abs_path, .{
+        .library = "zlibsrc",
+        .mode = .c,
+        .vendor_url = "https://example.invalid/never-actually-fetched.tar.gz",
+        .vendor_c_build = "./configure && make",
+        .link = &.{"z"},
+        .functions = &.{"zlibCompileFlags"},
+    });
+    try std.testing.expect(outcome.err == null);
+
+    const reparsed = try Config.load(allocator, io, abs_path);
+    const entry = reparsed.value.bindings[0];
+    try std.testing.expectEqualStrings("zlibsrc.h", entry.header);
+    try std.testing.expectEqualStrings("./configure && make", entry.vendor_c_build.?);
+    try std.testing.expectEqual(@as(usize, 0), entry.vendor_files.len);
+    try std.testing.expectEqual(@as(usize, 1), entry.link.len);
 }
 
 test "-c mode: an unknown pkg-config module surfaces pkg-config's own real error" {
