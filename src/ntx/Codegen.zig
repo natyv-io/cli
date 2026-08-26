@@ -702,7 +702,11 @@ const Emitter = struct {
             const src = (try self.stringAttr(el, "src")) orelse return self.fail(el.line, el.col, "<Image> requires a src=\"...\" attribute", .{});
             image_texture_id = self.image_texture_ids.get(src) orelse return self.fail(el.line, el.col, "image asset \"{s}\" was never staged -- this shouldn't happen if natyv prepare's own pre-scan ran first", .{src});
             is_image_tag = true;
-            try self.emitLayout(layout_var, attach_expr, .{ .direction = "widgets.TopToBottom", .child_gap = 0, .padding = 0 });
+            // A leaf widget like Label/Button, not a layout container --
+            // 300x200 is a plain, reasonable default "image box" size
+            // (no real sizing/layout attribute grammar exists yet, see the
+            // LayoutDefaults doc comment above), not a real design.
+            try self.emitLayout(layout_var, attach_expr, .{ .width_fixed = 300, .height_fixed = 200 });
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateContainer(");
