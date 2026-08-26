@@ -215,7 +215,7 @@ test "a genuine mutual component-reuse cycle, produced through the real .ntx use
     var pkg_a = try tmp.dir.createDirPathOpen(io, "a", .{});
     defer pkg_a.close(io);
     const found_a = try Expose.findComposers(allocator, src_a);
-    const gen_a = try Codegen.generateGo(allocator, "a", src_a, found_a.composers, &[_]Resolver.ResolvedStyleToken{}, found_a.uses, found_a.uses_start, found_a.uses_end);
+    const gen_a = try Codegen.generateGo(allocator, "a", src_a, found_a.composers, &[_]Resolver.ResolvedStyleToken{}, found_a.uses, found_a.uses_start, found_a.uses_end, .{});
     try std.testing.expect(gen_a.err == null);
     try pkg_a.writeFile(io, .{ .sub_path = "a.natyv.go", .data = gen_a.output.?.generated });
     try pkg_a.writeFile(io, .{ .sub_path = "a.go", .data = gen_a.output.?.logic });
@@ -223,7 +223,7 @@ test "a genuine mutual component-reuse cycle, produced through the real .ntx use
     var pkg_b = try tmp.dir.createDirPathOpen(io, "b", .{});
     defer pkg_b.close(io);
     const found_b = try Expose.findComposers(allocator, src_b);
-    const gen_b = try Codegen.generateGo(allocator, "b", src_b, found_b.composers, &[_]Resolver.ResolvedStyleToken{}, found_b.uses, found_b.uses_start, found_b.uses_end);
+    const gen_b = try Codegen.generateGo(allocator, "b", src_b, found_b.composers, &[_]Resolver.ResolvedStyleToken{}, found_b.uses, found_b.uses_start, found_b.uses_end, .{});
     try std.testing.expect(gen_b.err == null);
     try pkg_b.writeFile(io, .{ .sub_path = "b.natyv.go", .data = gen_b.output.?.generated });
     try pkg_b.writeFile(io, .{ .sub_path = "b.go", .data = gen_b.output.?.logic });

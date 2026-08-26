@@ -168,17 +168,25 @@ const AssetStagingResult = struct {
 /// real files directly into natyv-core's own tree" precedent exactly,
 /// just for asset bytes instead of Zig/Go source.
 ///
-/// A stylesheet with zero `texture` references is a real, zero-cost no-op
-/// -- returns immediately, never opens `assets_dir` or `natyv_core_src` at
-/// all, so an app that doesn't use texture fill never needs an `assets/`
-/// directory to exist. Referencing a texture without the `images`
-/// capability enabled, or with no `assets/` directory, or naming a file
-/// that isn't actually there, are all clear, natyv-attributed errors --
-/// matches this project's own "closed vocabulary, clear errors" posture
-/// rather than silently dropping the reference the way this code path used
-/// to before asset staging existed (see `styling/Codegen.zig`'s own,
-/// now-updated doc comment).
-fn stageTextureAssets(allocator: std.mem.Allocator, io: Io, assets_dir: ?Io.Dir, style_tokens: []const Resolver.ResolvedStyleToken, images_enabled: bool, natyv_core_src: []const u8) !AssetStagingResult {
+/// Also stages every path in `image_src_paths` (2026-08-26: `<Image
+/// src="...">` sugar's own references, collected by `findImageSrcReferences`
+/// *before* this function runs -- see that function's own doc comment for
+/// why this can't be resolved lazily during the real `.ntx` transpile
+/// walk) into the exact same combined id-assignment pass as `style_tokens`'
+/// own `.ntss`-declared `texture` values, so the same path referenced by
+/// both a stylesheet token and an `<Image>` tag is only ever staged once.
+///
+/// A stylesheet/markup tree with zero `texture`/`<Image src>` references
+/// is a real, zero-cost no-op -- returns immediately, never opens
+/// `assets_dir` or `natyv_core_src` at all, so an app that doesn't use
+/// texture fill never needs an `assets/` directory to exist. Referencing a
+/// texture without the `images` capability enabled, or with no `assets/`
+/// directory, or naming a file that isn't actually there, are all clear,
+/// natyv-attributed errors -- matches this project's own "closed
+/// vocabulary, clear errors" posture rather than silently dropping the
+/// reference the way this code path used to before asset staging existed
+/// (see `styling/Codegen.zig`'s own, now-updated doc comment).
+fn stageTextureAssets(allocator: std.mem.Allocator, io: Io, assets_dir: ?Io.Dir, style_tokens: []const Resolver.ResolvedStyleToken, image_src_paths: []const []const u8, images_enabled: bool, natyv_core_src: []const u8) !AssetStagingResult {
     var texture_ids: std.StringHashMapUnmanaged(u32) = .{};
     var paths: std.ArrayList([]const u8) = .empty;
 
@@ -187,6 +195,15 @@ fn stageTextureAssets(allocator: std.mem.Allocator, io: Io, assets_dir: ?Io.Dir,
         if (texture_ids.contains(path)) continue;
         if (!images_enabled) {
             return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv prepare: style token '{s}' references texture \"{s}\", but images aren't enabled -- add \"images\": {{\"enabled\": true}} to conf.natyv.json", .{ tok.name, path }) } };
+        }
+        const id: u32 = @intCast(paths.items.len);
+        try texture_ids.put(allocator, path, id);
+        try paths.append(allocator, path);
+    }
+    for (image_src_paths) |path| {
+        if (texture_ids.contains(path)) continue;
+        if (!images_enabled) {
+            return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv prepare: an <Image src=\"{s}\"/> tag references an image, but images aren't enabled -- add \"images\": {{\"enabled\": true}} to conf.natyv.json", .{path}) } };
         }
         const id: u32 = @intCast(paths.items.len);
         try texture_ids.put(allocator, path, id);
@@ -226,6 +243,46 @@ const StyleTokensResult = struct {
     tokens: []const Resolver.ResolvedStyleToken,
     err: ?PrepareError,
 };
+
+/// Texture-fill `<Image src="...">` sugar (2026-08-26): a lightweight,
+/// whole-file text scan for every `<Image ... src="...">` occurrence
+/// across the guest tree's `.ntx` files -- run *before* `stageTextureAssets`
+/// so an Image-referenced path gets staged the same way a `.ntss`-declared
+/// `texture` does, in one combined pass, rather than discovered too late
+/// (the real `.ntx` transpile walk that would otherwise find these runs
+/// *after* staging, per this file's own established ordering -- staging
+/// needs every referenced path known up front, not incrementally).
+/// Deliberately not a full markup parse: this only needs the `src` values,
+/// not real validation (that still happens for real during the actual
+/// `.ntx` transpile walk below, which will correctly fail on anything
+/// actually malformed) -- same accepted-false-positive-risk posture as
+/// `extractPackageName`'s own text scan elsewhere in this file (a `.ntx`
+/// file's own prose/string content coincidentally containing this exact
+/// text is a real but accepted edge case, not solved here).
+fn findImageSrcReferences(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir) ![]const []const u8 {
+    var paths: std.ArrayList([]const u8) = .empty;
+    var walker = try guest_dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".ntx")) continue;
+        const src = try entry.dir.readFileAlloc(io, entry.basename, allocator, .unlimited);
+
+        var search_start: usize = 0;
+        while (std.mem.indexOfPos(u8, src, search_start, "<Image")) |tag_start| {
+            const tag_end = std.mem.indexOfPos(u8, src, tag_start, ">") orelse break;
+            const tag_text = src[tag_start..tag_end];
+            if (std.mem.indexOf(u8, tag_text, "src=\"")) |src_attr_pos| {
+                const value_start = tag_start + src_attr_pos + "src=\"".len;
+                if (std.mem.indexOfScalarPos(u8, src, value_start, '"')) |value_end| {
+                    try paths.append(allocator, src[value_start..value_end]);
+                }
+            }
+            search_start = tag_end + 1;
+        }
+    }
+    return paths.toOwnedSlice(allocator);
+}
 
 /// Walks `guest_dir` for a real `.ntss` stylesheet source, parsing +
 /// resolving it if found. At most one is supported for v1 (see this
@@ -317,8 +374,11 @@ pub fn run(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir, bindings: []
     // runs, in both .codegen_only and .full mode (matches --codegen's own
     // documented "stylesheet pipeline + bind" scope) -- unlike the .ntx
     // walk below, staging referenced assets has nothing to do with
-    // transpilation.
-    const asset_result = try stageTextureAssets(allocator, io, assets_dir, style_tokens, images_enabled, natyv_core_src);
+    // transpilation. `<Image src="...">` references are collected *before*
+    // staging (see findImageSrcReferences's own doc comment) so they're
+    // staged in the exact same pass as `.ntss`-declared `texture` values.
+    const image_src_paths = try findImageSrcReferences(allocator, io, guest_dir);
+    const asset_result = try stageTextureAssets(allocator, io, assets_dir, style_tokens, image_src_paths, images_enabled, natyv_core_src);
     if (asset_result.err) |e| return .{
         .processed = 0,
         .binding_include_dirs = binding_include_dirs,
@@ -368,7 +428,7 @@ pub fn run(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir, bindings: []
             .message = try std.fmt.allocPrint(allocator, "natyv prepare: {s}:{d}:{d}: {s}", .{ entry.path, e.line, e.col, e.message }),
         } };
 
-        const result = try Codegen.generateGo(allocator, package_name, src, found.composers, style_tokens, found.uses, found.uses_start, found.uses_end);
+        const result = try Codegen.generateGo(allocator, package_name, src, found.composers, style_tokens, found.uses, found.uses_start, found.uses_end, texture_ids);
         if (result.err) |e| return .{ .processed = processed, .err = .{
             .message = try std.fmt.allocPrint(allocator, "natyv prepare: {s}:{d}:{d}: {s}", .{ entry.path, e.line, e.col, e.message }),
         } };
@@ -384,7 +444,14 @@ pub fn run(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir, bindings: []
         // reference which token names via `styles={...}`; matches the
         // real, already-shipping convention (see
         // examples/ntx-form/guest/styletokens_generated.go).
-        if (style_tokens.len > 0) {
+        // `texture_ids.count() > 0` is also checked, not just
+        // `style_tokens.len` -- an app with zero `.ntss` files but a real
+        // `<Image src="...">` reference still needs a real `StyleTokens`
+        // map to exist (ApplyStyleWithTexture's own second parameter), even
+        // though no *named* stylesheet token exists anywhere. Found by
+        // actually compiling a real Image-only guest via tinygo, not by
+        // inspection -- `StyleTokens` was undefined without this.
+        if (style_tokens.len > 0 or texture_ids.count() > 0) {
             const styletokens_src = try StylingCodegen.generateGo(allocator, package_name, style_tokens, texture_ids);
             try entry.dir.writeFile(io, .{ .sub_path = "styletokens_generated.go", .data = styletokens_src });
         }
@@ -759,6 +826,73 @@ test "texture-fill: a real referenced asset is staged and its TextureID flows in
 
     const styletokens = try tmp.dir.readFileAlloc(io, "styletokens_generated.go", allocator, .unlimited);
     try std.testing.expect(std.mem.indexOf(u8, styletokens, "TextureID: widgets.TextureIDPtr(0)") != null);
+}
+
+test "texture-fill: <Image src=...> in a .go.ntx file (no .ntss at all) gets its own path staged and applied" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var assets_tmp = std.testing.tmpDir(.{});
+    defer assets_tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    try assets_tmp.dir.writeFile(io, .{ .sub_path = "hero.png", .data = "not a real png, staging never decodes it" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "go.mod", .data = "module preptest\n\ngo 1.23\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "page.go.ntx", .data =
+        \\package main
+        \\
+        \\expose Page
+        \\
+        \\func Page(parent widgets.Container) error {
+        \\  <Image src="hero.png"/>
+        \\}
+    });
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    const outcome = try run(allocator, io, tmp.dir, &.{}, cwd_path, .full, true, assets_tmp.dir);
+    defer {
+        var core_assets_dir = std.Io.Dir.cwd().openDir(io, "src/assets", .{}) catch unreachable;
+        defer core_assets_dir.close(io);
+        core_assets_dir.deleteFile(io, "TextureAssetsGenerated.zig") catch {};
+        core_assets_dir.deleteTree(io, "textures") catch {};
+    }
+
+    try std.testing.expect(outcome.err == null);
+    try std.testing.expect(outcome.has_textures);
+
+    const staged = try std.Io.Dir.cwd().readFileAlloc(io, "src/assets/textures/0.png", allocator, .unlimited);
+    try std.testing.expectEqualStrings("not a real png, staging never decodes it", staged);
+
+    const gen = try tmp.dir.readFileAlloc(io, "page.natyv.go", allocator, .unlimited);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateContainer(Image0Layout, true, 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.ApplyStyleWithTexture(uint32(Image0), StyleTokens, 0)") != null);
+}
+
+test "texture-fill: <Image src=...> without images enabled is a clear, natyv-attributed error" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "go.mod", .data = "module preptest\n\ngo 1.23\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "page.go.ntx", .data =
+        \\package main
+        \\
+        \\expose Page
+        \\
+        \\func Page(parent widgets.Container) error {
+        \\  <Image src="hero.png"/>
+        \\}
+    });
+
+    const outcome = try run(allocator, io, tmp.dir, &.{}, "", .full, false, null);
+    try std.testing.expect(outcome.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "hero.png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.err.?.message, "images") != null);
 }
 
 test "Stage 2.7: natyv bind runs as run()'s own first step, real fixture entry produces real Go output" {

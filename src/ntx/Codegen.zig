@@ -203,6 +203,12 @@ const Emitter = struct {
     allocator: std.mem.Allocator,
     out: *std.ArrayList(u8),
     style_tokens: []const Resolver.ResolvedStyleToken = &.{},
+    /// `<Image src="...">` sugar (2026-08-26): resolved by `Prepare.zig`'s
+    /// own pre-scan + asset-staging pass *before* this file's own real
+    /// transpile pass runs, so every `src` value reaching `emitElement` is
+    /// already guaranteed staged with a real id -- see that file's own doc
+    /// comment for why this can't be resolved lazily here.
+    image_texture_ids: std.StringHashMapUnmanaged(u32) = .{},
     /// Names of every composer `expose`d in the file currently being
     /// processed (Stage 6a) -- lets a bare, non-builtin tag be recognized
     /// as a same-file component call rather than an unsupported widget
@@ -269,6 +275,28 @@ const Emitter = struct {
         try self.out.appendSlice(self.allocator, "\tif err := widgets.ApplyStyle(uint32(");
         try self.out.appendSlice(self.allocator, var_name);
         try self.out.appendSlice(self.allocator, "), StyleTokens");
+        for (names) |n| {
+            try self.out.appendSlice(self.allocator, ", ");
+            try writeGoStringLiteral(self.out, self.allocator, n);
+        }
+        try self.out.appendSlice(self.allocator, "); err != nil {\n\t\treturn err\n\t}\n");
+    }
+
+    /// `<Image src="...">` sugar: merges `names` (any `styles={...}` also
+    /// present on the tag) exactly like `emitApplyStyle`, then overrides
+    /// just the merged result's `TextureID` with `texture_id` -- `src`
+    /// always wins over whatever `texture` (if any) the named tokens
+    /// themselves carry, per Quinn's own explicit call; every other merged
+    /// field from `names` is untouched. `names` may be empty (a bare
+    /// `<Image src="..."/>` with no `styles=` at all still needs its
+    /// texture applied).
+    fn emitApplyStyleWithTexture(self: *Emitter, var_name: []const u8, names: [][]const u8, texture_id: u32) EmitError!void {
+        try self.out.appendSlice(self.allocator, "\tif err := widgets.ApplyStyleWithTexture(uint32(");
+        try self.out.appendSlice(self.allocator, var_name);
+        try self.out.appendSlice(self.allocator, "), StyleTokens, ");
+        var buf: [10]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&buf, "{d}", .{texture_id}) catch unreachable;
+        try self.out.appendSlice(self.allocator, id_str);
         for (names) |n| {
             try self.out.appendSlice(self.allocator, ", ");
             try writeGoStringLiteral(self.out, self.allocator, n);
@@ -442,7 +470,7 @@ const Emitter = struct {
     }
 
     fn isBuiltinWidgetKind(tag: []const u8) bool {
-        return std.mem.eql(u8, tag, "Container") or std.mem.eql(u8, tag, "Label") or std.mem.eql(u8, tag, "Button") or std.mem.eql(u8, tag, "TextField");
+        return std.mem.eql(u8, tag, "Container") or std.mem.eql(u8, tag, "Label") or std.mem.eql(u8, tag, "Button") or std.mem.eql(u8, tag, "TextField") or std.mem.eql(u8, tag, "Image");
     }
 
     /// Stage 6a (component reuse), bare-name resolution only -- an
@@ -553,7 +581,7 @@ const Emitter = struct {
             const child_var = try std.fmt.allocPrint(self.allocator, "p{d}", .{self.counter});
             self.counter += 1;
             var body: std.ArrayList(u8) = .empty;
-            var child_emitter: Emitter = .{ .allocator = self.allocator, .out = &body, .style_tokens = self.style_tokens, .composers = self.composers, .uses = self.uses, .used_paths = self.used_paths, .counter = self.counter };
+            var child_emitter: Emitter = .{ .allocator = self.allocator, .out = &body, .style_tokens = self.style_tokens, .composers = self.composers, .uses = self.uses, .used_paths = self.used_paths, .counter = self.counter, .image_texture_ids = self.image_texture_ids };
             for (el.children) |child| {
                 switch (child) {
                     .text => return self.fail(el.line, el.col, "<{s}> doesn't accept text content -- a component tag's children become its widgets.Builder callback", .{el.tag}),
@@ -620,6 +648,9 @@ const Emitter = struct {
         self.counter += 1;
         const layout_var = try std.fmt.allocPrint(self.allocator, "{s}Layout", .{var_name});
         var skip_attr: ?[]const u8 = null;
+        var is_image_tag = false;
+        var image_texture_id: u32 = undefined;
+        var image_styles_emitted = false;
 
         if (std.mem.eql(u8, el.tag, "Container")) {
             try self.emitLayout(layout_var, attach_expr, .{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 });
@@ -659,6 +690,25 @@ const Emitter = struct {
             try writeGoStringLiteral(self.out, self.allocator, placeholder);
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attr = "placeholder";
+        } else if (std.mem.eql(u8, el.tag, "Image")) {
+            // `background: true` (not false) is required -- Container's
+            // own fillRect() dispatch returns null entirely when
+            // background is false, which would silently skip drawStyledFill
+            // (and therefore the texture itself) regardless of any style
+            // applied below. A real gotcha found the hard way wiring up
+            // examples/clay-fixture's own demo -- see that fixture's own
+            // commit message and natyv_styling_system memory.
+            if (el.children.len > 0) return self.fail(el.line, el.col, "<Image> doesn't accept children -- it renders its own src, nothing else", .{});
+            const src = (try self.stringAttr(el, "src")) orelse return self.fail(el.line, el.col, "<Image> requires a src=\"...\" attribute", .{});
+            image_texture_id = self.image_texture_ids.get(src) orelse return self.fail(el.line, el.col, "image asset \"{s}\" was never staged -- this shouldn't happen if natyv prepare's own pre-scan ran first", .{src});
+            is_image_tag = true;
+            try self.emitLayout(layout_var, attach_expr, .{ .direction = "widgets.TopToBottom", .child_gap = 0, .padding = 0 });
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, var_name);
+            try self.out.appendSlice(self.allocator, ", err := widgets.CreateContainer(");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ", true, 0)\n\tif err != nil {\n\t\treturn err\n\t}\n");
+            skip_attr = "src";
         } else {
             return self.fail(el.line, el.col, "'{s}' isn't a supported widget kind, and no composer named '{s}' is exposed in this file", .{ el.tag, el.tag });
         }
@@ -676,7 +726,14 @@ const Emitter = struct {
             if (skip_attr != null and std.mem.eql(u8, attr.name, skip_attr.?)) continue;
             if (std.mem.eql(u8, attr.name, "styles")) {
                 switch (attr.value) {
-                    .styles => |names| try self.emitApplyStyle(var_name, names),
+                    .styles => |names| {
+                        if (is_image_tag) {
+                            try self.emitApplyStyleWithTexture(var_name, names, image_texture_id);
+                            image_styles_emitted = true;
+                        } else {
+                            try self.emitApplyStyle(var_name, names);
+                        }
+                    },
                     else => return self.fail(attr.line, attr.col, "dynamic 'styles' expressions aren't supported until a future stage", .{}),
                 }
             } else if (std.mem.eql(u8, attr.name, "ref")) {
@@ -692,6 +749,12 @@ const Emitter = struct {
             } else {
                 return self.fail(attr.line, attr.col, "attribute '{s}' isn't supported yet", .{attr.name});
             }
+        }
+        // A bare <Image src="..."/> with no styles={} attribute at all
+        // still needs its texture applied -- the branch above only fires
+        // when a real 'styles' attribute is present on the tag.
+        if (is_image_tag and !image_styles_emitted) {
+            try self.emitApplyStyleWithTexture(var_name, &.{}, image_texture_id);
         }
 
         if (!consumesTextChildren(el.tag)) {
@@ -761,7 +824,7 @@ fn applyEdits(allocator: std.mem.Allocator, src: []const u8, edits: []Edit) ![]c
     return out.toOwnedSlice(allocator);
 }
 
-pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: []const u8, composers: []const Expose.Composer, style_tokens: []const Resolver.ResolvedStyleToken, uses: []const Expose.UseImport, uses_start: usize, uses_end: usize) !struct { output: ?Output, err: ?CodegenError } {
+pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: []const u8, composers: []const Expose.Composer, style_tokens: []const Resolver.ResolvedStyleToken, uses: []const Expose.UseImport, uses_start: usize, uses_end: usize, image_texture_ids: std.StringHashMapUnmanaged(u32)) !struct { output: ?Output, err: ?CodegenError } {
     const hash_hex = sourceHashHex(src);
 
     for (uses) |u| {
@@ -851,7 +914,7 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
             } };
         };
 
-        var emitter: Emitter = .{ .allocator = allocator, .out = &body, .style_tokens = style_tokens, .composers = composer_names.items, .uses = uses, .used_paths = &used_paths };
+        var emitter: Emitter = .{ .allocator = allocator, .out = &body, .style_tokens = style_tokens, .composers = composer_names.items, .uses = uses, .used_paths = &used_paths, .image_texture_ids = image_texture_ids };
         _ = emitter.emitElement(node.element, parent_name) catch |e| {
             if (e == error.CodegenError) {
                 const eerr = emitter.err.?;
@@ -951,7 +1014,7 @@ test "generates a builder function and a spliced logic file for a single flat co
 
     const found = try Expose.findComposers(allocator, src);
     try std.testing.expect(found.err == null);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     const out = result.output.?;
 
@@ -980,7 +1043,7 @@ test "forwards multiple parameters positionally in the logic file's call-through
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "func natyvBuildFoo(parent widgets.Container, extra int) error {") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.logic, "return natyvBuildFoo(parent, extra)") != null);
@@ -998,7 +1061,7 @@ test "rejects a void composer with a clear error" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "must have signature") != null);
 }
@@ -1015,7 +1078,7 @@ test "rejects an unsupported widget kind with a clear error" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "Slider") != null);
 }
@@ -1032,7 +1095,7 @@ test "ref={&x} assigns the created widget's address to the named package-level v
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.CreateTextField(TextField0Layout, \"Your name\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "nameField = &TextField0") != null);
@@ -1053,7 +1116,7 @@ test "onClick={handler} binds the real .OnClick(...) method, and onClick reads a
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateButton(Button2Layout, \"Save\")") != null);
@@ -1072,7 +1135,7 @@ test "rejects an unrecognized attribute with a clear error, translated to an abs
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "bogus") != null);
     try std.testing.expectEqual(@as(u32, 4), result.err.?.line);
@@ -1090,7 +1153,7 @@ test "rejects <Container> with text content" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.output == null);
 }
 
@@ -1111,7 +1174,7 @@ test "multiple composers each get their own generated function and splice" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     const out = result.output.?;
     try std.testing.expect(std.mem.indexOf(u8, out.generated, "func natyvBuildNavBar") != null);
@@ -1133,7 +1196,7 @@ test "styles naming a token with margin inserts a wrapper Container, transparent
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "Margin0Layout := widgets.ParentID(uint32(parent))") != null);
@@ -1157,7 +1220,7 @@ test "a token with no margin never inserts a wrapper" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateContainer") == null);
@@ -1176,7 +1239,7 @@ test "an unknown style name contributes no margin and causes no error" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "widgets.CreateContainer") == null);
 }
@@ -1197,7 +1260,7 @@ test "later-wins margin resolution across multiple style names, matching ApplySt
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "Margin0Layout.Padding = widgets.Padding{Left: 20, Right: 20, Top: 20, Bottom: 20}") != null);
 }
@@ -1220,7 +1283,7 @@ test "nested margins produce a two-level wrapper chain, and ref still binds the 
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     // Outer wrapper attaches to the composer's own parent param.
@@ -1253,7 +1316,7 @@ test "a bare tag matching a same-file exposed composer compiles to a direct comp
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "func natyvBuildHeader(parent uint32) error {") != null);
@@ -1277,7 +1340,7 @@ test "a bare tag resolved via 'uses' compiles to a qualified cross-package compo
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
     try std.testing.expect(found.err == null);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "import (\n\t\"natyv/sdk/widgets\"\n\t\"natyv/ntx-components-guest/components\"\n)\n") != null);
@@ -1309,7 +1372,7 @@ test "two 'uses'-bound tags sharing one path only add that import once" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     var count: usize = 0;
@@ -1339,7 +1402,7 @@ test "a component tag not referenced by any composer body adds no unused import"
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "import \"natyv/sdk/widgets\"\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "components") == null);
@@ -1363,7 +1426,7 @@ test "children of a 'uses'-bound component tag compile to a trailing widgets.Bui
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "if err := components.Card(uint32(parent), func(p0 uint32) error {") != null);
@@ -1388,7 +1451,7 @@ test "ref on a component tag is a clear error, not silently dropped" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
     try std.testing.expect(result.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "ref") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "component tag") != null);
@@ -1410,7 +1473,7 @@ test "an onXxx-named attribute on a component tag forwards as a plain prop, not 
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "if err := components.UserCard(uint32(parent), handleTap); err != nil {\n\t\treturn err\n\t}\n") != null);
 }
@@ -1434,7 +1497,7 @@ test "styles on a component tag only applies its margin-wrapping effect, never f
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &tokens, found.uses, found.uses_start, found.uses_end);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, found.uses, found.uses_start, found.uses_end, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "Margin0Layout.Padding = widgets.Padding{Left: 16, Right: 16, Top: 16, Bottom: 16}") != null);
@@ -1460,7 +1523,7 @@ test "a 'uses' name colliding with a built-in widget kind is a clear error" {
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
     try std.testing.expect(found.err == null);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
     try std.testing.expect(result.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "Container") != null);
 }
@@ -1479,7 +1542,7 @@ test "<children/> compiles to a direct call to the composer's own 'children' par
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateContainer(Container0Layout, false, 0)") != null);
@@ -1498,7 +1561,7 @@ test "<children/> rejects attributes and its own children with a clear error" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const found1 = try Expose.findComposers(allocator, src_with_attr);
-    const result1 = try generateGo(allocator, "main", src_with_attr, found1.composers, &.{}, &.{}, 0, 0);
+    const result1 = try generateGo(allocator, "main", src_with_attr, found1.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result1.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result1.err.?.message, "attributes") != null);
 
@@ -1510,7 +1573,7 @@ test "<children/> rejects attributes and its own children with a clear error" {
         \\}
     ;
     const found2 = try Expose.findComposers(allocator, src_with_children);
-    const result2 = try generateGo(allocator, "main", src_with_children, found2.composers, &.{}, &.{}, 0, 0);
+    const result2 = try generateGo(allocator, "main", src_with_children, found2.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result2.output == null);
     try std.testing.expect(std.mem.indexOf(u8, result2.err.?.message, "its own children") != null);
 }
@@ -1531,7 +1594,7 @@ test "a composer body that never references a real widget kind gets no unused 'w
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "import \"natyv/sdk/widgets\"\n") != null);
 }
@@ -1548,7 +1611,7 @@ test "a composer body whose signature and body both never mention 'widgets' gets
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets") == null);
@@ -1572,9 +1635,104 @@ test "a component-only composer body needing a 'uses' import but no real widget 
     defer arena.deinit();
     const allocator = arena.allocator();
     const found = try Expose.findComposers(allocator, src);
-    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "import \"some/other/pkg\"\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "natyv/sdk/widgets") == null);
+}
+
+test "<Image src=...> with no styles= still applies its texture, background true" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Image src="hero.png"/>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    var image_texture_ids: std.StringHashMapUnmanaged(u32) = .{};
+    try image_texture_ids.put(allocator, "hero.png", 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, image_texture_ids);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateContainer(Image0Layout, true, 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.ApplyStyleWithTexture(uint32(Image0), StyleTokens, 0)") != null);
+}
+
+test "<Image src=...> with styles= merges names, src's texture still applied via the same call" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Image src="hero.png" styles={card}/>
+        \\}
+    ;
+    const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "card", .padding = 4 }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    var image_texture_ids: std.StringHashMapUnmanaged(u32) = .{};
+    try image_texture_ids.put(allocator, "hero.png", 2);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, image_texture_ids);
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.ApplyStyleWithTexture(uint32(Image0), StyleTokens, 2, \"card\")") != null);
+}
+
+test "<Image> requires a src attribute" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Image/>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "src") != null);
+}
+
+test "<Image> rejects children" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Image src="hero.png"><Label>no</Label></Image>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    var image_texture_ids: std.StringHashMapUnmanaged(u32) = .{};
+    try image_texture_ids.put(allocator, "hero.png", 0);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, image_texture_ids);
+    try std.testing.expect(result.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "children") != null);
+}
+
+test "<Image src=...> naming a path never staged is a clear error, not a crash" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Image src="never-staged.png"/>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "never-staged.png") != null);
 }
