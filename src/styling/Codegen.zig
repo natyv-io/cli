@@ -14,13 +14,17 @@
 //! same as how a hex color is resolved to floats here rather than crossing
 //! the wire as a string.
 //!
-//! `texture` resolves correctly (Resolver.zig validates/stores it) but is
-//! **deliberately silently dropped here**, not even a warning yet --
-//! confirmed 2026-08-21: a real capability-gated warning/error needs
-//! `conf.natyv.json`'s image-capability flag to actually exist and reach
-//! this pipeline, and neither does until asset staging is implemented.
-//! Revisit this exact spot once it is; don't add a stub check against a
-//! flag that isn't real yet.
+//! `texture` (2026-08-26): resolves to a real numeric asset id via the new
+//! `texture_ids` parameter (`Prepare.zig`'s own asset-staging pass builds
+//! this map -- see that file's doc comment -- from the exact same resolved
+//! token paths `findStyleTokens` already produces here). Emitted as
+//! `TextureID: &<id>` alongside whatever fill fields are also present --
+//! `FrameLoop.zig`'s draw dispatch (host side) decides precedence, not this
+//! file. A `texture` value with no corresponding entry in `texture_ids`
+//! (the capability-disabled or file-not-found cases) is caught earlier, in
+//! `Prepare.zig`'s own asset-staging pass, as a clear natyv-attributed
+//! error -- by the time a token reaches this function, every referenced
+//! texture is guaranteed already staged and assigned an id.
 //!
 //! `margin` is never emitted here at all, and deliberately not implemented
 //! anywhere else in the SDK either right now -- confirmed 2026-08-21:
@@ -96,6 +100,12 @@ fn writeGoU16(out: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u16) !vo
     try out.appendSlice(allocator, s);
 }
 
+fn writeGoU32(out: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u32) !void {
+    var buf: [10]u8 = undefined;
+    const s = try std.fmt.bufPrint(&buf, "{d}", .{v});
+    try out.appendSlice(allocator, s);
+}
+
 fn writeGoStringLiteral(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
     try out.appendSlice(allocator, "\"");
     for (s) |ch| {
@@ -105,7 +115,7 @@ fn writeGoStringLiteral(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s
     try out.appendSlice(allocator, "\"");
 }
 
-pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, tokens: []const Resolver.ResolvedStyleToken) ![]const u8 {
+pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, tokens: []const Resolver.ResolvedStyleToken, texture_ids: std.StringHashMapUnmanaged(u32)) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -190,6 +200,12 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, tokens
             try writeGoFloat(&out, allocator, g.end.color.a);
             try out.appendSlice(allocator, "}},\n");
         }
+        if (tok.texture) |path| {
+            const id = texture_ids.get(path) orelse unreachable; // Prepare.zig guarantees every resolved texture path is staged before Codegen ever runs -- see this file's doc comment.
+            try out.appendSlice(allocator, "\t\tTextureID: widgets.TextureIDPtr(");
+            try writeGoU32(&out, allocator, id);
+            try out.appendSlice(allocator, "),\n");
+        }
         try out.appendSlice(allocator, "\t},\n");
     }
 
@@ -207,7 +223,7 @@ test "generates valid-looking Go for a full token" {
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const src = try generateGo(arena.allocator(), "main", &tokens);
+    const src = try generateGo(arena.allocator(), "main", &tokens, .{});
     try std.testing.expect(std.mem.indexOf(u8, src, "package main") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "\"card-header\": {") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "BackgroundColor: &widgets.Color{R: 0.1, G: 0.2, B: 0.3, A: 1}") != null);
@@ -224,7 +240,7 @@ test "generates cornerRadius and border for a styled token" {
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const src = try generateGo(arena.allocator(), "main", &tokens);
+    const src = try generateGo(arena.allocator(), "main", &tokens, .{});
     try std.testing.expect(std.mem.indexOf(u8, src, "CornerRadius: &widgets.CornerRadius{TopLeft: 4, TopRight: 8, BottomRight: 12, BottomLeft: 16}") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "Border: &widgets.Border{Width: 2, Color: widgets.Color{R: 0.545, G: 0.361, B: 0.965, A: 1}}") != null);
 }
@@ -241,7 +257,7 @@ test "generates gradient with anchors resolved to UV positions" {
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const src = try generateGo(arena.allocator(), "main", &tokens);
+    const src = try generateGo(arena.allocator(), "main", &tokens, .{});
     try std.testing.expect(std.mem.indexOf(u8, src, "Gradient: &widgets.Gradient{StartPos: [2]float32{0, 0}, StartColor: widgets.Color{R: 0, G: 0, B: 0, A: 1}, EndPos: [2]float32{1, 1}, EndColor: widgets.Color{R: 1, G: 1, B: 1, A: 1}}") != null);
 }
 
@@ -249,6 +265,19 @@ test "omits fields that were never resolved" {
     const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "bare" }};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const src = try generateGo(arena.allocator(), "main", &tokens);
+    const src = try generateGo(arena.allocator(), "main", &tokens, .{});
     try std.testing.expect(std.mem.indexOf(u8, src, "\"bare\": {\n\t},\n") != null);
+}
+
+test "generates TextureID from the texture_ids lookup, not the raw path" {
+    const tokens = [_]Resolver.ResolvedStyleToken{
+        .{ .name = "hero", .texture = "hero.png" },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var texture_ids: std.StringHashMapUnmanaged(u32) = .{};
+    try texture_ids.put(arena.allocator(), "hero.png", 3);
+    const src = try generateGo(arena.allocator(), "main", &tokens, texture_ids);
+    try std.testing.expect(std.mem.indexOf(u8, src, "TextureID: widgets.TextureIDPtr(3)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "hero.png") == null);
 }

@@ -327,6 +327,17 @@ pub fn main(init: std.process.Init) !void {
     const guest_dir_path = try std.fs.path.join(allocator, &.{ config_dir, "guest" });
     defer allocator.free(guest_dir_path);
 
+    // Texture-fill styling system: the app dev's own asset files, staged
+    // by `Prepare.run` whenever the stylesheet references a `texture` --
+    // see that file's own `stageTextureAssets` doc comment. A missing
+    // `assets/` directory is not an error here -- most apps have no
+    // texture fill at all, and `Prepare.run` itself only treats it as a
+    // real error if a texture is actually referenced with none present.
+    const assets_dir_path = try std.fs.path.join(allocator, &.{ config_dir, "assets" });
+    defer allocator.free(assets_dir_path);
+    var assets_dir_opt: ?std.Io.Dir = std.Io.Dir.cwd().openDir(io, assets_dir_path, .{}) catch null;
+    defer if (assets_dir_opt) |*d| d.close(io);
+
     switch (parsed.subcommand) {
         .prepare => {
             var guest_dir = std.Io.Dir.cwd().openDir(io, guest_dir_path, .{ .iterate = true }) catch |err| {
@@ -345,7 +356,7 @@ pub fn main(init: std.process.Init) !void {
             // `bindings` entries at all.
             const natyv_core_src = init.environ_map.get("NATYV_CORE_SRC") orelse build_options.natyv_core_src_default;
             const mode: Prepare.Mode = if (parsed.codegen) .codegen_only else .full;
-            const outcome = try Prepare.run(arena.allocator(), io, guest_dir, config.value.bindings, natyv_core_src, mode);
+            const outcome = try Prepare.run(arena.allocator(), io, guest_dir, config.value.bindings, natyv_core_src, mode, config.value.images.enabled, assets_dir_opt);
             if (outcome.err) |e| {
                 std.debug.print("{s}\n", .{e.message});
                 return error.PrepareFailed;
@@ -387,7 +398,7 @@ pub fn main(init: std.process.Init) !void {
             const fresh = try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename);
             const mode: Prepare.Mode = if (fresh) .codegen_only else .full;
 
-            const outcome = try Prepare.run(arena_alloc, io, guest_dir, config.value.bindings, natyv_core_src, mode);
+            const outcome = try Prepare.run(arena_alloc, io, guest_dir, config.value.bindings, natyv_core_src, mode, config.value.images.enabled, assets_dir_opt);
             if (outcome.err) |e| {
                 std.debug.print("{s}\n", .{e.message});
                 return error.PrepareFailed;
@@ -443,7 +454,7 @@ pub fn main(init: std.process.Init) !void {
             const wasm_full_path = try std.fs.path.join(arena_alloc, &.{ guest_dir_path, wasm_basename });
 
             std.debug.print("natyv build: {s} -- bundling...\n", .{config.value.name});
-            const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files);
+            const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures);
             if (bundle_result.err) |e| {
                 std.debug.print("{s}\n", .{e.message});
                 return error.BundleFailed;
