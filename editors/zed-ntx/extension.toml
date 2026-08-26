@@ -1,0 +1,15 @@
+id = "ntx"
+name = "natyv .ntx Language Support"
+description = "Real-time diagnostics, hover, and go-to-definition for natyv's .ntx markup files via the ntx-lsp language server. Stage 1 (~/.claude/plans/lexical-wishing-penguin.md): lifecycle handshake only -- no diagnostics/hover/go-to-definition are wired up server-side yet."
+version = "0.1.0"
+schema_version = 1
+authors = ["natyv"]
+repository = "https://github.com/natyv/zed-ntx"
+
+[grammars.ntx]
+repository = "file:///Users/quinnmillican/Desktop/dev/natyv/editors/tree-sitter-ntx"
+commit = "05e5b44589b55bfb5d16f462435932d0c64606d4"
+
+[language_servers.ntx-lsp]
+name = "ntx-lsp"
+languages = ["natyv Markup"]

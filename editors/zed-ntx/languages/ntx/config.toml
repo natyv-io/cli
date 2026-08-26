@@ -1,0 +1,4 @@
+name = "natyv Markup"
+grammar = "ntx"
+path_suffixes = ["ntx"]
+line_comments = ["// "]
