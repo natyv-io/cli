@@ -130,6 +130,7 @@ const std = @import("std");
 const Parser = @import("Parser");
 const Expose = @import("Expose");
 const Resolver = @import("Resolver");
+const PositionMap = @import("PositionMap.zig");
 
 pub const CodegenError = struct {
     line: u32,
@@ -140,6 +141,23 @@ pub const CodegenError = struct {
 pub const Output = struct {
     generated: []const u8,
     logic: []const u8,
+    source_map: []const SourceMapping,
+};
+
+/// One real correspondence between a position in the original `.ntx`
+/// source (`ntx_line`/`ntx_col`, matching `Parser.Attr`'s own 1-based
+/// convention) and a byte range in the *generated* Go output
+/// (`gen_start`/`gen_end`, into `Output.generated`). The `.ntx` LSP's own
+/// position-mapping spike (see `PositionMap.zig`) -- narrow by design:
+/// only `Emitter.emitEventBinding`'s handler-identifier emission records
+/// one of these today, not every attribute/element. See
+/// `~/.claude/plans/lexical-wishing-penguin.md` for why this one case was
+/// chosen and what's deliberately not covered yet.
+pub const SourceMapping = struct {
+    ntx_line: u32,
+    ntx_col: u32,
+    gen_start: usize,
+    gen_end: usize,
 };
 
 fn writeGoStringLiteral(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
@@ -228,6 +246,20 @@ const Emitter = struct {
     /// own `import` block with exactly what's needed, no more and no less
     /// (Go hard-errors on an unused import).
     used_paths: *std.ArrayList([]const u8),
+    /// Shared across every `Emitter` for this file the same way
+    /// `used_paths` is -- see `SourceMapping`'s own doc comment.
+    mappings: *std.ArrayList(SourceMapping),
+    /// The owning composer's own absolute file position -- same values
+    /// `generateGo`'s error path already passes to `translatePosition`,
+    /// just also threaded onto the `Emitter` itself so `emitEventBinding`
+    /// can translate a `Parser`-relative position to a real, unambiguous
+    /// absolute-file position before recording a `SourceMapping` (a flat,
+    /// whole-file list can't otherwise tell two composers' identical
+    /// relative positions apart). Defaults exist only so every other
+    /// `Emitter`-constructing test elsewhere in this file (none of which
+    /// exercise source-mapping) doesn't need updating.
+    body_line: u32 = 1,
+    body_col: u32 = 1,
     counter: u32 = 0,
     err: ?CodegenError = null,
 
@@ -333,14 +365,29 @@ const Emitter = struct {
         return name.len > 2 and name[0] == 'o' and name[1] == 'n' and std.ascii.isUpper(name[2]);
     }
 
-    fn emitEventBinding(self: *Emitter, var_name: []const u8, attr_name: []const u8, handler_expr: []const u8) EmitError!void {
+    fn emitEventBinding(self: *Emitter, var_name: []const u8, attr_name: []const u8, handler_expr: []const u8, line: u32, col: u32) EmitError!void {
         try self.out.appendSlice(self.allocator, "\t");
         try self.out.appendSlice(self.allocator, var_name);
         try self.out.appendSlice(self.allocator, ".On");
         try self.out.append(self.allocator, attr_name[2]); // already uppercase, see isEventAttr
         try self.out.appendSlice(self.allocator, attr_name[3..]);
         try self.out.appendSlice(self.allocator, "(");
+        // `.ntx` LSP position-mapping spike: record exactly where
+        // `handler_expr` (the real handler identifier, e.g.
+        // `handleSave`) landed in the generated output, tagged with the
+        // attribute's own real, absolute `.ntx` file position -- `line`/
+        // `col` are `Parser`-relative to this composer's own body slice
+        // (always starting at (1,1)), so `translatePosition` (the same
+        // helper this file's own error-reporting path already uses) is
+        // required here too: a flat, whole-file `source_map` can't
+        // otherwise tell two different composers' identical relative
+        // positions apart. See `SourceMapping`'s own doc comment for what
+        // this does and doesn't cover.
+        const abs = translatePosition(self.body_line, self.body_col, line, col);
+        const gen_start = self.out.items.len;
         try self.out.appendSlice(self.allocator, handler_expr);
+        const gen_end = self.out.items.len;
+        try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end });
         try self.out.appendSlice(self.allocator, ")\n");
     }
 
@@ -581,7 +628,7 @@ const Emitter = struct {
             const child_var = try std.fmt.allocPrint(self.allocator, "p{d}", .{self.counter});
             self.counter += 1;
             var body: std.ArrayList(u8) = .empty;
-            var child_emitter: Emitter = .{ .allocator = self.allocator, .out = &body, .style_tokens = self.style_tokens, .composers = self.composers, .uses = self.uses, .used_paths = self.used_paths, .counter = self.counter, .image_texture_ids = self.image_texture_ids };
+            var child_emitter: Emitter = .{ .allocator = self.allocator, .out = &body, .style_tokens = self.style_tokens, .composers = self.composers, .uses = self.uses, .used_paths = self.used_paths, .mappings = self.mappings, .body_line = self.body_line, .body_col = self.body_col, .counter = self.counter, .image_texture_ids = self.image_texture_ids };
             for (el.children) |child| {
                 switch (child) {
                     .text => return self.fail(el.line, el.col, "<{s}> doesn't accept text content -- a component tag's children become its widgets.Builder callback", .{el.tag}),
@@ -747,7 +794,7 @@ const Emitter = struct {
                 }
             } else if (isEventAttr(attr.name)) {
                 switch (attr.value) {
-                    .expr => |handler| try self.emitEventBinding(var_name, attr.name, handler),
+                    .expr => |handler| try self.emitEventBinding(var_name, attr.name, handler, attr.line, attr.col),
                     else => return self.fail(attr.line, attr.col, "'{s}' must be a real handler expression, e.g. {s}={{handleX}}", .{ attr.name, attr.name }),
                 }
             } else {
@@ -877,6 +924,11 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
     var used_paths: std.ArrayList([]const u8) = .empty;
     errdefer used_paths.deinit(allocator);
 
+    // `.ntx` LSP position-mapping spike -- shared the same way
+    // `used_paths` is, see `SourceMapping`'s own doc comment.
+    var mappings: std.ArrayList(SourceMapping) = .empty;
+    errdefer mappings.deinit(allocator);
+
     for (composers) |composer| {
         if (!std.mem.eql(u8, composer.return_type, "error")) {
             return .{ .output = null, .err = .{
@@ -918,7 +970,7 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
             } };
         };
 
-        var emitter: Emitter = .{ .allocator = allocator, .out = &body, .style_tokens = style_tokens, .composers = composer_names.items, .uses = uses, .used_paths = &used_paths, .image_texture_ids = image_texture_ids };
+        var emitter: Emitter = .{ .allocator = allocator, .out = &body, .style_tokens = style_tokens, .composers = composer_names.items, .uses = uses, .used_paths = &used_paths, .mappings = &mappings, .body_line = composer.body_line, .body_col = composer.body_col, .image_texture_ids = image_texture_ids };
         _ = emitter.emitElement(node.element, parent_name) catch |e| {
             if (e == error.CodegenError) {
                 const eerr = emitter.err.?;
@@ -995,9 +1047,23 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
         }
         try generated.appendSlice(allocator, ")\n");
     }
+    // Every `SourceMapping.gen_start`/`gen_end` recorded during emission
+    // is an offset into `body` alone (`Emitter.out` always points at
+    // `&body`, never `&generated` directly -- the header/import block
+    // can only be finalized after every composer's body is fully
+    // emitted, see the comment above `var body` near the top of this
+    // function). Real bug caught only by this file's own new round-trip
+    // test, not by inspection: recorded offsets need shifting by the
+    // header's own final length before they're valid offsets into the
+    // real `generated` buffer this function actually returns.
+    const header_len = generated.items.len;
     try generated.appendSlice(allocator, body.items);
+    for (mappings.items) |*m| {
+        m.gen_start += header_len;
+        m.gen_end += header_len;
+    }
 
-    return .{ .output = .{ .generated = try generated.toOwnedSlice(allocator), .logic = logic }, .err = null };
+    return .{ .output = .{ .generated = try generated.toOwnedSlice(allocator), .logic = logic, .source_map = try mappings.toOwnedSlice(allocator) }, .err = null };
 }
 
 test "generates a builder function and a spliced logic file for a single flat composer" {
@@ -1125,6 +1191,60 @@ test "onClick={handler} binds the real .OnClick(...) method, and onClick reads a
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateButton(Button2Layout, \"Save\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "Button2.OnClick(handleSave)") != null);
+}
+
+test ".ntx LSP position-mapping spike: onClick={handleSave} round-trips between the real .ntx source and the generated Go output" {
+    const src =
+        \\expose Form
+        \\
+        \\func Form(parent widgets.Container) error {
+        \\  <Container>
+        \\    <TextField ref={&nameField} placeholder="Your name" />
+        \\    <Button onClick={handleSave}>Save</Button>
+        \\  </Container>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+
+    // Exactly one mapping recorded -- this fixture has exactly one
+    // `on[A-Z]...` event-handler attribute (`onClick`); `ref`/
+    // `placeholder` aren't event attributes and record nothing.
+    try std.testing.expectEqual(@as(usize, 1), output.source_map.len);
+    const mapping = output.source_map[0];
+
+    // Independent sanity check on the recorded absolute position, without
+    // hardcoding the exact expected line/col (fragile to hand-compute and
+    // not actually the interesting thing to prove) -- the recorded line
+    // should be a real line in the original source, and that real line
+    // should be the one that actually contains `onClick`.
+    var line_it = std.mem.splitScalar(u8, src, '\n');
+    var current_line: u32 = 1;
+    while (line_it.next()) |line_text| : (current_line += 1) {
+        if (current_line == mapping.ntx_line) {
+            try std.testing.expect(std.mem.indexOf(u8, line_text, "onClick") != null);
+            break;
+        }
+    } else try std.testing.expect(false); // mapping.ntx_line must be a real line in src
+
+    // Forward mapping (`.ntx` -> generated): resolves to *exactly*
+    // "handleSave" in the generated output, not just "somewhere on the
+    // right line" -- the precise proof a real hover/go-to-definition
+    // request forwarded to gopls would need.
+    const forward = PositionMap.ntxToGenerated(output.source_map, mapping.ntx_line, mapping.ntx_col).?;
+    try std.testing.expectEqualStrings("handleSave", output.generated[forward.start..forward.end]);
+
+    // Reverse mapping (generated -> `.ntx`): a position gopls might return
+    // (e.g. the start of a diagnostic range over `handleSave`) maps back
+    // to the exact same real source position -- the real round trip.
+    const back = PositionMap.generatedToNtx(output.source_map, forward.start).?;
+    try std.testing.expectEqual(mapping.ntx_line, back.line);
+    try std.testing.expectEqual(mapping.ntx_col, back.col);
 }
 
 test "rejects an unrecognized attribute with a clear error, translated to an absolute file position" {
