@@ -34,6 +34,7 @@ const BuildCache = @import("BuildCache");
 const Bundle = @import("Bundle.zig");
 const Get = @import("Get.zig");
 const Init = @import("Init.zig");
+const ZigVersion = @import("ZigVersion.zig");
 const build_options = @import("build_options");
 
 pub const Subcommand = enum { prepare, build, init, get };
@@ -311,6 +312,19 @@ pub fn main(init: std.process.Init) !void {
         }
         std.debug.print("natyv init: scaffolded a new Go natyv app here -- try `natyv build` next\n", .{});
         return;
+    }
+
+    // `.prepare`/`.build` are the only two subcommands that ever shell out
+    // to a real `zig` toolchain (via `Bind.zig`/`Compile.zig`/`Bundle.zig`/
+    // `TranslateC.zig`) -- `.get`/`.init` already returned above without
+    // reaching this point. Checked once, up front, so a missing or
+    // mismatched zig install fails with one clear, natyv-attributed
+    // message instead of a confusing failure surfacing later from deep
+    // inside natyv-core's own build.zig.
+    const zig_check = try ZigVersion.check(allocator, io);
+    if (!zig_check.ok) {
+        std.debug.print("{s}\n", .{zig_check.err.?.message});
+        return error.UnsupportedZigVersion;
     }
 
     const config = Config.load(allocator, io, parsed.config_path) catch |err| {
