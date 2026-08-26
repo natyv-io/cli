@@ -27,9 +27,27 @@
 //! `src/assets/` originally), so the compiled wasm has to physically be
 //! copied into natyv-core's own source tree, however briefly, before the
 //! embed can work at all.
+//!
+//! On macOS, the final step wraps the built executable in a real `.app`
+//! bundle (`<name>.app/Contents/{MacOS,Resources,Info.plist}`) instead of
+//! dropping a flat binary straight into `dist_dir` -- a bare Unix
+//! executable has no icon/Dock-identity concept at all on macOS (Finder
+//! always shows the generic terminal-cog glyph for one), and every real
+//! Mac app uses this exact structure regardless. A dev-supplied PNG (see
+//! `Config.icon`) gets turned into a real `.icns` via `sips`+`iconutil`
+//! (both ship standard on every Mac, matching this project's own
+//! established "shell out to a real system tool rather than reimplement
+//! it" precedent) -- no icon means the bundle just gets macOS's own
+//! generic app icon rather than the previous bare-executable glyph.
+//! Windows/Linux equivalents (a `.ico` resource embed, a `.desktop` file
+//! + freedesktop icon theme) are real, separate mechanisms, not yet
+//! designed -- see `project_natyv_distribution_packaging` memory; the
+//! non-macOS branch below keeps the pre-existing flat-binary behavior
+//! unchanged for now.
 
 const std = @import("std");
 const Io = std.Io;
+const builtin = @import("builtin");
 
 pub const BundleError = struct {
     message: []const u8,
@@ -70,7 +88,22 @@ pub const Result = struct {
 /// `name:artifact,...` list -- a `-zig`-mode entry links via the fetched
 /// package's own build.zig (`b.dependency(name, ...).artifact(artifact)` +
 /// `linkLibrary`, see `build.zig`), which flags alone can't express.
-pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, wasm_path: []const u8, dist_dir: Io.Dir, output_name: []const u8, has_bindings: bool, binding_include_dirs: []const u8, binding_lib_dirs: []const u8, binding_link: []const u8, binding_zig_deps: []const u8, binding_vendor_c_files: []const u8, has_textures: bool) !Result {
+///
+/// `bundle_id` (`Config.effectiveBundleId`'s already-resolved result --
+/// either the dev's real one or the synthesized `dev.natyv.<name>`
+/// default) and `icon_path` (`Config.icon`, resolved relative to the
+/// config file's own directory, or `null`) only matter on macOS -- see
+/// this file's own doc comment.
+///
+/// `config_path` is the app's own real `conf.natyv.json`, copied to
+/// `embedded_config.json` the same way `wasm_path` is copied to
+/// `embedded_app.wasm` just below -- a real bundled binary can't rely on
+/// any particular cwd at launch (Finder/Launch Services never sets one
+/// to the bundle's own directory), so `src/main.zig` reads this embedded
+/// copy instead of a cwd-relative disk file whenever `-Dembed-app-wasm`
+/// is set. See `EmbeddedWasmPresent.zig`'s own doc comment for the real
+/// launch failure this fixes.
+pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, wasm_path: []const u8, config_path: []const u8, dist_dir: Io.Dir, output_name: []const u8, has_bindings: bool, binding_include_dirs: []const u8, binding_lib_dirs: []const u8, binding_link: []const u8, binding_zig_deps: []const u8, binding_vendor_c_files: []const u8, has_textures: bool, bundle_id: []const u8, icon_path: ?[]const u8) !Result {
     var core_dir = std.Io.Dir.cwd().openDir(io, natyv_core_src, .{}) catch |e| {
         return .{ .ok = false, .err = .{
             .message = try std.fmt.allocPrint(allocator, "natyv build: could not open NATYV_CORE_SRC ('{s}'): {s}", .{ natyv_core_src, @errorName(e) }),
@@ -90,6 +123,12 @@ pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, was
         } };
     };
 
+    const config_bytes = std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .unlimited) catch |e| {
+        return .{ .ok = false, .err = .{
+            .message = try std.fmt.allocPrint(allocator, "natyv build: could not read '{s}': {s}", .{ config_path, @errorName(e) }),
+        } };
+    };
+
     var assets_dir = core_dir.openDir(io, "src/assets", .{}) catch |e| {
         return .{ .ok = false, .err = .{
             .message = try std.fmt.allocPrint(allocator, "natyv build: could not open '{s}/src/assets': {s}", .{ natyv_core_src, @errorName(e) }),
@@ -97,6 +136,7 @@ pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, was
     };
     defer assets_dir.close(io);
     try assets_dir.writeFile(io, .{ .sub_path = "embedded_app.wasm", .data = wasm_bytes });
+    try assets_dir.writeFile(io, .{ .sub_path = "embedded_config.json", .data = config_bytes });
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dist_abs_len = try dist_dir.realPath(io, &path_buf);
@@ -145,25 +185,219 @@ pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, was
         },
     }
 
-    // Zig's own install step always produces `<prefix>/bin/natyv-core` --
-    // renamed to `output_name` directly in `dist_dir` so the real
-    // deliverable is one flat, sensibly-named file, not something a dev
-    // has to go find inside a `bin/` subdirectory.
+    // Zig's own install step always produces `<prefix>/bin/natyv-core`
+    // regardless of OS -- what happens to it from here differs.
     var bin_dir = dist_dir.openDir(io, "bin", .{}) catch |e| {
         return .{ .ok = false, .err = .{
             .message = try std.fmt.allocPrint(allocator, "natyv build: bundling reported success but '{s}/bin' wasn't created: {s}", .{ dist_abs, @errorName(e) }),
         } };
     };
-    bin_dir.rename("natyv-core", dist_dir, output_name, io) catch |e| {
-        bin_dir.close(io);
-        return .{ .ok = false, .err = .{
-            .message = try std.fmt.allocPrint(allocator, "natyv build: bundling reported success but the built binary couldn't be moved out of '{s}/bin': {s}", .{ dist_abs, @errorName(e) }),
-        } };
-    };
-    bin_dir.close(io);
+    defer bin_dir.close(io);
+
+    if (builtin.target.os.tag == .macos) {
+        const app_result = try buildMacosApp(allocator, io, dist_dir, dist_abs, bin_dir, output_name, bundle_id, icon_path);
+        if (app_result.err) |e| return .{ .ok = false, .err = e };
+    } else {
+        // Windows/Linux: keep the pre-existing flat-binary behavior --
+        // real icon embedding for those platforms is a distinct,
+        // not-yet-designed mechanism (see this file's own doc comment).
+        bin_dir.rename("natyv-core", dist_dir, output_name, io) catch |e| {
+            return .{ .ok = false, .err = .{
+                .message = try std.fmt.allocPrint(allocator, "natyv build: bundling reported success but the built binary couldn't be moved out of '{s}/bin': {s}", .{ dist_abs, @errorName(e) }),
+            } };
+        };
+    }
     dist_dir.deleteDir(io, "bin") catch {};
 
     return .{ .ok = true, .err = null };
+}
+
+/// Builds `<dist_dir>/<output_name>.app/Contents/{MacOS,Resources,Info.plist}`
+/// and moves the freshly built executable into `Contents/MacOS`. Kept
+/// separate from `run` so the macOS-only control flow (several fallible
+/// steps in sequence, each needing its own clear error) doesn't nest
+/// inside `run`'s own already-long body.
+fn buildMacosApp(allocator: std.mem.Allocator, io: Io, dist_dir: Io.Dir, dist_abs: []const u8, bin_dir: Io.Dir, output_name: []const u8, bundle_id: []const u8, icon_path: ?[]const u8) !Result {
+    const app_dir_name = try std.fmt.allocPrint(allocator, "{s}.app", .{output_name});
+    const contents_rel = try std.fs.path.join(allocator, &.{ app_dir_name, "Contents" });
+
+    var contents_dir = dist_dir.createDirPathOpen(io, contents_rel, .{}) catch |e| {
+        return .{ .ok = false, .err = .{
+            .message = try std.fmt.allocPrint(allocator, "natyv build: could not create '{s}/{s}': {s}", .{ dist_abs, contents_rel, @errorName(e) }),
+        } };
+    };
+    defer contents_dir.close(io);
+
+    var macos_dir = contents_dir.createDirPathOpen(io, "MacOS", .{}) catch |e| {
+        return .{ .ok = false, .err = .{
+            .message = try std.fmt.allocPrint(allocator, "natyv build: could not create '{s}/{s}/MacOS': {s}", .{ dist_abs, contents_rel, @errorName(e) }),
+        } };
+    };
+    defer macos_dir.close(io);
+
+    var resources_dir = contents_dir.createDirPathOpen(io, "Resources", .{}) catch |e| {
+        return .{ .ok = false, .err = .{
+            .message = try std.fmt.allocPrint(allocator, "natyv build: could not create '{s}/{s}/Resources': {s}", .{ dist_abs, contents_rel, @errorName(e) }),
+        } };
+    };
+    defer resources_dir.close(io);
+
+    bin_dir.rename("natyv-core", macos_dir, output_name, io) catch |e| {
+        return .{ .ok = false, .err = .{
+            .message = try std.fmt.allocPrint(allocator, "natyv build: bundling reported success but the built binary couldn't be moved into '{s}/{s}/MacOS': {s}", .{ dist_abs, contents_rel, @errorName(e) }),
+        } };
+    };
+
+    var has_icon = false;
+    if (icon_path) |icon| {
+        std.Io.Dir.cwd().access(io, icon, .{}) catch |e| {
+            return .{ .ok = false, .err = .{
+                .message = try std.fmt.allocPrint(allocator, "natyv build: configured icon '{s}' could not be read: {s}", .{ icon, @errorName(e) }),
+            } };
+        };
+
+        var res_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const resources_abs_len = try resources_dir.realPath(io, &res_path_buf);
+        const resources_abs = res_path_buf[0..resources_abs_len];
+
+        _ = resources_dir.createDirPathOpen(io, "AppIcon.iconset", .{}) catch |e| {
+            return .{ .ok = false, .err = .{
+                .message = try std.fmt.allocPrint(allocator, "natyv build: could not create '{s}/AppIcon.iconset': {s}", .{ resources_abs, @errorName(e) }),
+            } };
+        };
+
+        // The macOS-documented `.iconset` naming convention -- 10 exact
+        // filenames `iconutil` expects, covering every size Finder/Dock/
+        // Launchpad/the app switcher actually draw at.
+        const icon_sizes = [_]struct { px: u32, name: []const u8 }{
+            .{ .px = 16, .name = "icon_16x16.png" },
+            .{ .px = 32, .name = "icon_16x16@2x.png" },
+            .{ .px = 32, .name = "icon_32x32.png" },
+            .{ .px = 64, .name = "icon_32x32@2x.png" },
+            .{ .px = 128, .name = "icon_128x128.png" },
+            .{ .px = 256, .name = "icon_128x128@2x.png" },
+            .{ .px = 256, .name = "icon_256x256.png" },
+            .{ .px = 512, .name = "icon_256x256@2x.png" },
+            .{ .px = 512, .name = "icon_512x512.png" },
+            .{ .px = 1024, .name = "icon_512x512@2x.png" },
+        };
+        for (icon_sizes) |entry| {
+            const out_path = try std.fmt.allocPrint(allocator, "{s}/AppIcon.iconset/{s}", .{ resources_abs, entry.name });
+            const px_str = try std.fmt.allocPrint(allocator, "{d}", .{entry.px});
+            if (try runTool(allocator, io, &.{ "sips", "-z", px_str, px_str, icon, "--out", out_path }, "generating icon size")) |e| {
+                resources_dir.deleteTree(io, "AppIcon.iconset") catch {};
+                return .{ .ok = false, .err = e };
+            }
+        }
+
+        const icns_path = try std.fmt.allocPrint(allocator, "{s}/AppIcon.icns", .{resources_abs});
+        const iconset_path = try std.fmt.allocPrint(allocator, "{s}/AppIcon.iconset", .{resources_abs});
+        if (try runTool(allocator, io, &.{ "iconutil", "-c", "icns", iconset_path, "-o", icns_path }, "packing .icns")) |e| {
+            resources_dir.deleteTree(io, "AppIcon.iconset") catch {};
+            return .{ .ok = false, .err = e };
+        }
+        resources_dir.deleteTree(io, "AppIcon.iconset") catch {};
+        has_icon = true;
+    }
+
+    const plist = try buildInfoPlist(allocator, output_name, bundle_id, has_icon);
+    contents_dir.writeFile(io, .{ .sub_path = "Info.plist", .data = plist }) catch |e| {
+        return .{ .ok = false, .err = .{
+            .message = try std.fmt.allocPrint(allocator, "natyv build: could not write '{s}/{s}/Info.plist': {s}", .{ dist_abs, contents_rel, @errorName(e) }),
+        } };
+    };
+
+    return .{ .ok = true, .err = null };
+}
+
+/// Runs one real subprocess (`sips`/`iconutil`) and returns `null` on
+/// success or a natyv-attributed `BundleError` (real stderr surfaced
+/// verbatim) otherwise -- shared by every real-tool invocation in
+/// `buildMacosApp` above so the same three-way exit-code check isn't
+/// duplicated per call site.
+fn runTool(allocator: std.mem.Allocator, io: Io, argv: []const []const u8, what: []const u8) !?BundleError {
+    const result = std.process.run(allocator, io, .{ .argv = argv }) catch |e| {
+        return .{ .message = try std.fmt.allocPrint(allocator, "natyv build: could not run '{s}' ({s}): {s}", .{ argv[0], what, @errorName(e) }) };
+    };
+    defer allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| {
+            if (code != 0) {
+                defer allocator.free(result.stderr);
+                return .{ .message = try std.fmt.allocPrint(allocator, "natyv build: {s} failed (exit code {d}):\n{s}{s}", .{ what, code, result.stdout, result.stderr }) };
+            }
+            allocator.free(result.stderr);
+        },
+        else => |term| {
+            defer allocator.free(result.stderr);
+            return .{ .message = try std.fmt.allocPrint(allocator, "natyv build: {s} exited abnormally ({any}):\n{s}{s}", .{ what, term, result.stdout, result.stderr }) };
+        },
+    }
+    return null;
+}
+
+/// Escapes the five real XML metacharacters -- `name`/`bundle_id` are
+/// dev-supplied and end up as literal text inside a generated XML plist.
+fn xmlEscapeAlloc(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (s) |c| {
+        switch (c) {
+            '&' => try out.appendSlice(allocator, "&amp;"),
+            '<' => try out.appendSlice(allocator, "&lt;"),
+            '>' => try out.appendSlice(allocator, "&gt;"),
+            '"' => try out.appendSlice(allocator, "&quot;"),
+            '\'' => try out.appendSlice(allocator, "&apos;"),
+            else => try out.append(allocator, c),
+        }
+    }
+    // `toOwnedSlice`, not `.items` directly -- `ArrayList`'s backing
+    // buffer routinely over-allocates past `.items.len` for growth, and
+    // `allocator.free` on a slice shorter than the real original
+    // allocation is invalid (confirmed the hard way: a real
+    // DebugAllocator "Invalid free" panic in `buildInfoPlist`'s own
+    // `defer allocator.free(...)` calls before this fix). `toOwnedSlice`
+    // shrinks to exactly the used length first, so a plain `free` on the
+    // result is always valid.
+    return out.toOwnedSlice(allocator);
+}
+
+/// A minimal, hand-built `Info.plist` -- no plist library needed, the
+/// real key set a bundled app needs is small and fixed. `CFBundleIconFile`
+/// is only included when `has_icon` -- macOS falls back to its own
+/// generic app icon when the key is simply absent, no placeholder needed.
+fn buildInfoPlist(allocator: std.mem.Allocator, name: []const u8, bundle_id: []const u8, has_icon: bool) ![]const u8 {
+    const escaped_name = try xmlEscapeAlloc(allocator, name);
+    defer allocator.free(escaped_name);
+    const escaped_id = try xmlEscapeAlloc(allocator, bundle_id);
+    defer allocator.free(escaped_id);
+    const icon_block = if (has_icon) "    <key>CFBundleIconFile</key>\n    <string>AppIcon</string>\n" else "";
+    return std.fmt.allocPrint(allocator,
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>CFBundleExecutable</key>
+        \\    <string>{s}</string>
+        \\    <key>CFBundleIdentifier</key>
+        \\    <string>{s}</string>
+        \\    <key>CFBundleName</key>
+        \\    <string>{s}</string>
+        \\    <key>CFBundleDisplayName</key>
+        \\    <string>{s}</string>
+        \\    <key>CFBundlePackageType</key>
+        \\    <string>APPL</string>
+        \\    <key>CFBundleShortVersionString</key>
+        \\    <string>1.0</string>
+        \\    <key>CFBundleVersion</key>
+        \\    <string>1</string>
+        \\    <key>CFBundleInfoDictionaryVersion</key>
+        \\    <string>6.0</string>
+        \\    <key>NSHighResolutionCapable</key>
+        \\    <true/>
+        \\{s}</dict>
+        \\</plist>
+        \\
+    , .{ escaped_name, escaped_id, escaped_name, escaped_name, icon_block });
 }
 
 test "a NATYV_CORE_SRC that doesn't exist is a clear error" {
@@ -171,7 +405,7 @@ test "a NATYV_CORE_SRC that doesn't exist is a clear error" {
     defer tmp.cleanup();
     const io = std.testing.io;
 
-    const result = try run(std.testing.allocator, io, "/definitely/not/a/real/path", "app.wasm", tmp.dir, "myapp", false, "", "", "", "", "", false);
+    const result = try run(std.testing.allocator, io, "/definitely/not/a/real/path", "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, "dev.natyv.myapp", null);
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "NATYV_CORE_SRC") != null);
@@ -193,7 +427,7 @@ test "a NATYV_CORE_SRC with no build.zig is a clear error" {
     const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/not-natyv-core", .{ cwd_path, tmp.sub_path });
     defer std.testing.allocator.free(abs_path);
 
-    const result = try run(std.testing.allocator, io, abs_path, "app.wasm", tmp.dir, "myapp", false, "", "", "", "", "", false);
+    const result = try run(std.testing.allocator, io, abs_path, "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, "dev.natyv.myapp", null);
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "build.zig") != null);
@@ -211,8 +445,54 @@ test "a missing compiled wasm file is a clear error" {
     const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_path, tmp.sub_path });
     defer std.testing.allocator.free(abs_path);
 
-    const result = try run(std.testing.allocator, io, abs_path, "/definitely/not/a/real/wasm/path.wasm", tmp.dir, "myapp", false, "", "", "", "", "", false);
+    const result = try run(std.testing.allocator, io, abs_path, "/definitely/not/a/real/wasm/path.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, "dev.natyv.myapp", null);
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "compiled wasm") != null);
+}
+
+test "a missing config file is a clear error" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "build.zig", .data = "" });
+    try tmp.dir.createDirPath(io, "src/assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.wasm", .data = "" });
+
+    const cwd_path = try std.process.currentPathAlloc(io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd_path);
+    const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_path, tmp.sub_path });
+    defer std.testing.allocator.free(abs_path);
+    const wasm_abs = try std.fmt.allocPrint(std.testing.allocator, "{s}/app.wasm", .{abs_path});
+    defer std.testing.allocator.free(wasm_abs);
+
+    const result = try run(std.testing.allocator, io, abs_path, wasm_abs, "/definitely/not/a/real/conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, "dev.natyv.myapp", null);
+    defer if (result.err) |e| std.testing.allocator.free(e.message);
+    try std.testing.expect(!result.ok);
+    try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "conf.natyv.json") != null);
+}
+
+test "buildInfoPlist: no icon omits CFBundleIconFile" {
+    const allocator = std.testing.allocator;
+    const plist = try buildInfoPlist(allocator, "MyApp", "dev.natyv.myapp", false);
+    defer allocator.free(plist);
+    try std.testing.expect(std.mem.indexOf(u8, plist, "<string>MyApp</string>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plist, "<string>dev.natyv.myapp</string>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plist, "CFBundleIconFile") == null);
+}
+
+test "buildInfoPlist: an icon includes CFBundleIconFile pointing at AppIcon" {
+    const allocator = std.testing.allocator;
+    const plist = try buildInfoPlist(allocator, "MyApp", "dev.natyv.myapp", true);
+    defer allocator.free(plist);
+    try std.testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleIconFile</key>\n    <string>AppIcon</string>") != null);
+}
+
+test "buildInfoPlist: name/bundle_id containing XML metacharacters are escaped" {
+    const allocator = std.testing.allocator;
+    const plist = try buildInfoPlist(allocator, "Foo & Bar's <App>", "dev.natyv.foo", false);
+    defer allocator.free(plist);
+    try std.testing.expect(std.mem.indexOf(u8, plist, "Foo &amp; Bar&apos;s &lt;App&gt;") != null);
+    // The raw, unescaped text should never appear anywhere in the output.
+    try std.testing.expect(std.mem.indexOf(u8, plist, "Foo & Bar's <App>") == null);
 }

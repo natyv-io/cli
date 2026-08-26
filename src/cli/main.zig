@@ -27,6 +27,7 @@
 //! freshness, while `.ntx` transpile + `wasm_compile` stay skippable.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Config = @import("Config");
 const Prepare = @import("Prepare");
 const Compile = @import("Compile.zig");
@@ -467,13 +468,22 @@ pub fn main(init: std.process.Init) !void {
 
             const wasm_full_path = try std.fs.path.join(arena_alloc, &.{ guest_dir_path, wasm_basename });
 
+            // Only meaningful on macOS (see `Bundle.zig`'s own doc
+            // comment) -- resolved unconditionally regardless of host OS
+            // since it's cheap and keeps `Bundle.run`'s own signature
+            // simple; the icon path is `Config.icon`, relative to the
+            // config file's own directory, same convention as `assets/`.
+            const bundle_id = try config.value.effectiveBundleId(arena_alloc);
+            const icon_path: ?[]const u8 = if (config.value.icon) |icon| try std.fs.path.join(arena_alloc, &.{ config_dir, icon }) else null;
+
             std.debug.print("natyv build: {s} -- bundling...\n", .{config.value.name});
-            const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures);
+            const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, bundle_id, icon_path);
             if (bundle_result.err) |e| {
                 std.debug.print("{s}\n", .{e.message});
                 return error.BundleFailed;
             }
-            std.debug.print("natyv build: {s} -- built {s}/{s}\n", .{ config.value.name, dist_dir_path, config.value.name });
+            const output_suffix = if (builtin.target.os.tag == .macos) ".app" else "";
+            std.debug.print("natyv build: {s} -- built {s}/{s}{s}\n", .{ config.value.name, dist_dir_path, config.value.name, output_suffix });
         },
         .init, .get => unreachable, // both handled above
     }
