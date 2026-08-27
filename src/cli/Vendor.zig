@@ -49,7 +49,7 @@ pub const LocateResult = struct {
     source_dir: ?[]const u8,
     /// The real scratch subdirectory name under `parent_dir` the caller
     /// must `deleteTree` once done -- returned rather than left for the
-    /// caller to reconstruct independently, since it's PID-suffixed (two
+    /// caller to reconstruct independently, since it's random-suffixed (two
     /// separate `zig build test` processes racing on the exact same fixed
     /// name is a real, reproduced bug this stage hit: Zig's default test
     /// binary includes every `test` block transitively reachable via
@@ -82,16 +82,22 @@ fn runOrError(allocator: std.mem.Allocator, io: Io, argv: []const []const u8, cw
 }
 
 /// Creates a real, throwaway scratch Zig project under `parent_dir` named
-/// `_natyv_vendor_locate_<name>_<pid>` (PID-suffixed -- see
-/// `LocateResult.scratch_dir_name`'s own doc comment on why, and
-/// `Bind.zig`'s own `bindOne` doc comment for the fuller reliability
-/// reasoning plus a possible future UUID/random-suffix alternative Quinn
-/// flagged as worth reconsidering later), fetches `url` as dependency
-/// `name` into it, and reports the real extraction path. Does not clean
-/// up after itself -- the caller is responsible for deleting the returned
-/// `scratch_dir_name` subtree once it's done reading from `source_dir`.
+/// `_natyv_vendor_locate_<name>_<random>` (random-suffixed for real,
+/// confirmed-necessary uniqueness -- see `LocateResult.scratch_dir_name`'s
+/// own doc comment on why. Was `getpid()`-suffixed until this stopped
+/// compiling cleanly for a Windows target -- `std.c.getpid()`'s return
+/// type doesn't format through `{x}` there the way it does on POSIX,
+/// confirmed via a real cross-compile attempt; `Io.random` gives the
+/// identical uniqueness guarantee with no libc dependency and no
+/// platform-specific type), fetches `url` as dependency `name` into it,
+/// and reports the real extraction path. Does not clean up after itself --
+/// the caller is responsible for deleting the returned `scratch_dir_name`
+/// subtree once it's done reading from `source_dir`.
 pub fn locateSource(allocator: std.mem.Allocator, io: Io, parent_dir: Io.Dir, parent_dir_abs: []const u8, name: []const u8, url: []const u8) !LocateResult {
-    const scratch_name = try std.fmt.allocPrint(allocator, "_natyv_vendor_locate_{s}_{x}", .{ name, std.c.getpid() });
+    var suffix_bytes: [8]u8 = undefined;
+    io.random(&suffix_bytes);
+    const suffix = std.mem.readInt(u64, &suffix_bytes, .little);
+    const scratch_name = try std.fmt.allocPrint(allocator, "_natyv_vendor_locate_{s}_{x}", .{ name, suffix });
     parent_dir.deleteTree(io, scratch_name) catch {};
     var scratch_dir = parent_dir.createDirPathOpen(io, scratch_name, .{}) catch |e| {
         return .{ .source_dir = null, .scratch_dir_name = scratch_name, .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv get: could not create scratch vendor-locate dir for '{s}': {s}", .{ name, @errorName(e) }) } };

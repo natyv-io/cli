@@ -222,8 +222,8 @@ const VendorModeOutcome = union(enum) {
 /// entry's own real `-I` to both `compile_argv` (the reflector's own
 /// real compile invocation) and `reflector_include_dirs` (Stage 2.8's
 /// translate-c pre-pass, which needs the identical set) on success;
-/// returns a real error on failure. `url`/`pid` are passed in rather than
-/// re-read from `entry`/re-derived, since the caller already has both.
+/// returns a real error on failure. `url` is passed in rather than
+/// re-read from `entry`, since the caller already has it.
 fn handleZigUrlMode(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, core_dir: Io.Dir, bindgen_dir: Io.Dir, bindgen_abs: []const u8, url: []const u8, compile_argv: *std.ArrayList([]const u8), reflector_include_dirs: *std.ArrayList([]const u8)) !?BindError {
     const core_fetch = try ZigFetch.fetchSave(allocator, io, core_dir, entry.library, url);
     if (core_fetch.err) |e| return .{ .message = e.message };
@@ -370,26 +370,28 @@ fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, cor
         return .{ .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv bind: '{s}' has both zig_url and vendor_url set -- these are mutually exclusive modes (natyv get's own CLI already prevents this combination; check for a hand-edited or otherwise malformed conf.natyv.json)", .{entry.library}) } };
     }
 
-    // PID-suffixed, not just keyed by `entry.library` -- Stage 2.7 made
+    // Random-suffixed, not just keyed by `entry.library` -- Stage 2.7 made
     // `bind_module` reachable from more than one independently-running
     // test binary for the first time (`bind_tests` directly, and
     // `ntx_prepare_tests` via `Prepare`'s new named "Bind" import), and
     // both binaries' own real fixture-library tests (`library = "fixture"`)
     // raced on this exact fixed path, reproduced as a real, non-flaky
     // failure -- the identical root cause already found and fixed for
-    // `ZigFetch.zig`/`Vendor.zig`'s own scratch dirs. Correct as-is (two
-    // processes alive at the same moment can never share a PID, and stale
-    // files from a since-recycled PID just get clobbered by the
-    // delete-then-create below), but Quinn flagged the raw OS-process
-    // concept sitting in application logic as worth reconsidering later --
-    // a UUID/random-suffix scheme would express the same "just make this
-    // unique" intent without reaching for `getpid()` specifically. Not
-    // changed now; noted for a future revisit if this file gets touched
-    // again.
-    const pid = std.c.getpid();
-    const scratch_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_{x}.zig", .{ entry.library, pid });
-    const exe_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_{x}_exe", .{ entry.library, pid });
-    const meta_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_{x}.meta", .{ entry.library, pid });
+    // `ZigFetch.zig`/`Vendor.zig`'s own scratch dirs. Was `getpid()`-suffixed
+    // until a real Windows cross-compile attempt showed `std.c.getpid()`'s
+    // return type doesn't format through `{x}` on that target the way it
+    // does on POSIX -- switched to `Io.random`, which gives the identical
+    // uniqueness guarantee (two concurrent processes essentially never draw
+    // the same 64-bit value) with no libc dependency and no
+    // platform-specific type, also finally addressing the "raw OS-process
+    // concept sitting in application logic" Quinn had flagged as worth
+    // reconsidering.
+    var suffix_bytes: [8]u8 = undefined;
+    io.random(&suffix_bytes);
+    const suffix = std.mem.readInt(u64, &suffix_bytes, .little);
+    const scratch_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_{x}.zig", .{ entry.library, suffix });
+    const exe_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_{x}_exe", .{ entry.library, suffix });
+    const meta_name = try std.fmt.allocPrint(allocator, "_natyv_bind_scratch_{s}_{x}.meta", .{ entry.library, suffix });
     defer bindgen_dir.deleteFile(io, scratch_name) catch {};
     defer bindgen_dir.deleteFile(io, exe_name) catch {};
     defer bindgen_dir.deleteFile(io, meta_name) catch {};
@@ -446,7 +448,7 @@ fn bindOne(allocator: std.mem.Allocator, io: Io, entry: Config.BindingEntry, cor
     // for the real, empirically-confirmed dividing lines. Confirmed cheap
     // to run unconditionally (~0.2s warm on this machine), not just on a
     // prior failure.
-    const tc_scratch_name = try std.fmt.allocPrint(allocator, "_natyv_bind_tc_check_{s}_{x}.c", .{ entry.library, pid });
+    const tc_scratch_name = try std.fmt.allocPrint(allocator, "_natyv_bind_tc_check_{s}_{x}.c", .{ entry.library, suffix });
     const tc_check = try TranslateC.check(allocator, io, bindgen_dir, entry.header, reflector_include_dirs.items, entry.functions, tc_scratch_name);
     if (!tc_check.ok) return .{ .err = .{ .message = tc_check.err.?.message } };
 

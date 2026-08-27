@@ -115,11 +115,17 @@ pub fn run(allocator: std.mem.Allocator, io: Io, config_path: []const u8, args: 
             // partially-extracted files yanked out from under it by the
             // other's cleanup) -- confirmed empirically, not just a
             // theoretical concern, so real uniqueness is required, not
-            // just table stakes. Correct as-is; see `Bind.zig`'s own
-            // fuller `getpid()` doc comment (`bindOne`) for why, and for a
-            // possible future UUID/random-suffix alternative Quinn flagged
-            // as worth reconsidering later.
-            const scratch_parent_name = try std.fmt.allocPrint(allocator, ".natyv-vendor-discover-{x}", .{std.c.getpid()});
+            // just table stakes. A random `Io.random` suffix, not
+            // `getpid()` -- the previously-used `std.c.getpid()` doesn't
+            // compile cleanly for a Windows target at all (its return type
+            // doesn't format through `{x}` the way it does on POSIX),
+            // confirmed via a real cross-compile attempt; a random suffix
+            // gives the identical uniqueness guarantee with no libc
+            // dependency and no platform-specific type at all.
+            var suffix_bytes: [8]u8 = undefined;
+            io.random(&suffix_bytes);
+            const suffix = std.mem.readInt(u64, &suffix_bytes, .little);
+            const scratch_parent_name = try std.fmt.allocPrint(allocator, ".natyv-vendor-discover-{x}", .{suffix});
             var scratch_parent = std.Io.Dir.cwd().createDirPathOpen(io, scratch_parent_name, .{}) catch |e| {
                 return .{ .updated_existing = false, .err = .{ .message = try std.fmt.allocPrint(allocator, "natyv get: could not create scratch vendor-discovery dir: {s}", .{@errorName(e)}) } };
             };
