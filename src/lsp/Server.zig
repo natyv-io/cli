@@ -1,14 +1,21 @@
 //! The `.ntx` LSP server's dispatch loop. Stage 1 (see
 //! `~/.claude/plans/lexical-wishing-penguin.md`) covers the real lifecycle
 //! (`initialize`/`initialized`/`shutdown`/`exit`); Stage 2 adds real
-//! diagnostics on `textDocument/didOpen`/`didChange`/`didClose`. Anything
-//! else still gets a real `MethodNotFound` error response (for requests)
-//! or is silently ignored (for notifications, matching the LSP spec's own
-//! "unknown notifications must be ignored" requirement), rather than a
-//! stub response, so later stages' manual testing sees an honest "not
-//! implemented yet" instead of something that looks like it worked.
+//! diagnostics on `textDocument/didOpen`/`didChange`/`didClose`; Stage 3
+//! adds real semantic tokens (`textDocument/semanticTokens/full`), which
+//! is what first required `Server` to hold real per-connection state --
+//! unlike diagnostics (recomputed from the full text a
+//! `didOpen`/`didChange` notification already carries inline), a semantic
+//! tokens *request* carries only a URI, per the real LSP spec, so the
+//! server must already know that document's current text from an earlier
+//! notification. Anything unimplemented still gets a real
+//! `MethodNotFound` error response (for requests) or is silently ignored
+//! (for notifications, matching the LSP spec's own "unknown notifications
+//! must be ignored" requirement), rather than a stub response, so later
+//! stages' manual testing sees an honest "not implemented yet" instead of
+//! something that looks like it worked.
 //!
-//! `handleMessage` is a pure function (real JSON bytes in, real JSON bytes
+//! `handleMessage` is a real method (real JSON bytes in, real JSON bytes
 //! out) deliberately kept separate from `run`'s real stdio loop -- lets
 //! the dispatch logic itself be tested directly against fixture message
 //! bytes with no real process/pipe involved, matching this project's own
@@ -18,6 +25,8 @@
 const std = @import("std");
 const Protocol = @import("Protocol.zig");
 const Diagnostics = @import("Diagnostics.zig");
+const SemanticTokens = @import("SemanticTokens.zig");
+const Transport = @import("Transport.zig");
 
 pub const HandleResult = struct {
     /// Populated only when a response must be sent back to the client --
@@ -39,61 +48,176 @@ pub const HandleResult = struct {
     should_exit: bool = false,
 };
 
-/// Parses one already-length-delimited JSON-RPC message body (see
-/// `Transport.readMessage`) and dispatches it. Never returns a Zig error
-/// for a malformed *message* (bad JSON, missing `method`, unknown method)
-/// -- those become real JSON-RPC error responses instead, exactly what a
-/// real client expects back; a Zig error here means allocation failure,
-/// nothing else.
-pub fn handleMessage(gpa: std.mem.Allocator, body: []const u8) !HandleResult {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+/// Real per-connection server state -- as of Stage 3, just the currently
+/// open documents' own text, keyed by URI (needed so a
+/// `textDocument/semanticTokens/full` *request*, which per the real LSP
+/// spec carries only a URI, can still be answered against the document's
+/// actual current content).
+pub const Server = struct {
+    documents: std.StringHashMapUnmanaged([]const u8) = .empty,
 
-    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch {
-        return .{ .response = try encodeError(gpa, .null, .parse_error, "request was not valid JSON") };
-    };
-    const obj = switch (value) {
-        .object => |o| o,
-        else => return .{ .response = try encodeError(gpa, .null, .invalid_request, "JSON-RPC message must be an object") },
-    };
-
-    const id: std.json.Value = obj.get("id") orelse .null;
-    const is_request = obj.get("id") != null;
-
-    const method_value = obj.get("method") orelse {
-        return .{ .response = try encodeError(gpa, id, .invalid_request, "message has no 'method'") };
-    };
-    const method = switch (method_value) {
-        .string => |s| s,
-        else => return .{ .response = try encodeError(gpa, id, .invalid_request, "'method' must be a string") },
-    };
-
-    if (std.mem.eql(u8, method, "initialize")) {
-        return .{ .response = try encodeResult(gpa, Protocol.InitializeResult, id, .{}) };
-    }
-    if (std.mem.eql(u8, method, "initialized")) {
-        return .{}; // notification: server has nothing to do in response
-    }
-    if (std.mem.eql(u8, method, "shutdown")) {
-        return .{ .response = try encodeNullResult(gpa, id) };
-    }
-    if (std.mem.eql(u8, method, "exit")) {
-        return .{ .should_exit = true };
-    }
-    if (std.mem.eql(u8, method, "textDocument/didOpen")) {
-        return .{ .notification = try handleDidOpen(gpa, obj.get("params") orelse .null) };
-    }
-    if (std.mem.eql(u8, method, "textDocument/didChange")) {
-        return .{ .notification = try handleDidChange(gpa, obj.get("params") orelse .null) };
-    }
-    if (std.mem.eql(u8, method, "textDocument/didClose")) {
-        return .{ .notification = try handleDidClose(gpa, obj.get("params") orelse .null) };
+    pub fn deinit(self: *Server, gpa: std.mem.Allocator) void {
+        var it = self.documents.iterator();
+        while (it.next()) |entry| {
+            gpa.free(entry.key_ptr.*);
+            gpa.free(entry.value_ptr.*);
+        }
+        self.documents.deinit(gpa);
     }
 
-    if (!is_request) return .{}; // unknown notification: ignore per spec
-    return .{ .response = try encodeError(gpa, id, .method_not_found, "method not found") };
-}
+    /// Parses one already-length-delimited JSON-RPC message body (see
+    /// `Transport.readMessage`) and dispatches it. Never returns a Zig
+    /// error for a malformed *message* (bad JSON, missing `method`,
+    /// unknown method) -- those become real JSON-RPC error responses
+    /// instead, exactly what a real client expects back; a Zig error here
+    /// means allocation failure, nothing else.
+    pub fn handleMessage(self: *Server, gpa: std.mem.Allocator, body: []const u8) !HandleResult {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const value = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch {
+            return .{ .response = try encodeError(gpa, .null, .parse_error, "request was not valid JSON") };
+        };
+        const obj = switch (value) {
+            .object => |o| o,
+            else => return .{ .response = try encodeError(gpa, .null, .invalid_request, "JSON-RPC message must be an object") },
+        };
+
+        const id: std.json.Value = obj.get("id") orelse .null;
+        const is_request = obj.get("id") != null;
+
+        const method_value = obj.get("method") orelse {
+            return .{ .response = try encodeError(gpa, id, .invalid_request, "message has no 'method'") };
+        };
+        const method = switch (method_value) {
+            .string => |s| s,
+            else => return .{ .response = try encodeError(gpa, id, .invalid_request, "'method' must be a string") },
+        };
+
+        if (std.mem.eql(u8, method, "initialize")) {
+            return .{ .response = try encodeResult(gpa, Protocol.InitializeResult, id, .{}) };
+        }
+        if (std.mem.eql(u8, method, "initialized")) {
+            return .{}; // notification: server has nothing to do in response
+        }
+        if (std.mem.eql(u8, method, "shutdown")) {
+            return .{ .response = try encodeNullResult(gpa, id) };
+        }
+        if (std.mem.eql(u8, method, "exit")) {
+            return .{ .should_exit = true };
+        }
+        if (std.mem.eql(u8, method, "textDocument/didOpen")) {
+            return .{ .notification = try self.handleDidOpen(gpa, obj.get("params") orelse .null) };
+        }
+        if (std.mem.eql(u8, method, "textDocument/didChange")) {
+            return .{ .notification = try self.handleDidChange(gpa, obj.get("params") orelse .null) };
+        }
+        if (std.mem.eql(u8, method, "textDocument/didClose")) {
+            return .{ .notification = try self.handleDidClose(gpa, obj.get("params") orelse .null) };
+        }
+        if (std.mem.eql(u8, method, "textDocument/semanticTokens/full")) {
+            return .{ .response = try self.handleSemanticTokensFull(gpa, id, obj.get("params") orelse .null) };
+        }
+
+        if (!is_request) return .{}; // unknown notification: ignore per spec
+        return .{ .response = try encodeError(gpa, id, .method_not_found, "method not found") };
+    }
+
+    fn handleDidOpen(self: *Server, gpa: std.mem.Allocator, params: std.json.Value) !?[]u8 {
+        const uri = textDocumentField(params, "uri") orelse return null;
+        const text = textDocumentField(params, "text") orelse return null;
+        try self.storeDocument(gpa, uri, text);
+        return try publishDiagnosticsFor(gpa, uri, text);
+    }
+
+    /// Full-sync mode only (`ServerCapabilities.textDocumentSync = 1`) --
+    /// `contentChanges`'s *last* entry always carries the document's
+    /// entire current text, not an incremental edit.
+    fn handleDidChange(self: *Server, gpa: std.mem.Allocator, params: std.json.Value) !?[]u8 {
+        const uri = textDocumentField(params, "uri") orelse return null;
+        const changes = switch (params.object.get("contentChanges") orelse return null) {
+            .array => |a| a,
+            else => return null,
+        };
+        if (changes.items.len == 0) return null;
+        const text = switch (changes.items[changes.items.len - 1]) {
+            .object => |o| switch (o.get("text") orelse return null) {
+                .string => |s| s,
+                else => return null,
+            },
+            else => return null,
+        };
+        try self.storeDocument(gpa, uri, text);
+        return try publishDiagnosticsFor(gpa, uri, text);
+    }
+
+    /// Publishes an empty diagnostics list for the closed document -- a
+    /// document that's no longer open can't still have live errors shown
+    /// against it in the editor.
+    fn handleDidClose(self: *Server, gpa: std.mem.Allocator, params: std.json.Value) !?[]u8 {
+        const uri = textDocumentField(params, "uri") orelse return null;
+        self.removeDocument(gpa, uri);
+        return try encodePublishDiagnostics(gpa, uri, &.{});
+    }
+
+    fn handleSemanticTokensFull(self: *Server, gpa: std.mem.Allocator, id: std.json.Value, params: std.json.Value) ![]u8 {
+        const uri = textDocumentField(params, "uri") orelse "";
+        const text = self.documents.get(uri) orelse "";
+        const data = try SemanticTokens.compute(gpa, text);
+        defer gpa.free(data);
+        const Result = struct { data: []const u32 };
+        return try encodeResult(gpa, Result, id, .{ .data = data });
+    }
+
+    /// Stores (or replaces) `uri`'s current text -- both `uri` and `text`
+    /// are duped into `gpa`-owned memory, since the JSON-RPC message
+    /// they're parsed from is freed by the caller right after
+    /// `handleMessage` returns.
+    fn storeDocument(self: *Server, gpa: std.mem.Allocator, uri: []const u8, text: []const u8) !void {
+        const owned_text = try gpa.dupe(u8, text);
+        errdefer gpa.free(owned_text);
+        if (self.documents.getPtr(uri)) |existing| {
+            gpa.free(existing.*);
+            existing.* = owned_text;
+            return;
+        }
+        const owned_uri = try gpa.dupe(u8, uri);
+        errdefer gpa.free(owned_uri);
+        try self.documents.put(gpa, owned_uri, owned_text);
+    }
+
+    fn removeDocument(self: *Server, gpa: std.mem.Allocator, uri: []const u8) void {
+        if (self.documents.fetchRemove(uri)) |kv| {
+            gpa.free(kv.key);
+            gpa.free(kv.value);
+        }
+    }
+
+    /// The real stdio loop: read one framed message, dispatch it, write
+    /// back whatever response (if any) resulted, repeat until `exit`.
+    /// Every `Transport`/`handleMessage` error is real and fatal here --
+    /// there's no meaningful way to recover mid-stream from a broken
+    /// framing layer or an OOM, so `run` just surfaces the error to
+    /// `main`, matching every other CLI entry point in this repo.
+    pub fn run(self: *Server, gpa: std.mem.Allocator, reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
+        while (true) {
+            const body = try Transport.readMessage(reader, gpa);
+            defer gpa.free(body);
+
+            const result = try self.handleMessage(gpa, body);
+            if (result.response) |response| {
+                defer gpa.free(response);
+                try Transport.writeMessage(writer, response);
+            }
+            if (result.notification) |notification| {
+                defer gpa.free(notification);
+                try Transport.writeMessage(writer, notification);
+            }
+            if (result.should_exit) return;
+        }
+    }
+};
 
 /// Reads `params.textDocument.<field>` as a string, or `null` if `params`
 /// doesn't have that exact shape -- a real client always sends a
@@ -108,40 +232,6 @@ fn textDocumentField(params: std.json.Value, field: []const u8) ?[]const u8 {
         .string => |s| s,
         else => null,
     };
-}
-
-fn handleDidOpen(gpa: std.mem.Allocator, params: std.json.Value) !?[]u8 {
-    const uri = textDocumentField(params, "uri") orelse return null;
-    const text = textDocumentField(params, "text") orelse return null;
-    return try publishDiagnosticsFor(gpa, uri, text);
-}
-
-/// Full-sync mode only (`ServerCapabilities.textDocumentSync = 1`) --
-/// `contentChanges`'s *last* entry always carries the document's entire
-/// current text, not an incremental edit.
-fn handleDidChange(gpa: std.mem.Allocator, params: std.json.Value) !?[]u8 {
-    const uri = textDocumentField(params, "uri") orelse return null;
-    const changes = switch (params.object.get("contentChanges") orelse return null) {
-        .array => |a| a,
-        else => return null,
-    };
-    if (changes.items.len == 0) return null;
-    const text = switch (changes.items[changes.items.len - 1]) {
-        .object => |o| switch (o.get("text") orelse return null) {
-            .string => |s| s,
-            else => return null,
-        },
-        else => return null,
-    };
-    return try publishDiagnosticsFor(gpa, uri, text);
-}
-
-/// Publishes an empty diagnostics list for the closed document -- a
-/// document that's no longer open can't still have live errors shown
-/// against it in the editor.
-fn handleDidClose(gpa: std.mem.Allocator, params: std.json.Value) !?[]u8 {
-    const uri = textDocumentField(params, "uri") orelse return null;
-    return try encodePublishDiagnostics(gpa, uri, &.{});
 }
 
 fn publishDiagnosticsFor(gpa: std.mem.Allocator, uri: []const u8, text: []const u8) !?[]u8 {
@@ -196,89 +286,83 @@ fn encodeError(gpa: std.mem.Allocator, id: std.json.Value, code: Protocol.ErrorC
     }, .{}) catch return error.OutOfMemory;
 }
 
-const Transport = @import("Transport.zig");
-
-/// The real stdio loop: read one framed message, dispatch it, write back
-/// whatever response (if any) resulted, repeat until `exit`. Every
-/// `Transport`/`handleMessage` error is real and fatal here -- there's no
-/// meaningful way to recover mid-stream from a broken framing layer or an
-/// OOM, so `run` just surfaces the error to `main`, matching every other
-/// CLI entry point in this repo.
-pub fn run(gpa: std.mem.Allocator, reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
-    while (true) {
-        const body = try Transport.readMessage(reader, gpa);
-        defer gpa.free(body);
-
-        const result = try handleMessage(gpa, body);
-        if (result.response) |response| {
-            defer gpa.free(response);
-            try Transport.writeMessage(writer, response);
-        }
-        if (result.notification) |notification| {
-            defer gpa.free(notification);
-            try Transport.writeMessage(writer, notification);
-        }
-        if (result.should_exit) return;
-    }
-}
-
 test "handleMessage: initialize returns a real result advertising full document sync" {
-    const result = try handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
+    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
     defer std.testing.allocator.free(result.response.?);
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1}}}", result.response.?);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true}}}}", result.response.?);
     try std.testing.expect(!result.should_exit);
 }
 
 test "handleMessage: initialize echoes back a real string id, not just a number one" {
-    const result = try handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"method\":\"initialize\",\"params\":{}}");
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
+    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"method\":\"initialize\",\"params\":{}}");
     defer std.testing.allocator.free(result.response.?);
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"result\":{\"capabilities\":{\"textDocumentSync\":1}}}", result.response.?);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true}}}}", result.response.?);
 }
 
 test "handleMessage: initialized notification produces no response and doesn't exit" {
-    const result = try handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
+    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
     try std.testing.expect(result.response == null);
     try std.testing.expect(!result.should_exit);
 }
 
 test "handleMessage: shutdown responds with a real null result" {
-    const result = try handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\"}");
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
+    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\"}");
     defer std.testing.allocator.free(result.response.?);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}", result.response.?);
 }
 
 test "handleMessage: exit notification produces no response but does signal should_exit" {
-    const result = try handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}");
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
+    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}");
     try std.testing.expect(result.response == null);
     try std.testing.expect(result.should_exit);
 }
 
 test "handleMessage: an unknown request method gets a real MethodNotFound error, not silence" {
-    const result = try handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{}}");
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
+    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{}}");
     defer std.testing.allocator.free(result.response.?);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32601,\"message\":\"method not found\"}}", result.response.?);
 }
 
 test "handleMessage: an unknown notification (no id) is silently ignored, not errored" {
-    const result = try handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"$/someUnknownNotification\"}");
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
+    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"$/someUnknownNotification\"}");
     try std.testing.expect(result.response == null);
     try std.testing.expect(!result.should_exit);
 }
 
 test "handleMessage: malformed JSON gets a real ParseError response with a null id" {
-    const result = try handleMessage(std.testing.allocator, "not json at all");
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
+    const result = try server.handleMessage(std.testing.allocator, "not json at all");
     defer std.testing.allocator.free(result.response.?);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"request was not valid JSON\"}}", result.response.?);
 }
 
 test "handleMessage: a JSON value that isn't an object is a real InvalidRequest error" {
-    const result = try handleMessage(std.testing.allocator, "[1,2,3]");
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
+    const result = try server.handleMessage(std.testing.allocator, "[1,2,3]");
     defer std.testing.allocator.free(result.response.?);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"JSON-RPC message must be an object\"}}", result.response.?);
 }
 
 test "run: a real initialize/initialized/shutdown/exit sequence produces exactly the two expected responses" {
     const gpa = std.testing.allocator;
+    var server: Server = .{};
+    defer server.deinit(gpa);
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
 
@@ -290,13 +374,13 @@ test "run: a real initialize/initialized/shutdown/exit sequence produces exactly
     try Transport.writeMessage(&input.writer, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}");
 
     var reader = std.Io.Reader.fixed(input.writer.buffered());
-    try run(gpa, &reader, &aw.writer);
+    try server.run(gpa, &reader, &aw.writer);
 
     const output = aw.writer.buffered();
     var out_reader = std.Io.Reader.fixed(output);
     const first = try Transport.readMessage(&out_reader, gpa);
     defer gpa.free(first);
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1}}}", first);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true}}}}", first);
     const second = try Transport.readMessage(&out_reader, gpa);
     defer gpa.free(second);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}", second);
@@ -360,12 +444,24 @@ fn encodeDidClose(gpa: std.mem.Allocator, uri: []const u8) ![]u8 {
     return std.json.Stringify.valueAlloc(gpa, Msg{ .params = .{ .textDocument = .{ .uri = uri } } }, .{});
 }
 
+fn encodeSemanticTokensFull(gpa: std.mem.Allocator, id: i64, uri: []const u8) ![]u8 {
+    const Msg = struct {
+        jsonrpc: []const u8 = "2.0",
+        id: i64,
+        method: []const u8 = "textDocument/semanticTokens/full",
+        params: struct { textDocument: struct { uri: []const u8 } },
+    };
+    return std.json.Stringify.valueAlloc(gpa, Msg{ .id = id, .params = .{ .textDocument = .{ .uri = uri } } }, .{});
+}
+
 test "handleMessage: didOpen with a clean .ntx document publishes empty diagnostics" {
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
     const gpa = std.testing.allocator;
     const body = try encodeDidOpen(gpa, "file:///test.go.ntx", clean_ntx_source);
     defer gpa.free(body);
 
-    const result = try handleMessage(gpa, body);
+    const result = try server.handleMessage(gpa, body);
     try std.testing.expect(result.response == null);
     defer gpa.free(result.notification.?);
     try std.testing.expectEqualStrings(
@@ -375,11 +471,13 @@ test "handleMessage: didOpen with a clean .ntx document publishes empty diagnost
 }
 
 test "handleMessage: didOpen with a broken .ntx document publishes a real diagnostic with a real position" {
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
     const gpa = std.testing.allocator;
     const body = try encodeDidOpen(gpa, "file:///test.go.ntx", broken_ntx_source);
     defer gpa.free(body);
 
-    const result = try handleMessage(gpa, body);
+    const result = try server.handleMessage(gpa, body);
     defer gpa.free(result.notification.?);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, result.notification.?, .{});
@@ -395,16 +493,18 @@ test "handleMessage: didOpen with a broken .ntx document publishes a real diagno
 }
 
 test "handleMessage: didChange that fixes a broken document clears its diagnostics" {
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
     const gpa = std.testing.allocator;
 
     const open_body = try encodeDidOpen(gpa, "file:///test.go.ntx", broken_ntx_source);
     defer gpa.free(open_body);
-    const open_result = try handleMessage(gpa, open_body);
+    const open_result = try server.handleMessage(gpa, open_body);
     gpa.free(open_result.notification.?);
 
     const change_body = try encodeDidChange(gpa, "file:///test.go.ntx", clean_ntx_source);
     defer gpa.free(change_body);
-    const change_result = try handleMessage(gpa, change_body);
+    const change_result = try server.handleMessage(gpa, change_body);
     defer gpa.free(change_result.notification.?);
     try std.testing.expectEqualStrings(
         "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///test.go.ntx\",\"diagnostics\":[]}}",
@@ -413,14 +513,55 @@ test "handleMessage: didChange that fixes a broken document clears its diagnosti
 }
 
 test "handleMessage: didClose publishes an empty diagnostics list for that document" {
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
     const gpa = std.testing.allocator;
     const body = try encodeDidClose(gpa, "file:///test.go.ntx");
     defer gpa.free(body);
 
-    const result = try handleMessage(gpa, body);
+    const result = try server.handleMessage(gpa, body);
     defer gpa.free(result.notification.?);
     try std.testing.expectEqualStrings(
         "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///test.go.ntx\",\"diagnostics\":[]}}",
         result.notification.?,
     );
+}
+
+test "handleMessage: semanticTokens/full on a never-opened uri returns a real empty token array, not an error" {
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
+    const gpa = std.testing.allocator;
+    const body = try encodeSemanticTokensFull(gpa, 5, "file:///never-opened.go.ntx");
+    defer gpa.free(body);
+
+    const result = try server.handleMessage(gpa, body);
+    defer gpa.free(result.response.?);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"data\":[]}}", result.response.?);
+}
+
+test "handleMessage: semanticTokens/full on a real open document returns real delta-encoded tokens" {
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
+    const gpa = std.testing.allocator;
+
+    const open_body = try encodeDidOpen(gpa, "file:///test.go.ntx", clean_ntx_source);
+    defer gpa.free(open_body);
+    const open_result = try server.handleMessage(gpa, open_body);
+    gpa.free(open_result.notification.?);
+
+    const tokens_body = try encodeSemanticTokensFull(gpa, 7, "file:///test.go.ntx");
+    defer gpa.free(tokens_body);
+    const result = try server.handleMessage(gpa, tokens_body);
+    defer gpa.free(result.response.?);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, result.response.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("id").?.integer);
+    const data = parsed.value.object.get("result").?.object.get("data").?.array;
+    // `clean_ntx_source`'s only element is `<Container></Container>` --
+    // its own opening AND closing tag each get a real .type token, 10
+    // integers total.
+    try std.testing.expectEqual(@as(usize, 10), data.items.len);
+    try std.testing.expectEqual(@as(i64, 0), data.items[3].integer); // tokenType index for .type
+    try std.testing.expectEqual(@as(i64, 0), data.items[8].integer); // tokenType index for .type (closing tag)
 }

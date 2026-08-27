@@ -142,6 +142,47 @@ pub const Output = struct {
     generated: []const u8,
     logic: []const u8,
     source_map: []const SourceMapping,
+    semantic_tokens: []const SemanticToken,
+};
+
+/// The real LSP semantic-token types this server advertises (a small
+/// subset of the standard legend -- `type`, `property`, `string` --
+/// picked because they're what `.ntx` markup itself actually contains;
+/// anything else in a `.ntx` file is real host-language Go code, which a
+/// real LSP client already colors via its own existing Go support with no
+/// help needed here).
+pub const SemanticTokenType = enum {
+    /// A tag name, e.g. `Container` in `<Container>` -- built-in widget
+    /// kinds and component-tag calls alike, at both its opening (`<Tag`)
+    /// and, if present, its own closing (`</Tag>`) position.
+    type,
+    /// An attribute name, e.g. `onClick` in `onClick={handleSave}` --
+    /// recorded regardless of what kind of value the attribute carries.
+    property,
+    /// A style-token name (`styles={card}`) -- real `.ntx`-authoring
+    /// syntax naming a stylesheet token, distinct from a widget's own
+    /// child text (`<Label>Enter your name:</Label>`), which is
+    /// deliberately left untokenized (Quinn's own click-through,
+    /// 2026-08-26: coloring it like a string read as an off-putting
+    /// orange rather than plain content -- see `emitElement`'s Label/
+    /// Button branches) even though both render as Go string literals in
+    /// the generated output.
+    string,
+};
+
+/// One real `.ntx`-source-only classification -- unlike `SourceMapping`,
+/// this never needs a `generated`-side byte range at all (a semantic
+/// token exists purely to tell a real editor how to color a span of the
+/// `.ntx` file itself; it has nothing to do with correlating that span to
+/// gopls-forwarded generated Go). `.ntx` LSP Stage 3
+/// (~/.claude/plans/lexical-wishing-penguin.md) -- the revised design
+/// after grammar injection was tried for real and found not to work
+/// cleanly against VS Code's own bundled Go grammar.
+pub const SemanticToken = struct {
+    ntx_line: u32,
+    ntx_col: u32,
+    ntx_len: u32,
+    token_type: SemanticTokenType,
 };
 
 /// One real correspondence between a position in the original `.ntx`
@@ -153,11 +194,24 @@ pub const Output = struct {
 /// one of these today, not every attribute/element. See
 /// `~/.claude/plans/lexical-wishing-penguin.md` for why this one case was
 /// chosen and what's deliberately not covered yet.
+/// What kind of `.ntx` source construct a `SourceMapping` entry
+/// correlates to -- Stage 3 of the LSP's own plan (semantic tokens) needs
+/// this to know how to color each mapped span, not just where it is.
+pub const SourceMappingKind = enum {
+    event_handler,
+    ref_target,
+    style_token,
+    string_literal,
+    child_text,
+    component_call,
+};
+
 pub const SourceMapping = struct {
     ntx_line: u32,
     ntx_col: u32,
     gen_start: usize,
     gen_end: usize,
+    kind: SourceMappingKind,
 };
 
 fn writeGoStringLiteral(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
@@ -249,6 +303,10 @@ const Emitter = struct {
     /// Shared across every `Emitter` for this file the same way
     /// `used_paths` is -- see `SourceMapping`'s own doc comment.
     mappings: *std.ArrayList(SourceMapping),
+    /// Shared across every `Emitter` for this file, same as `mappings` --
+    /// see `SemanticToken`'s own doc comment for why this is a genuinely
+    /// separate list, not folded into `mappings` itself.
+    semantic_tokens: *std.ArrayList(SemanticToken),
     /// The owning composer's own absolute file position -- same values
     /// `generateGo`'s error path already passes to `translatePosition`,
     /// just also threaded onto the `Emitter` itself so `emitEventBinding`
@@ -272,15 +330,29 @@ const Emitter = struct {
     /// -- shared by `Label` and `Button`, both of which take their real
     /// text/label param from child content, not an attribute (matching
     /// every real design-doc example, e.g. `<Button ...>Save</Button>`).
-    fn childText(self: *Emitter, el: Parser.Element) EmitError![]const u8 {
+    const ChildText = struct { text: []const u8, line: u32, col: u32 };
+
+    /// Returns `null` only when the element has no text children at all
+    /// (an empty `<Label></Label>` still gets `.text = ""`, since it *did*
+    /// have a text child, just an empty/whitespace-only one) -- the
+    /// distinction matters for whether a `SourceMapping` gets recorded:
+    /// there's no real `.ntx` position to point at when there was never a
+    /// text child in the first place.
+    fn childText(self: *Emitter, el: Parser.Element) EmitError!?ChildText {
         var text: std.ArrayList(u8) = .empty;
+        var pos: ?struct { line: u32, col: u32 } = null;
         for (el.children) |child| {
             switch (child) {
-                .text => |t| try text.appendSlice(self.allocator, t),
+                .text => |t| {
+                    if (pos == null) pos = .{ .line = t.line, .col = t.col };
+                    try text.appendSlice(self.allocator, t.text);
+                },
                 .element => return self.fail(el.line, el.col, "<{s}> doesn't accept nested elements", .{el.tag}),
             }
         }
-        return text.toOwnedSlice(self.allocator);
+        const combined = try text.toOwnedSlice(self.allocator);
+        const p = pos orelse return null;
+        return .{ .text = combined, .line = p.line, .col = p.col };
     }
 
     fn consumesTextChildren(tag: []const u8) bool {
@@ -292,24 +364,31 @@ const Emitter = struct {
     /// param, not a generic post-creation attribute like `styles`/`ref`/
     /// an event handler. Returns `null` if absent (caller supplies its
     /// own default); errors if present but not a plain string.
-    fn stringAttr(self: *Emitter, el: Parser.Element, name: []const u8) EmitError!?[]const u8 {
+    const StringAttr = struct { value: []const u8, line: u32, col: u32 };
+
+    fn stringAttr(self: *Emitter, el: Parser.Element, name: []const u8) EmitError!?StringAttr {
         for (el.attrs) |attr| {
             if (!std.mem.eql(u8, attr.name, name)) continue;
             switch (attr.value) {
-                .string_literal => |s| return s,
+                .string_literal => |s| return .{ .value = s, .line = attr.line, .col = attr.col },
                 else => return self.fail(attr.line, attr.col, "'{s}' must be a plain string, e.g. {s}=\"...\"", .{ name, name }),
             }
         }
         return null;
     }
 
-    fn emitApplyStyle(self: *Emitter, var_name: []const u8, names: [][]const u8) EmitError!void {
+    fn emitApplyStyle(self: *Emitter, var_name: []const u8, names: []Parser.StyleRef) EmitError!void {
         try self.out.appendSlice(self.allocator, "\tif err := widgets.ApplyStyle(uint32(");
         try self.out.appendSlice(self.allocator, var_name);
         try self.out.appendSlice(self.allocator, "), StyleTokens");
         for (names) |n| {
             try self.out.appendSlice(self.allocator, ", ");
-            try writeGoStringLiteral(self.out, self.allocator, n);
+            const abs = translatePosition(self.body_line, self.body_col, n.line, n.col);
+            const gen_start = self.out.items.len;
+            try writeGoStringLiteral(self.out, self.allocator, n.name);
+            const gen_end = self.out.items.len;
+            try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .style_token });
+            try self.semantic_tokens.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(n.name.len), .token_type = .string });
         }
         try self.out.appendSlice(self.allocator, "); err != nil {\n\t\treturn err\n\t}\n");
     }
@@ -322,7 +401,7 @@ const Emitter = struct {
     /// field from `names` is untouched. `names` may be empty (a bare
     /// `<Image src="..."/>` with no `styles=` at all still needs its
     /// texture applied).
-    fn emitApplyStyleWithTexture(self: *Emitter, var_name: []const u8, names: [][]const u8, texture_id: u32) EmitError!void {
+    fn emitApplyStyleWithTexture(self: *Emitter, var_name: []const u8, names: []Parser.StyleRef, texture_id: u32) EmitError!void {
         try self.out.appendSlice(self.allocator, "\tif err := widgets.ApplyStyleWithTexture(uint32(");
         try self.out.appendSlice(self.allocator, var_name);
         try self.out.appendSlice(self.allocator, "), StyleTokens, ");
@@ -331,7 +410,12 @@ const Emitter = struct {
         try self.out.appendSlice(self.allocator, id_str);
         for (names) |n| {
             try self.out.appendSlice(self.allocator, ", ");
-            try writeGoStringLiteral(self.out, self.allocator, n);
+            const abs = translatePosition(self.body_line, self.body_col, n.line, n.col);
+            const gen_start = self.out.items.len;
+            try writeGoStringLiteral(self.out, self.allocator, n.name);
+            const gen_end = self.out.items.len;
+            try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .style_token });
+            try self.semantic_tokens.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(n.name.len), .token_type = .string });
         }
         try self.out.appendSlice(self.allocator, "); err != nil {\n\t\treturn err\n\t}\n");
     }
@@ -345,9 +429,13 @@ const Emitter = struct {
     /// Real type mismatches (e.g. a `*widgets.Label` ref on a `<Button>`)
     /// are deliberately left for Go's own compiler to catch -- natyv
     /// doesn't re-implement Go's type checker to pre-validate this.
-    fn emitRefAssign(self: *Emitter, target: []const u8, var_name: []const u8) EmitError!void {
+    fn emitRefAssign(self: *Emitter, target: []const u8, var_name: []const u8, line: u32, col: u32) EmitError!void {
         try self.out.appendSlice(self.allocator, "\t");
+        const abs = translatePosition(self.body_line, self.body_col, line, col);
+        const gen_start = self.out.items.len;
         try self.out.appendSlice(self.allocator, target);
+        const gen_end = self.out.items.len;
+        try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .ref_target });
         try self.out.appendSlice(self.allocator, " = &");
         try self.out.appendSlice(self.allocator, var_name);
         try self.out.appendSlice(self.allocator, "\n");
@@ -387,7 +475,7 @@ const Emitter = struct {
         const gen_start = self.out.items.len;
         try self.out.appendSlice(self.allocator, handler_expr);
         const gen_end = self.out.items.len;
-        try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end });
+        try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .event_handler });
         try self.out.appendSlice(self.allocator, ")\n");
     }
 
@@ -483,7 +571,7 @@ const Emitter = struct {
             var margin: ?u16 = null;
             for (names) |name| {
                 for (self.style_tokens) |tok| {
-                    if (std.mem.eql(u8, tok.name, name)) {
+                    if (std.mem.eql(u8, tok.name, name.name)) {
                         if (tok.margin) |m| margin = m;
                         break;
                     }
@@ -608,6 +696,16 @@ const Emitter = struct {
             call_target = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ lastPathSegment(path), el.tag });
         }
 
+        // `.ntx` LSP Stage 4 (~/.claude/plans/lexical-wishing-penguin.md):
+        // every mapping recorded below this point while building `args`
+        // (a plain string-literal argument, or anything a nested
+        // `child_emitter` records into `body`) is relative to a scratch
+        // buffer, not `self.out` -- a *second* offset correction is needed
+        // on top of the global header-length shift `generateGo` already
+        // applies. `args_mappings_start` marks where that correction range
+        // begins; it's applied once, right before `args.items` is finally
+        // spliced into `self.out` below.
+        const args_mappings_start = self.mappings.items.len;
         var args: std.ArrayList(u8) = .empty;
         for (el.attrs) |attr| {
             switch (attr.value) {
@@ -615,7 +713,11 @@ const Emitter = struct {
                 .styles => {},
                 .string_literal => |s| {
                     if (args.items.len > 0) try args.appendSlice(self.allocator, ", ");
+                    const abs = translatePosition(self.body_line, self.body_col, attr.line, attr.col);
+                    const gen_start = args.items.len;
                     try writeGoStringLiteral(&args, self.allocator, s);
+                    const gen_end = args.items.len;
+                    try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .string_literal });
                 },
                 .expr => |e| {
                     if (args.items.len > 0) try args.appendSlice(self.allocator, ", ");
@@ -628,7 +730,14 @@ const Emitter = struct {
             const child_var = try std.fmt.allocPrint(self.allocator, "p{d}", .{self.counter});
             self.counter += 1;
             var body: std.ArrayList(u8) = .empty;
-            var child_emitter: Emitter = .{ .allocator = self.allocator, .out = &body, .style_tokens = self.style_tokens, .composers = self.composers, .uses = self.uses, .used_paths = self.used_paths, .mappings = self.mappings, .body_line = self.body_line, .body_col = self.body_col, .counter = self.counter, .image_texture_ids = self.image_texture_ids };
+            var child_emitter: Emitter = .{ .allocator = self.allocator, .out = &body, .style_tokens = self.style_tokens, .composers = self.composers, .uses = self.uses, .used_paths = self.used_paths, .mappings = self.mappings, .semantic_tokens = self.semantic_tokens, .body_line = self.body_line, .body_col = self.body_col, .counter = self.counter, .image_texture_ids = self.image_texture_ids };
+            // Every mapping `child_emitter` records below is relative to
+            // `body`, not `args` -- a real, distinct sub-shift, since
+            // `body.items` itself gets spliced into `args` at whatever
+            // offset `args` has already reached (from attribute args
+            // processed above), before the whole of `args` gets its own
+            // shift into `self.out` further down.
+            const body_mappings_start = self.mappings.items.len;
             for (el.children) |child| {
                 switch (child) {
                     .text => return self.fail(el.line, el.col, "<{s}> doesn't accept text content -- a component tag's children become its widgets.Builder callback", .{el.tag}),
@@ -644,18 +753,36 @@ const Emitter = struct {
             try args.appendSlice(self.allocator, "func(");
             try args.appendSlice(self.allocator, child_var);
             try args.appendSlice(self.allocator, " uint32) error {\n");
+            const body_into_args_offset = args.items.len;
             try args.appendSlice(self.allocator, body.items);
             try args.appendSlice(self.allocator, "\treturn nil\n\t}");
+            for (self.mappings.items[body_mappings_start..]) |*m| {
+                m.gen_start += body_into_args_offset;
+                m.gen_end += body_into_args_offset;
+            }
         }
+        const args_mappings_end = self.mappings.items.len;
 
         try self.out.appendSlice(self.allocator, "\tif err := ");
+        // +1 column: `el.col` marks the tag's own `<`, not the tag name
+        // itself -- see the matching note on Stage 3's tag-name semantic
+        // token in `emitElement`.
+        const call_abs = translatePosition(self.body_line, self.body_col, el.line, el.col + 1);
+        const call_gen_start = self.out.items.len;
         try self.out.appendSlice(self.allocator, call_target);
+        const call_gen_end = self.out.items.len;
+        try self.mappings.append(self.allocator, .{ .ntx_line = call_abs.line, .ntx_col = call_abs.col, .gen_start = call_gen_start, .gen_end = call_gen_end, .kind = .component_call });
         try self.out.appendSlice(self.allocator, "(uint32(");
         try self.out.appendSlice(self.allocator, parent_expr);
         try self.out.appendSlice(self.allocator, ")");
         if (args.items.len > 0) {
             try self.out.appendSlice(self.allocator, ", ");
+            const args_into_out_offset = self.out.items.len;
             try self.out.appendSlice(self.allocator, args.items);
+            for (self.mappings.items[args_mappings_start..args_mappings_end]) |*m| {
+                m.gen_start += args_into_out_offset;
+                m.gen_end += args_into_out_offset;
+            }
         }
         try self.out.appendSlice(self.allocator, "); err != nil {\n\t\treturn err\n\t}\n");
 
@@ -683,6 +810,33 @@ const Emitter = struct {
     }
 
     fn emitElement(self: *Emitter, el: Parser.Element, parent_expr: []const u8) EmitError![]const u8 {
+        // `.ntx` LSP Stage 3: every element's own tag name gets a real
+        // `.type` semantic token, regardless of what kind of tag it turns
+        // out to be (built-in widget, `<children/>`, or a component-tag
+        // call) -- recorded once, here, rather than separately in each of
+        // this function's own branches below.
+        // `el.line`/`el.col` mark the position of the tag's own `<`
+        // (`Parser.zig`'s `parseElement` captures it right before
+        // consuming that character), not the tag name itself -- +1 column
+        // to land on the name's first real character. Always safe on the
+        // same line: the grammar never allows a newline between `<` and
+        // the tag name.
+        const tag_abs = translatePosition(self.body_line, self.body_col, el.line, el.col + 1);
+        try self.semantic_tokens.append(self.allocator, .{ .ntx_line = tag_abs.line, .ntx_col = tag_abs.col, .ntx_len = @intCast(el.tag.len), .token_type = .type });
+        // A non-self-closing element's own `</Tag>` gets the identical
+        // `.type` token too -- `Parser.zig`'s `close.line`/`close.col`
+        // already mark the tag name's own first character (right after
+        // `</`), unlike `el.line`/`el.col` above, so no `+1` correction is
+        // needed here.
+        if (el.close) |close| {
+            const close_abs = translatePosition(self.body_line, self.body_col, close.line, close.col);
+            try self.semantic_tokens.append(self.allocator, .{ .ntx_line = close_abs.line, .ntx_col = close_abs.col, .ntx_len = @intCast(el.tag.len), .token_type = .type });
+        }
+        for (el.attrs) |attr| {
+            const attr_abs = translatePosition(self.body_line, self.body_col, attr.line, attr.col);
+            try self.semantic_tokens.append(self.allocator, .{ .ntx_line = attr_abs.line, .ntx_col = attr_abs.col, .ntx_len = @intCast(attr.name.len), .token_type = .property });
+        }
+
         var attach_expr = parent_expr;
         if (self.marginFor(el)) |margin| {
             if (margin > 0) attach_expr = try self.emitMarginWrapper(parent_expr, margin);
@@ -707,34 +861,65 @@ const Emitter = struct {
             try self.out.appendSlice(self.allocator, layout_var);
             try self.out.appendSlice(self.allocator, ", false, 0)\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "Label")) {
-            const text = try self.childText(el);
+            const text_child = try self.childText(el);
+            const text = if (text_child) |t| t.text else "";
             try self.emitLayout(layout_var, attach_expr, .{ .width_fixed = 300, .height_fixed = 24 });
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateLabel(");
             try self.out.appendSlice(self.allocator, layout_var);
             try self.out.appendSlice(self.allocator, ", ");
+            const gen_start = self.out.items.len;
             try writeGoStringLiteral(self.out, self.allocator, text);
+            const gen_end = self.out.items.len;
+            if (text_child) |t| {
+                const abs = translatePosition(self.body_line, self.body_col, t.line, t.col);
+                try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .child_text });
+                // Deliberately no semantic token here (unlike style-token
+                // names above) -- child text is a widget's own real,
+                // author-facing label, not string-literal *syntax* from
+                // the `.ntx` author's perspective, and coloring it like a
+                // string (Quinn's own click-through, 2026-08-26: rendered
+                // as an off-putting orange) obscured rather than clarified
+                // that it's plain text. Leaving it untokenized renders it
+                // in the editor's own default foreground color instead.
+            }
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "Button")) {
-            const text = try self.childText(el);
+            const text_child = try self.childText(el);
+            const text = if (text_child) |t| t.text else "";
             try self.emitLayout(layout_var, attach_expr, .{ .width_fixed = 120, .height_fixed = 32 });
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateButton(");
             try self.out.appendSlice(self.allocator, layout_var);
             try self.out.appendSlice(self.allocator, ", ");
+            const gen_start = self.out.items.len;
             try writeGoStringLiteral(self.out, self.allocator, text);
+            const gen_end = self.out.items.len;
+            if (text_child) |t| {
+                const abs = translatePosition(self.body_line, self.body_col, t.line, t.col);
+                try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .child_text });
+                // Deliberately no semantic token here -- see the matching
+                // Label branch's own comment above.
+            }
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
         } else if (std.mem.eql(u8, el.tag, "TextField")) {
-            const placeholder = (try self.stringAttr(el, "placeholder")) orelse "";
+            const placeholder_attr = try self.stringAttr(el, "placeholder");
+            const placeholder = if (placeholder_attr) |pa| pa.value else "";
             try self.emitLayout(layout_var, attach_expr, .{ .width_fixed = 240, .height_fixed = 32 });
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateTextField(");
             try self.out.appendSlice(self.allocator, layout_var);
             try self.out.appendSlice(self.allocator, ", ");
+            const gen_start = self.out.items.len;
             try writeGoStringLiteral(self.out, self.allocator, placeholder);
+            const gen_end = self.out.items.len;
+            if (placeholder_attr) |pa| {
+                const abs = translatePosition(self.body_line, self.body_col, pa.line, pa.col);
+                try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .string_literal });
+            }
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attr = "placeholder";
         } else if (std.mem.eql(u8, el.tag, "Image")) {
@@ -747,7 +932,7 @@ const Emitter = struct {
             // commit message and natyv_styling_system memory.
             if (el.children.len > 0) return self.fail(el.line, el.col, "<Image> doesn't accept children -- it renders its own src, nothing else", .{});
             const src = (try self.stringAttr(el, "src")) orelse return self.fail(el.line, el.col, "<Image> requires a src=\"...\" attribute", .{});
-            image_texture_id = self.image_texture_ids.get(src) orelse return self.fail(el.line, el.col, "image asset \"{s}\" was never staged -- this shouldn't happen if natyv prepare's own pre-scan ran first", .{src});
+            image_texture_id = self.image_texture_ids.get(src.value) orelse return self.fail(el.line, el.col, "image asset \"{s}\" was never staged -- this shouldn't happen if natyv prepare's own pre-scan ran first", .{src.value});
             is_image_tag = true;
             // A leaf widget like Label/Button, not a layout container --
             // 300x200 is a plain, reasonable default "image box" size
@@ -789,7 +974,7 @@ const Emitter = struct {
                 }
             } else if (std.mem.eql(u8, attr.name, "ref")) {
                 switch (attr.value) {
-                    .ref => |target| try self.emitRefAssign(target, var_name),
+                    .ref => |target| try self.emitRefAssign(target, var_name, attr.line, attr.col),
                     else => return self.fail(attr.line, attr.col, "malformed 'ref' attribute", .{}),
                 }
             } else if (isEventAttr(attr.name)) {
@@ -929,6 +1114,11 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
     var mappings: std.ArrayList(SourceMapping) = .empty;
     errdefer mappings.deinit(allocator);
 
+    // `.ntx` LSP Stage 3 -- shared the same way, see `SemanticToken`'s own
+    // doc comment for why this is a separate list from `mappings`.
+    var semantic_tokens: std.ArrayList(SemanticToken) = .empty;
+    errdefer semantic_tokens.deinit(allocator);
+
     for (composers) |composer| {
         if (!std.mem.eql(u8, composer.return_type, "error")) {
             return .{ .output = null, .err = .{
@@ -970,7 +1160,7 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
             } };
         };
 
-        var emitter: Emitter = .{ .allocator = allocator, .out = &body, .style_tokens = style_tokens, .composers = composer_names.items, .uses = uses, .used_paths = &used_paths, .mappings = &mappings, .body_line = composer.body_line, .body_col = composer.body_col, .image_texture_ids = image_texture_ids };
+        var emitter: Emitter = .{ .allocator = allocator, .out = &body, .style_tokens = style_tokens, .composers = composer_names.items, .uses = uses, .used_paths = &used_paths, .mappings = &mappings, .semantic_tokens = &semantic_tokens, .body_line = composer.body_line, .body_col = composer.body_col, .image_texture_ids = image_texture_ids };
         _ = emitter.emitElement(node.element, parent_name) catch |e| {
             if (e == error.CodegenError) {
                 const eerr = emitter.err.?;
@@ -1063,7 +1253,7 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
         m.gen_end += header_len;
     }
 
-    return .{ .output = .{ .generated = try generated.toOwnedSlice(allocator), .logic = logic, .source_map = try mappings.toOwnedSlice(allocator) }, .err = null };
+    return .{ .output = .{ .generated = try generated.toOwnedSlice(allocator), .logic = logic, .source_map = try mappings.toOwnedSlice(allocator), .semantic_tokens = try semantic_tokens.toOwnedSlice(allocator) }, .err = null };
 }
 
 test "generates a builder function and a spliced logic file for a single flat composer" {
@@ -1212,11 +1402,18 @@ test ".ntx LSP position-mapping spike: onClick={handleSave} round-trips between 
     try std.testing.expect(result.err == null);
     const output = result.output.?;
 
-    // Exactly one mapping recorded -- this fixture has exactly one
-    // `on[A-Z]...` event-handler attribute (`onClick`); `ref`/
-    // `placeholder` aren't event attributes and record nothing.
-    try std.testing.expectEqual(@as(usize, 1), output.source_map.len);
-    const mapping = output.source_map[0];
+    // Four mappings recorded, one per case Stage 4 generalized coverage
+    // to that this fixture happens to exercise: `ref={&nameField}`,
+    // `placeholder="Your name"`, `onClick={handleSave}`, and the
+    // `Button`'s own "Save" child text. This test cares specifically
+    // about the `onClick` one -- find it by kind, not by a hardcoded
+    // index (recording order isn't part of the contract).
+    try std.testing.expectEqual(@as(usize, 4), output.source_map.len);
+    var mapping: ?SourceMapping = null;
+    for (output.source_map) |m| {
+        if (m.kind == .event_handler) mapping = m;
+    }
+    const found_mapping = mapping.?;
 
     // Independent sanity check on the recorded absolute position, without
     // hardcoding the exact expected line/col (fragile to hand-compute and
@@ -1226,25 +1423,386 @@ test ".ntx LSP position-mapping spike: onClick={handleSave} round-trips between 
     var line_it = std.mem.splitScalar(u8, src, '\n');
     var current_line: u32 = 1;
     while (line_it.next()) |line_text| : (current_line += 1) {
-        if (current_line == mapping.ntx_line) {
+        if (current_line == found_mapping.ntx_line) {
             try std.testing.expect(std.mem.indexOf(u8, line_text, "onClick") != null);
             break;
         }
-    } else try std.testing.expect(false); // mapping.ntx_line must be a real line in src
+    } else try std.testing.expect(false); // found_mapping.ntx_line must be a real line in src
 
     // Forward mapping (`.ntx` -> generated): resolves to *exactly*
     // "handleSave" in the generated output, not just "somewhere on the
     // right line" -- the precise proof a real hover/go-to-definition
     // request forwarded to gopls would need.
-    const forward = PositionMap.ntxToGenerated(output.source_map, mapping.ntx_line, mapping.ntx_col).?;
+    const forward = PositionMap.ntxToGenerated(output.source_map, found_mapping.ntx_line, found_mapping.ntx_col).?;
     try std.testing.expectEqualStrings("handleSave", output.generated[forward.start..forward.end]);
 
     // Reverse mapping (generated -> `.ntx`): a position gopls might return
     // (e.g. the start of a diagnostic range over `handleSave`) maps back
     // to the exact same real source position -- the real round trip.
     const back = PositionMap.generatedToNtx(output.source_map, forward.start).?;
+    try std.testing.expectEqual(found_mapping.ntx_line, back.line);
+    try std.testing.expectEqual(found_mapping.ntx_col, back.col);
+}
+
+// The five real round-trip tests below are Stage 4's own verification
+// (~/.claude/plans/lexical-wishing-penguin.md): one per newly-covered
+// `SourceMappingKind`, each proving the exact same thing the spike test
+// above proved for `.event_handler` -- forward-maps to *exactly* the
+// right substring, reverse-maps back to the identical original position.
+
+fn expectOnlyMapping(source_map: []const SourceMapping, kind: SourceMappingKind) SourceMapping {
+    var found: ?SourceMapping = null;
+    for (source_map) |m| {
+        if (m.kind == kind) {
+            std.testing.expect(found == null) catch unreachable; // more than one of this kind -- test fixture isn't as narrow as intended
+            found = m;
+        }
+    }
+    return found.?;
+}
+
+test ".ntx LSP Stage 4: ref={&x} round-trips between the real .ntx source and the generated Go output" {
+    const src =
+        \\expose Form
+        \\
+        \\func Form(parent widgets.Container) error {
+        \\  <TextField ref={&nameField} />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+
+    const mapping = expectOnlyMapping(output.source_map, .ref_target);
+    const forward = PositionMap.ntxToGenerated(output.source_map, mapping.ntx_line, mapping.ntx_col).?;
+    try std.testing.expectEqualStrings("nameField", output.generated[forward.start..forward.end]);
+    const back = PositionMap.generatedToNtx(output.source_map, forward.start).?;
     try std.testing.expectEqual(mapping.ntx_line, back.line);
     try std.testing.expectEqual(mapping.ntx_col, back.col);
+}
+
+test ".ntx LSP Stage 4: styles={token} round-trips between the real .ntx source and the generated Go output" {
+    const src =
+        \\expose Form
+        \\
+        \\func Form(parent widgets.Container) error {
+        \\  <Label styles={card}>hi</Label>
+        \\}
+    ;
+    const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "card" }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+
+    const mapping = expectOnlyMapping(output.source_map, .style_token);
+    const forward = PositionMap.ntxToGenerated(output.source_map, mapping.ntx_line, mapping.ntx_col).?;
+    try std.testing.expectEqualStrings("\"card\"", output.generated[forward.start..forward.end]);
+    const back = PositionMap.generatedToNtx(output.source_map, forward.start).?;
+    try std.testing.expectEqual(mapping.ntx_line, back.line);
+    try std.testing.expectEqual(mapping.ntx_col, back.col);
+}
+
+test ".ntx LSP Stage 4: a plain string attribute (TextField placeholder) round-trips" {
+    const src =
+        \\expose Form
+        \\
+        \\func Form(parent widgets.Container) error {
+        \\  <TextField placeholder="Your name" />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+
+    const mapping = expectOnlyMapping(output.source_map, .string_literal);
+    const forward = PositionMap.ntxToGenerated(output.source_map, mapping.ntx_line, mapping.ntx_col).?;
+    try std.testing.expectEqualStrings("\"Your name\"", output.generated[forward.start..forward.end]);
+    const back = PositionMap.generatedToNtx(output.source_map, forward.start).?;
+    try std.testing.expectEqual(mapping.ntx_line, back.line);
+    try std.testing.expectEqual(mapping.ntx_col, back.col);
+}
+
+test ".ntx LSP Stage 4: a Button's own child text round-trips" {
+    const src =
+        \\expose Form
+        \\
+        \\func Form(parent widgets.Container) error {
+        \\  <Button onClick={handleSave}>Save changes</Button>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+
+    const mapping = expectOnlyMapping(output.source_map, .child_text);
+    const forward = PositionMap.ntxToGenerated(output.source_map, mapping.ntx_line, mapping.ntx_col).?;
+    try std.testing.expectEqualStrings("\"Save changes\"", output.generated[forward.start..forward.end]);
+    const back = PositionMap.generatedToNtx(output.source_map, forward.start).?;
+    try std.testing.expectEqual(mapping.ntx_line, back.line);
+    try std.testing.expectEqual(mapping.ntx_col, back.col);
+}
+
+test ".ntx LSP Stage 4: a component-tag call site round-trips" {
+    const src =
+        \\expose Header
+        \\expose Page
+        \\
+        \\func Header(parent uint32) error {
+        \\  <Label>Hi</Label>
+        \\}
+        \\
+        \\func Page(parent widgets.Container) error {
+        \\  <Header/>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+
+    const mapping = expectOnlyMapping(output.source_map, .component_call);
+    const forward = PositionMap.ntxToGenerated(output.source_map, mapping.ntx_line, mapping.ntx_col).?;
+    try std.testing.expectEqualStrings("Header", output.generated[forward.start..forward.end]);
+    const back = PositionMap.generatedToNtx(output.source_map, forward.start).?;
+    try std.testing.expectEqual(mapping.ntx_line, back.line);
+    try std.testing.expectEqual(mapping.ntx_col, back.col);
+}
+
+// The previously-deferred sub-case (see emitComponentCall's own doc
+// comment): a plain string literal forwarded as a component-tag call's
+// own argument writes into a scratch `args` buffer, and a nested child's
+// own mappings write into a *further* nested `body` buffer -- both need a
+// real double offset-shift (body -> args -> self.out) on top of the
+// existing global header-length shift. Picked up immediately after Stage
+// 4 landed, once Quinn asked when it would be -- not left open-ended.
+test ".ntx LSP Stage 4 follow-up: a string-literal component-call argument round-trips" {
+    const src =
+        \\expose Header
+        \\expose Page
+        \\
+        \\func Header(parent uint32, label string) error {
+        \\  <Label>Hi</Label>
+        \\}
+        \\
+        \\func Page(parent widgets.Container) error {
+        \\  <Header label="Hi there" />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+
+    const mapping = expectOnlyMapping(output.source_map, .string_literal);
+    const forward = PositionMap.ntxToGenerated(output.source_map, mapping.ntx_line, mapping.ntx_col).?;
+    try std.testing.expectEqualStrings("\"Hi there\"", output.generated[forward.start..forward.end]);
+    const back = PositionMap.generatedToNtx(output.source_map, forward.start).?;
+    try std.testing.expectEqual(mapping.ntx_line, back.line);
+    try std.testing.expectEqual(mapping.ntx_col, back.col);
+}
+
+test ".ntx LSP Stage 4 follow-up: a nested child's own mapping round-trips through a component call's children" {
+    const src =
+        \\expose Header
+        \\expose Page
+        \\
+        \\func Header(parent uint32) error {
+        \\  <Label>Hi</Label>
+        \\}
+        \\
+        \\func Page(parent widgets.Container) error {
+        \\  <Header label="Hi there">
+        \\    <Button onClick={handleSave}>Save</Button>
+        \\  </Header>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+
+    // Real proof the *nested child's* mapping (recorded inside `body`,
+    // spliced into `args`, spliced into `self.out`) resolves to the
+    // correct final byte range, not the string-literal-arg's own text
+    // that happens to land nearby after both splices.
+    const mapping = expectOnlyMapping(output.source_map, .event_handler);
+    const forward = PositionMap.ntxToGenerated(output.source_map, mapping.ntx_line, mapping.ntx_col).?;
+    try std.testing.expectEqualStrings("handleSave", output.generated[forward.start..forward.end]);
+    const back = PositionMap.generatedToNtx(output.source_map, forward.start).?;
+    try std.testing.expectEqual(mapping.ntx_line, back.line);
+    try std.testing.expectEqual(mapping.ntx_col, back.col);
+}
+
+// Stage 3's own real tests (~/.claude/plans/lexical-wishing-penguin.md):
+// `SemanticToken`s never need a generated-side round trip (see that
+// type's own doc comment), so verification here is simpler than the
+// `SourceMapping` round-trip tests above -- slice the real `.ntx` source
+// at the recorded `(ntx_line, ntx_col, ntx_len)` and confirm it's exactly
+// the expected text, proving the position/length is real and correct,
+// not just "some token got produced."
+
+fn sliceAtPosition(src: []const u8, line: u32, col: u32, len: u32) []const u8 {
+    var current_line: u32 = 1;
+    var idx: usize = 0;
+    while (current_line < line) : (current_line += 1) {
+        idx = std.mem.indexOfScalarPos(u8, src, idx, '\n').? + 1;
+    }
+    const start = idx + col - 1;
+    return src[start .. start + len];
+}
+
+test ".ntx LSP Stage 3: every tag name gets a real .type semantic token, at both its opening and closing position" {
+    const src =
+        \\expose Form
+        \\
+        \\func Form(parent widgets.Container) error {
+        \\  <Container>
+        \\    <Label>Hi</Label>
+        \\  </Container>
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+
+    var tag_names: std.ArrayList([]const u8) = .empty;
+    for (output.semantic_tokens) |t| {
+        if (t.token_type != .type) continue;
+        try tag_names.append(allocator, sliceAtPosition(src, t.ntx_line, t.ntx_col, t.ntx_len));
+    }
+    // 4, not 2: each of Container/Label's own opening *and* closing tag
+    // name gets its own token -- neither is self-closing here. Checked as
+    // a multiset, not a fixed order: `emitElement` pushes both of an
+    // element's own tokens (open, then close) before recursing into its
+    // children, so the raw list here isn't in source order -- a real LSP
+    // client always receives them sorted by position regardless
+    // (`SemanticTokens.compute` does that sorting), so list order itself
+    // carries no meaning worth asserting on.
+    try std.testing.expectEqual(@as(usize, 4), tag_names.items.len);
+    var seen_container: usize = 0;
+    var seen_label: usize = 0;
+    for (tag_names.items) |name| {
+        if (std.mem.eql(u8, name, "Container")) seen_container += 1;
+        if (std.mem.eql(u8, name, "Label")) seen_label += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen_container);
+    try std.testing.expectEqual(@as(usize, 2), seen_label);
+}
+
+test ".ntx LSP Stage 3: a self-closing tag gets exactly one .type token, not a phantom second one" {
+    const src =
+        \\expose Form
+        \\
+        \\func Form(parent widgets.Container) error {
+        \\  <TextField placeholder="Your name" />
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+
+    var tag_names: std.ArrayList([]const u8) = .empty;
+    for (output.semantic_tokens) |t| {
+        if (t.token_type != .type) continue;
+        try tag_names.append(allocator, sliceAtPosition(src, t.ntx_line, t.ntx_col, t.ntx_len));
+    }
+    try std.testing.expectEqual(@as(usize, 1), tag_names.items.len);
+    try std.testing.expectEqualStrings("TextField", tag_names.items[0]);
+}
+
+test ".ntx LSP Stage 3: every attribute name gets a real .property semantic token" {
+    const src =
+        \\expose Form
+        \\
+        \\func Form(parent widgets.Container) error {
+        \\  <Button onClick={handleSave} styles={card}>Save</Button>
+        \\}
+    ;
+    const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "card" }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+
+    var attr_names: std.ArrayList([]const u8) = .empty;
+    for (output.semantic_tokens) |t| {
+        if (t.token_type != .property) continue;
+        try attr_names.append(allocator, sliceAtPosition(src, t.ntx_line, t.ntx_col, t.ntx_len));
+    }
+    try std.testing.expectEqual(@as(usize, 2), attr_names.items.len);
+    try std.testing.expectEqualStrings("onClick", attr_names.items[0]);
+    try std.testing.expectEqualStrings("styles", attr_names.items[1]);
+}
+
+test ".ntx LSP Stage 3: style-token names get real .string semantic tokens, but a widget's own child text does not" {
+    const src =
+        \\expose Form
+        \\
+        \\func Form(parent widgets.Container) error {
+        \\  <Label styles={card}>Hello there</Label>
+        \\}
+    ;
+    const tokens = [_]Resolver.ResolvedStyleToken{.{ .name = "card" }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const output = result.output.?;
+
+    // Deliberate, per Quinn's own click-through feedback: child text reads
+    // as plain author-facing content, not `.ntx` syntax, so it should
+    // render in the editor's default color, not be colored like a string
+    // literal -- see `emitElement`'s Label/Button branches.
+    var strings: std.ArrayList([]const u8) = .empty;
+    for (output.semantic_tokens) |t| {
+        if (t.token_type != .string) continue;
+        try strings.append(allocator, sliceAtPosition(src, t.ntx_line, t.ntx_col, t.ntx_len));
+    }
+    try std.testing.expectEqual(@as(usize, 1), strings.items.len);
+    try std.testing.expectEqualStrings("card", strings.items[0]);
+
+    for (output.semantic_tokens) |t| {
+        const text = sliceAtPosition(src, t.ntx_line, t.ntx_col, t.ntx_len);
+        try std.testing.expect(!std.mem.eql(u8, text, "Hello there"));
+    }
 }
 
 test "rejects an unrecognized attribute with a clear error, translated to an absolute file position" {

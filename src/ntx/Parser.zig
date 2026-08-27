@@ -49,16 +49,39 @@ pub const AttrValue = union(enum) {
     /// captured verbatim too, since this parser never validates real Go
     /// expression shapes).
     ref: []const u8,
-    /// `styles={a, b}` -- the bare comma-separated style-token-name list.
-    styles: [][]const u8,
+    /// `styles={a, b}` -- the bare comma-separated style-token-name list,
+    /// each with its own real position (`.ntx` LSP Stage 4,
+    /// ~/.claude/plans/lexical-wishing-penguin.md) -- distinct names in one
+    /// `styles={...}` attribute are otherwise indistinguishable positions
+    /// once flattened into `Codegen.zig`'s single `source_map` list.
+    styles: []StyleRef,
     /// Any other `{...}` value -- opaque host-language text, pasted
     /// verbatim into generated code by a later stage. Never parsed here.
     expr: []const u8,
 };
 
+/// One name inside a `styles={...}` list, with its own real position --
+/// `attr.line`/`attr.col` (below) only locate the word "styles" itself,
+/// not any individual name in the list.
+pub const StyleRef = struct {
+    name: []const u8,
+    line: u32,
+    col: u32,
+};
+
 pub const Attr = struct {
     name: []const u8,
     value: AttrValue,
+    line: u32,
+    col: u32,
+};
+
+/// The position of a non-self-closing element's own `</Tag>` -- `line`/
+/// `col` mark the tag name's own first character (right after the `</`),
+/// matching `Element.line`/`col`'s post-`+1`-correction convention for the
+/// opening tag, not the position of `<` itself. `null` for a self-closing
+/// element (`<Tag/>`), which has no closing tag to point at.
+pub const ClosingTag = struct {
     line: u32,
     col: u32,
 };
@@ -69,15 +92,21 @@ pub const Element = struct {
     children: []Node,
     line: u32,
     col: u32,
+    close: ?ClosingTag = null,
 };
 
-/// Text children are plain trimmed byte slices, no line/col -- mirrors
-/// Stylesheet.zig's `Value` union, where leaf variants (`.string`,
-/// `.ident`) are bare `[]const u8` too. Revisit if a later stage needs to
-/// report a real error location inside label/button text specifically.
+/// A run of plain text between tags, with its own real position (`.ntx`
+/// LSP Stage 4) -- position marks the start of the *trimmed* content, not
+/// any stripped leading whitespace/newline.
+pub const TextNode = struct {
+    text: []const u8,
+    line: u32,
+    col: u32,
+};
+
 pub const Node = union(enum) {
     element: Element,
-    text: []const u8,
+    text: TextNode,
 };
 
 pub const ParseError = struct {
@@ -232,13 +261,14 @@ pub const Parser = struct {
         }
 
         try self.expectByte('>');
-        const children = try self.parseChildren(tag);
+        const closed = try self.parseChildren(tag);
         return .{ .element = .{
             .tag = tag,
             .attrs = try attrs.toOwnedSlice(self.allocator),
-            .children = children,
+            .children = closed.children,
             .line = start_line,
             .col = start_col,
+            .close = .{ .line = closed.close_line, .col = closed.close_col },
         } };
     }
 
@@ -319,9 +349,9 @@ pub const Parser = struct {
     /// Stylesheet.zig's `parseBraced` uses for its own one-token
     /// lookahead) and returns `null` so the caller can fall back to
     /// opaque-expression scanning of the identical span.
-    fn tryParseStylesList(self: *Parser) error{OutOfMemory}!?[][]const u8 {
+    fn tryParseStylesList(self: *Parser) error{OutOfMemory}!?[]StyleRef {
         const snapshot = self.*;
-        var names: std.ArrayList([]const u8) = .empty;
+        var names: std.ArrayList(StyleRef) = .empty;
         defer names.deinit(self.allocator);
 
         while (true) {
@@ -334,13 +364,15 @@ pub const Parser = struct {
                 self.* = snapshot;
                 return null;
             }
+            const name_line = self.line;
+            const name_col = self.col;
             const start = self.pos;
             self.advance();
             while (self.peek()) |c| {
                 if (!isTokenIdentCont(c)) break;
                 self.advance();
             }
-            names.append(self.allocator, self.src[start..self.pos]) catch |err| {
+            names.append(self.allocator, .{ .name = self.src[start..self.pos], .line = name_line, .col = name_col }) catch |err| {
                 self.* = snapshot;
                 return err;
             };
@@ -458,7 +490,7 @@ pub const Parser = struct {
         return self.fail(line, col, "unterminated rune literal", .{});
     }
 
-    fn parseChildren(self: *Parser, open_tag: []const u8) error{ ParseError, OutOfMemory }![]Node {
+    fn parseChildren(self: *Parser, open_tag: []const u8) error{ ParseError, OutOfMemory }!struct { children: []Node, close_line: u32, close_col: u32 } {
         var children: std.ArrayList(Node) = .empty;
         errdefer children.deinit(self.allocator);
 
@@ -476,7 +508,7 @@ pub const Parser = struct {
                 }
                 self.skipWhitespace();
                 try self.expectByte('>');
-                return children.toOwnedSlice(self.allocator);
+                return .{ .children = try children.toOwnedSlice(self.allocator), .close_line = close_line, .close_col = close_col };
             }
 
             if (self.peek() == '<' and self.peekAt(1) != null and isIdentStart(self.peekAt(1).?)) {
@@ -485,12 +517,33 @@ pub const Parser = struct {
             }
 
             const text_start = self.pos;
+            const text_start_line = self.line;
+            const text_start_col = self.col;
             while (self.peek()) |b| {
                 if (b == '<') break;
                 self.advance();
             }
-            const trimmed = std.mem.trim(u8, self.src[text_start..self.pos], " \t\r\n");
-            if (trimmed.len > 0) try children.append(self.allocator, .{ .text = trimmed });
+            const raw = self.src[text_start..self.pos];
+            const after_leading = std.mem.trimStart(u8, raw, " \t\r\n");
+            const trimmed = std.mem.trimEnd(u8, after_leading, " \t\r\n");
+            if (trimmed.len > 0) {
+                // Advance a local (line, col) tracker past whatever leading
+                // whitespace/newlines were trimmed off, so the recorded
+                // position marks the start of `trimmed` itself, not
+                // `text_start` (which may sit on an earlier line, e.g. the
+                // newline right after a tag's own `>`).
+                var line = text_start_line;
+                var col = text_start_col;
+                for (raw[0 .. raw.len - after_leading.len]) |b| {
+                    if (b == '\n') {
+                        line += 1;
+                        col = 1;
+                    } else {
+                        col += 1;
+                    }
+                }
+                try children.append(self.allocator, .{ .text = .{ .text = trimmed, .line = line, .col = col } });
+            }
         }
     }
 };
@@ -542,18 +595,18 @@ test "parses nested tags, ref, styles, and text children (the confirmed design d
     const label1 = container.children[0].element;
     try std.testing.expectEqualStrings("Label", label1.tag);
     try std.testing.expectEqual(@as(usize, 1), label1.children.len);
-    try std.testing.expectEqualStrings("Save your profile", label1.children[0].text);
-    try std.testing.expectEqualStrings("form-title", label1.attrs[0].value.styles[0]);
+    try std.testing.expectEqualStrings("Save your profile", label1.children[0].text.text);
+    try std.testing.expectEqualStrings("form-title", label1.attrs[0].value.styles[0].name);
 
     const text_field = container.children[1].element;
     try std.testing.expectEqualStrings("nameField", text_field.attrs[0].value.ref);
-    try std.testing.expectEqualStrings("input", text_field.attrs[1].value.styles[0]);
+    try std.testing.expectEqualStrings("input", text_field.attrs[1].value.styles[0].name);
     try std.testing.expectEqualStrings("Your name", text_field.attrs[2].value.string_literal);
 
     const button = container.children[2].element;
     try std.testing.expectEqual(@as(usize, 1), button.children.len);
-    try std.testing.expectEqualStrings("Save", button.children[0].text);
-    try std.testing.expectEqualStrings("primary-button", button.attrs[0].value.styles[0]);
+    try std.testing.expectEqualStrings("Save", button.children[0].text.text);
+    try std.testing.expectEqualStrings("primary-button", button.attrs[0].value.styles[0].name);
     try std.testing.expectEqualStrings("handleSave", button.attrs[1].value.expr);
 
     const label2 = container.children[3].element;
@@ -568,8 +621,8 @@ test "styles={a, b} parses multiple bare token names" {
     const node = try parser.parseTopLevel();
     const styles = node.element.attrs[0].value.styles;
     try std.testing.expectEqual(@as(usize, 2), styles.len);
-    try std.testing.expectEqualStrings("card-header", styles[0]);
-    try std.testing.expectEqualStrings("elevated", styles[1]);
+    try std.testing.expectEqualStrings("card-header", styles[0].name);
+    try std.testing.expectEqualStrings("elevated", styles[1].name);
 }
 
 test "styles={...} falls back to an opaque expression when it isn't a bare identifier list" {

@@ -44,7 +44,7 @@ test "ntxToGenerated: empty map always misses" {
 
 test "ntxToGenerated: exact line/col match hits, anything else misses" {
     const map = [_]Codegen.SourceMapping{
-        .{ .ntx_line = 3, .ntx_col = 20, .gen_start = 10, .gen_end = 20 },
+        .{ .ntx_line = 3, .ntx_col = 20, .gen_start = 10, .gen_end = 20, .kind = .event_handler },
     };
     const hit = ntxToGenerated(&map, 3, 20).?;
     try std.testing.expectEqual(@as(usize, 10), hit.start);
@@ -60,7 +60,7 @@ test "generatedToNtx: empty map always misses" {
 
 test "generatedToNtx: an offset inside the range hits, the exclusive end and anything outside misses" {
     const map = [_]Codegen.SourceMapping{
-        .{ .ntx_line = 3, .ntx_col = 20, .gen_start = 10, .gen_end = 20 },
+        .{ .ntx_line = 3, .ntx_col = 20, .gen_start = 10, .gen_end = 20, .kind = .event_handler },
     };
     const hit = generatedToNtx(&map, 15).?;
     try std.testing.expectEqual(@as(u32, 3), hit.line);
@@ -75,8 +75,8 @@ test "generatedToNtx: an offset inside the range hits, the exclusive end and any
 
 test "generatedToNtx: an offset between two entries resolves to the containing one, not its neighbor" {
     const map = [_]Codegen.SourceMapping{
-        .{ .ntx_line = 3, .ntx_col = 20, .gen_start = 10, .gen_end = 20 },
-        .{ .ntx_line = 5, .ntx_col = 8, .gen_start = 30, .gen_end = 40 },
+        .{ .ntx_line = 3, .ntx_col = 20, .gen_start = 10, .gen_end = 20, .kind = .event_handler },
+        .{ .ntx_line = 5, .ntx_col = 8, .gen_start = 30, .gen_end = 40, .kind = .event_handler },
     };
     try std.testing.expect(generatedToNtx(&map, 25) == null);
     const second = generatedToNtx(&map, 35).?;

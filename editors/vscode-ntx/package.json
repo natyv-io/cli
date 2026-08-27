@@ -19,6 +19,13 @@
         "configuration": "./language-configuration.json"
       }
     ],
+    "grammars": [
+      {
+        "language": "ntx",
+        "scopeName": "source.ntx",
+        "path": "./syntaxes/ntx.tmLanguage.json"
+      }
+    ],
     "configuration": {
       "title": "natyv .ntx",
       "properties": {

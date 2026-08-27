@@ -12,7 +12,7 @@
 //! `std.Io.Reader`/`Writer` loop.
 
 const std = @import("std");
-const Server = @import("Server.zig");
+const ServerModule = @import("Server.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -29,5 +29,14 @@ pub fn main(init: std.process.Init) !void {
     var reader = stdin_file.reader(io, &read_buf);
     var writer = stdout_file.writer(io, &write_buf);
 
-    try Server.run(gpa, &reader.interface, &writer.interface);
+    // Real per-connection state as of Stage 3 (open documents' own text,
+    // needed to answer a `textDocument/semanticTokens/full` request,
+    // which per the real LSP spec carries only a URI). Explicitly
+    // deinited even though the process exits right after -- confirmed via
+    // a real end-to-end smoke test against the compiled binary that
+    // skipping this trips the debug allocator's real leak detector on
+    // every open document, not just a theoretical concern.
+    var server: ServerModule.Server = .{};
+    defer server.deinit(gpa);
+    try server.run(gpa, &reader.interface, &writer.interface);
 }

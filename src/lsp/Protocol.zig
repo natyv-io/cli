@@ -27,15 +27,33 @@ pub const ResponseError = struct {
     message: []const u8,
 };
 
+/// Real legend for `textDocumentSync = 1`'s sibling capability below --
+/// order must match `Codegen.SemanticTokenType`'s own declaration order
+/// exactly (`SemanticTokens.compute` encodes `@intFromEnum` directly as
+/// the wire index, no separate lookup table), hardcoded here rather than
+/// imported from `SemanticTokens.zig` to keep this file dependency-free
+/// (only `std`) the way it's been since Stage 1.
+pub const SemanticTokensLegend = struct {
+    tokenTypes: []const []const u8 = &.{ "type", "property", "string" },
+    tokenModifiers: []const []const u8 = &.{},
+};
+
+pub const SemanticTokensOptions = struct {
+    legend: SemanticTokensLegend = .{},
+    full: bool = true,
+};
+
 /// `textDocumentSync = 1` (Full) as of Stage 2 -- real diagnostics need
 /// the client to send the document's current full text on every change,
 /// which `TextDocumentSyncKind.Full` (value `1`) is what asks for.
-/// `hoverProvider`/`definitionProvider`/etc. get added as fields here only
-/// once each corresponding stage actually lands (Stage 4) -- advertising a
+/// `semanticTokensProvider` as of Stage 3. `hoverProvider`/
+/// `definitionProvider`/etc. get added as fields here only once each
+/// corresponding stage actually lands (Stage 5) -- advertising a
 /// capability before the handler exists would be a real client-visible
 /// lie, not just premature.
 pub const ServerCapabilities = struct {
     textDocumentSync: u32 = 1,
+    semanticTokensProvider: SemanticTokensOptions = .{},
 };
 
 pub const InitializeResult = struct {
