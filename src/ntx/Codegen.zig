@@ -152,6 +152,14 @@ pub const Output = struct {
     logic: []const u8,
     source_map: []const SourceMapping,
     semantic_tokens: []const SemanticToken,
+    /// `.ntx` LSP Stage 7 (~/.claude/plans/lexical-wishing-penguin.md):
+    /// the exact edit list `applyEdits` used to splice `src` into `logic`,
+    /// sorted by `start` (the same sort `applyEdits` already performs on
+    /// this identical backing slice) -- needed by `PositionMap.logicToNtx`/
+    /// `ntxToLogic` to map a position between the original `.ntx` source
+    /// and the real, on-disk logic file (where hand-written code like an
+    /// `onClick` handler's own body actually lives, untouched by codegen).
+    edits: []const Edit,
 };
 
 /// The real LSP semantic-token types this server advertises (a small
@@ -1065,7 +1073,7 @@ fn translatePosition(body_line: u32, body_col: u32, rel_line: u32, rel_col: u32)
     return .{ .line = body_line + rel_line - 1, .col = rel_col };
 }
 
-const Edit = struct {
+pub const Edit = struct {
     start: usize,
     end: usize,
     replacement: []const u8,
@@ -1283,7 +1291,7 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
         m.gen_end += header_len;
     }
 
-    return .{ .output = .{ .generated = try generated.toOwnedSlice(allocator), .logic = logic, .source_map = try mappings.toOwnedSlice(allocator), .semantic_tokens = try semantic_tokens.toOwnedSlice(allocator) }, .err = null };
+    return .{ .output = .{ .generated = try generated.toOwnedSlice(allocator), .logic = logic, .source_map = try mappings.toOwnedSlice(allocator), .semantic_tokens = try semantic_tokens.toOwnedSlice(allocator), .edits = try edits.toOwnedSlice(allocator) }, .err = null };
 }
 
 test "generates a builder function and a spliced logic file for a single flat composer" {

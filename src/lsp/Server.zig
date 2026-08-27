@@ -165,6 +165,12 @@ pub const Server = struct {
         if (std.mem.eql(u8, method, "textDocument/hover")) {
             return .{ .response = try self.handleHover(gpa, io, id, obj.get("params") orelse .null) };
         }
+        if (std.mem.eql(u8, method, "textDocument/definition")) {
+            return .{ .response = try self.handleDefinition(gpa, io, id, obj.get("params") orelse .null) };
+        }
+        if (std.mem.eql(u8, method, "textDocument/completion")) {
+            return .{ .response = try self.handleCompletion(gpa, io, id, obj.get("params") orelse .null) };
+        }
 
         if (!is_request) return .{}; // unknown notification: ignore per spec
         return .{ .response = try encodeError(gpa, id, .method_not_found, "method not found") };
@@ -226,63 +232,241 @@ pub const Server = struct {
     /// this position) degrades to a real `null` hover result, never a
     /// JSON-RPC error -- exactly what a real editor expects when there's
     /// simply nothing to show at a given position.
-    fn handleHover(self: *Server, gpa: std.mem.Allocator, io: Io, id: std.json.Value, params: std.json.Value) ![]u8 {
-        const uri = textDocumentField(params, "uri") orelse return try encodeNullResult(gpa, id);
-        const pos = parsePositionParam(params) orelse return try encodeNullResult(gpa, id);
-        const text = self.documents.get(uri) orelse return try encodeNullResult(gpa, id);
+    /// The real setup shared by every gopls-proxying request handler
+    /// (`handleHover`, `handleDefinition`, `handleCompletion`): retranspile
+    /// the document fresh (matching `Diagnostics.zig`/`SemanticTokens.zig`'s
+    /// own pattern), forward-map the request's `.ntx` position into the
+    /// generated document's own terms, and get-or-spawn the real `gopls`
+    /// client for that document's module, syncing the virtual document
+    /// against it. `null` covers every real "nothing to do" case uniformly
+    /// (document not open, doesn't currently transpile, no `SourceMapping`
+    /// at that exact position, `gopls` missing from `PATH`) -- callers
+    /// don't need to distinguish which, since every one of them degrades to
+    /// the same "no real answer" response regardless of the specific cause.
+    /// `arena` must outlive the caller's own use of `.generated`/
+    /// `.source_map`/`.generated_uri` -- typically the caller's whole
+    /// handler-scoped arena, not a narrower one.
+    const PreparedRequest = struct {
+        /// The real, current `.ntx` document text (`self.documents.get(uri)`
+        /// at request time) -- needed by `handleDefinition`'s own
+        /// Stage 7 logic-file redirect to convert a real `.ntx`-side byte
+        /// offset (from `PositionMap.logicToNtx`) back into a real
+        /// `{line, character}` LSP position.
+        ntx_text: []const u8,
+        generated: []const u8,
+        source_map: []const Codegen.SourceMapping,
+        /// `.ntx` LSP Stage 7: the real logic-file text and its own edit
+        /// list, mapping the original `.ntx` source to `logic_uri`'s real
+        /// content -- needed by `handleDefinition` to redirect a location
+        /// landing in the logic file back to the real `.ntx` position it
+        /// actually corresponds to.
+        logic: []const u8,
+        edits: []const Codegen.Edit,
+        client: *GoplsClient,
+        generated_uri: []const u8,
+        /// `.ntx` LSP Stage 7: the real logic-file URI (`<stem>.go`) --
+        /// kept in sync with the user's *live* `.ntx` edits the same way
+        /// `generated_uri` is, so `gopls`'s own view of hand-written logic
+        /// code (an `onClick` handler's body, its doc comment, etc.)
+        /// never lags behind what's actually on screen.
+        logic_uri: []const u8,
+        gen_line: u32,
+        gen_character: u32,
+        mapped_ntx_col: u32,
+        mapped_ntx_len: u32,
+    };
 
-        var arena_state = std.heap.ArenaAllocator.init(gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
+    fn prepareGoplsRequest(self: *Server, gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, uri: []const u8, line: u32, character: u32) !?PreparedRequest {
+        const text = self.documents.get(uri) orelse return null;
 
-        const found = Expose.findComposers(arena, text) catch return try encodeNullResult(gpa, id);
-        if (found.err != null) return try encodeNullResult(gpa, id);
-        const transpiled = Codegen.generateGo(arena, "main", text, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{}) catch return try encodeNullResult(gpa, id);
-        if (transpiled.err != null) return try encodeNullResult(gpa, id);
+        const found = Expose.findComposers(arena, text) catch return null;
+        if (found.err != null) return null;
+        const transpiled = Codegen.generateGo(arena, "main", text, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{}) catch return null;
+        if (transpiled.err != null) return null;
         const output = transpiled.output.?;
 
         // LSP positions are 0-based; every `Parser`/`Codegen` position is
         // 1-based -- the same `+1` `publishDiagnosticsFor` applies in the
         // opposite direction.
-        const ntx_line = pos.line + 1;
-        const ntx_col = pos.character + 1;
-        const mapped = PositionMap.ntxToGenerated(output.source_map, ntx_line, ntx_col) orelse return try encodeNullResult(gpa, id);
+        const ntx_line = line + 1;
+        const ntx_col = character + 1;
+        const mapped = PositionMap.ntxToGenerated(output.source_map, ntx_line, ntx_col) orelse return null;
         const gen_pos = PositionMap.offsetToPosition(output.generated, mapped.start);
 
-        const ntx_path = GoplsClientModule.uriToPath(uri) orelse return try encodeNullResult(gpa, id);
-        const ntx_dir = std.fs.path.dirname(ntx_path) orelse return try encodeNullResult(gpa, id);
-        const module_root = GoplsClientModule.findModuleRoot(gpa, io, ntx_dir) catch return try encodeNullResult(gpa, id);
+        const ntx_path = GoplsClientModule.uriToPath(uri) orelse return null;
+        const ntx_dir = std.fs.path.dirname(ntx_path) orelse return null;
+        const module_root = GoplsClientModule.findModuleRoot(gpa, io, ntx_dir) catch return null;
         defer gpa.free(module_root);
 
-        const client = self.getOrSpawnGoplsClient(gpa, io, module_root) catch return try encodeNullResult(gpa, id);
-        const generated_uri = (GoplsClientModule.derivedGeneratedUri(gpa, uri) catch return try encodeNullResult(gpa, id)) orelse return try encodeNullResult(gpa, id);
-        defer gpa.free(generated_uri);
+        const client = self.getOrSpawnGoplsClient(gpa, io, module_root) catch return null;
+        // Allocated via `arena`, not `gpa` -- lives exactly as long as the
+        // caller's own arena, no separate free needed.
+        const generated_uri = (GoplsClientModule.derivedGeneratedUri(arena, uri) catch return null) orelse return null;
+        const logic_uri = (GoplsClientModule.derivedLogicUri(arena, uri) catch return null) orelse return null;
 
-        client.syncDocument(gpa, generated_uri, output.generated) catch return try encodeNullResult(gpa, id);
-        const hover_result = client.hover(gpa, arena, generated_uri, gen_pos.line, gen_pos.character) catch return try encodeNullResult(gpa, id);
+        client.syncDocument(gpa, generated_uri, output.generated) catch return null;
+        // Real, necessary companion sync (Stage 7): without this, `gopls`
+        // only ever sees whatever `natyv prepare` last wrote to the real
+        // on-disk logic file -- a live-edited doc comment or handler body
+        // inside the `.ntx` file itself would never show up in hover, and
+        // a stale definition target could point at now-wrong content.
+        client.syncDocument(gpa, logic_uri, output.logic) catch return null;
+
+        return .{
+            .ntx_text = text,
+            .generated = output.generated,
+            .source_map = output.source_map,
+            .logic = output.logic,
+            .edits = output.edits,
+            .client = client,
+            .generated_uri = generated_uri,
+            .logic_uri = logic_uri,
+            .gen_line = gen_pos.line,
+            .gen_character = gen_pos.character,
+            .mapped_ntx_col = mapped.ntx_col,
+            .mapped_ntx_len = mapped.ntx_len,
+        };
+    }
+
+    fn handleHover(self: *Server, gpa: std.mem.Allocator, io: Io, id: std.json.Value, params: std.json.Value) ![]u8 {
+        const uri = textDocumentField(params, "uri") orelse return try encodeNullResult(gpa, id);
+        const pos = parsePositionParam(params) orelse return try encodeNullResult(gpa, id);
+
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const prep = (self.prepareGoplsRequest(gpa, io, arena, uri, pos.line, pos.character) catch null) orelse return try encodeNullResult(gpa, id);
+        const hover_result = prep.client.hover(gpa, arena, prep.generated_uri, prep.gen_line, prep.gen_character) catch return try encodeNullResult(gpa, id);
         const h = hover_result orelse return try encodeNullResult(gpa, id);
 
         // The real `.ntx`-side span of the hovered token is already fully
-        // known from the mapping itself (`mapped.ntx_col`/`mapped.ntx_len`)
-        // -- deliberately *not* derived from `mapped.end - mapped.start`
-        // (the generated-side span), which is a real, different length for
-        // a `.string_literal`/`.style_token`/`.child_text` mapping: that
-        // span includes the wrapping Go string quotes `writeGoStringLiteral`
-        // adds, which the `.ntx`-side token never has. This is also
-        // simpler and more correct than trying to reverse-map `gopls`'s
-        // own returned range through `generatedToNtx` -- a real bug found
-        // via this stage's own end-to-end smoke test: `generatedToNtx`
-        // only ever resolves to a matching mapping's fixed *start*
-        // position for any offset inside its span (that's what it's for --
-        // "which token contains this offset," not "where exactly inside
-        // this token"), so reverse-mapping a multi-byte range's *end* that
-        // way collapsed it down to the same single-character span as the
-        // start every time.
+        // known from the mapping itself (`prep.mapped_ntx_col`/`ntx_len`)
+        // -- deliberately *not* derived from `gopls`'s own returned range,
+        // for two independent reasons found the hard way: (1) a
+        // `.string_literal`/`.style_token`/`.child_text` mapping's
+        // generated-side span includes the wrapping Go string quotes
+        // `writeGoStringLiteral` adds, which the `.ntx`-side token never
+        // has; (2) `PositionMap.generatedToNtx` only ever resolves to a
+        // matching mapping's fixed *start* position for any offset inside
+        // its span (that's what it's for -- "which token contains this
+        // offset," not "where exactly inside this token"), so reverse-
+        // mapping a multi-byte range's *end* through it collapses to the
+        // same single-character span as the start every time -- a real bug
+        // caught by this stage's own end-to-end smoke test.
         const ntx_range = Protocol.Range{
-            .start = .{ .line = ntx_line - 1, .character = mapped.ntx_col - 1 },
-            .end = .{ .line = ntx_line - 1, .character = mapped.ntx_col - 1 + mapped.ntx_len },
+            .start = .{ .line = pos.line, .character = prep.mapped_ntx_col - 1 },
+            .end = .{ .line = pos.line, .character = prep.mapped_ntx_col - 1 + prep.mapped_ntx_len },
         };
         return try encodeResult(gpa, Protocol.Hover, id, .{ .contents = .{ .value = h.contents_markdown }, .range = ntx_range });
+    }
+
+    /// `.ntx` LSP Stage 6: real `gopls`-backed go-to-definition, enabling a
+    /// real editor's cmd/ctrl-click. The common real case needs *no*
+    /// `.ntx`-side remapping at all: `handleSave`'s own definition is a
+    /// real position in the real, unrelated, on-disk `form.go` file, not
+    /// the virtual generated document -- confirmed via a live protocol
+    /// probe against `gopls` before writing this. Only a location that
+    /// happens to point back into the virtual document itself gets mapped
+    /// back to a real `.ntx` position, via `generatedToNtx` -- a real,
+    /// honest degrade to a zero-width range there (unlike hover's own
+    /// exact-span answer), since `generatedToNtx` only ever resolves a
+    /// mapping's fixed start position, not an arbitrary interior one, and
+    /// this path is a genuine edge case (a composer body's own generated
+    /// boilerplate has nothing meaningful to jump to inside itself).
+    fn handleDefinition(self: *Server, gpa: std.mem.Allocator, io: Io, id: std.json.Value, params: std.json.Value) ![]u8 {
+        const uri = textDocumentField(params, "uri") orelse return try encodeResult(gpa, []const Protocol.Location, id, &.{});
+        const pos = parsePositionParam(params) orelse return try encodeResult(gpa, []const Protocol.Location, id, &.{});
+
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const prep = (self.prepareGoplsRequest(gpa, io, arena, uri, pos.line, pos.character) catch null) orelse return try encodeResult(gpa, []const Protocol.Location, id, &.{});
+        const locations = prep.client.definition(gpa, arena, prep.generated_uri, prep.gen_line, prep.gen_character) catch return try encodeResult(gpa, []const Protocol.Location, id, &.{});
+
+        var results: std.ArrayList(Protocol.Location) = .empty;
+        for (locations) |loc| {
+            if (std.mem.eql(u8, loc.uri, prep.generated_uri)) {
+                const offset = PositionMap.positionToOffset(prep.generated, loc.range.start.line, loc.range.start.character);
+                const ntx_pos = PositionMap.generatedToNtx(prep.source_map, offset) orelse continue;
+                try results.append(arena, .{
+                    .uri = uri,
+                    .range = .{
+                        .start = .{ .line = ntx_pos.line - 1, .character = ntx_pos.col - 1 },
+                        .end = .{ .line = ntx_pos.line - 1, .character = ntx_pos.col - 1 },
+                    },
+                });
+                continue;
+            }
+            // `.ntx` LSP Stage 7: a location pointing into the real logic
+            // file (e.g. `handleSave`'s own declaration) gets redirected
+            // back to the original `.ntx` file instead of forwarded as-is
+            // -- the whole point of the two-file split being an
+            // implementation detail invisible to the user, who only ever
+            // authors the one `.ntx` file. `logicToNtx` (unlike
+            // `generatedToNtx`) does real per-offset arithmetic rather
+            // than a discrete-token lookup, so both the start *and* end
+            // of the real range convert accurately -- a real, non-zero-
+            // width span, not the degraded zero-width fallback the
+            // generated-document case above needs.
+            if (std.mem.eql(u8, loc.uri, prep.logic_uri)) {
+                const start_offset = PositionMap.positionToOffset(prep.logic, loc.range.start.line, loc.range.start.character);
+                const end_offset = PositionMap.positionToOffset(prep.logic, loc.range.end.line, loc.range.end.character);
+                const ntx_start = PositionMap.logicToNtx(prep.edits, start_offset) orelse continue;
+                const ntx_end = PositionMap.logicToNtx(prep.edits, end_offset) orelse continue;
+                const start_pos = PositionMap.offsetToPosition(prep.ntx_text, ntx_start);
+                const end_pos = PositionMap.offsetToPosition(prep.ntx_text, ntx_end);
+                try results.append(arena, .{
+                    .uri = uri,
+                    .range = .{
+                        .start = .{ .line = start_pos.line, .character = start_pos.character },
+                        .end = .{ .line = end_pos.line, .character = end_pos.character },
+                    },
+                });
+                continue;
+            }
+            try results.append(arena, .{
+                .uri = loc.uri,
+                .range = .{
+                    .start = .{ .line = loc.range.start.line, .character = loc.range.start.character },
+                    .end = .{ .line = loc.range.end.line, .character = loc.range.end.character },
+                },
+            });
+        }
+        return try encodeResult(gpa, []const Protocol.Location, id, results.items);
+    }
+
+    /// `.ntx` LSP Stage 6: real `gopls`-backed autocomplete. Unlike hover/
+    /// definition, a completion response needs *no* `.ntx`-side position
+    /// remapping at all -- the editor inserts a chosen item's own
+    /// `insertText`/`label` directly at the user's real cursor position in
+    /// the real `.ntx` document, with no coordinates involved. Works
+    /// through the exact same virtual-document mechanism as hover/
+    /// definition, and for the same reason it's viable at all: this
+    /// server's own `.ntx` grammar treats a `{...}` attribute value as
+    /// fully opaque text (`Parser.zig`'s `scanUntilMatchingBrace`), so a
+    /// still-being-typed, syntactically "incomplete" identifier like
+    /// `onClick={handle}` parses at the `.ntx` level exactly as cleanly as
+    /// a finished one -- confirmed live via a protocol probe against real
+    /// `gopls` before writing this, simulating that exact mid-typing shape
+    /// against this repo's own `examples/ntx-form/guest` fixture.
+    fn handleCompletion(self: *Server, gpa: std.mem.Allocator, io: Io, id: std.json.Value, params: std.json.Value) ![]u8 {
+        const uri = textDocumentField(params, "uri") orelse return try encodeResult(gpa, []const Protocol.CompletionItem, id, &.{});
+        const pos = parsePositionParam(params) orelse return try encodeResult(gpa, []const Protocol.CompletionItem, id, &.{});
+
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const prep = (self.prepareGoplsRequest(gpa, io, arena, uri, pos.line, pos.character) catch null) orelse return try encodeResult(gpa, []const Protocol.CompletionItem, id, &.{});
+        const items = prep.client.completion(gpa, arena, prep.generated_uri, prep.gen_line, prep.gen_character) catch return try encodeResult(gpa, []const Protocol.CompletionItem, id, &.{});
+
+        var results: std.ArrayList(Protocol.CompletionItem) = .empty;
+        for (items) |item| {
+            try results.append(arena, .{ .label = item.label, .kind = item.kind, .detail = item.detail, .insertText = item.insertText });
+        }
+        return try encodeResult(gpa, []const Protocol.CompletionItem, id, results.items);
     }
 
     /// Stores (or replaces) `uri`'s current text -- both `uri` and `text`
@@ -430,7 +614,7 @@ test "handleMessage: initialize returns a real result advertising full document 
     defer server.deinit(std.testing.allocator, std.testing.io);
     const result = try server.handleMessage(std.testing.allocator, std.testing.io, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
     defer std.testing.allocator.free(result.response.?);
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true},\"hoverProvider\":true}}}", result.response.?);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\",\"&\"]}}}}", result.response.?);
     try std.testing.expect(!result.should_exit);
 }
 
@@ -439,7 +623,7 @@ test "handleMessage: initialize echoes back a real string id, not just a number 
     defer server.deinit(std.testing.allocator, std.testing.io);
     const result = try server.handleMessage(std.testing.allocator, std.testing.io, "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"method\":\"initialize\",\"params\":{}}");
     defer std.testing.allocator.free(result.response.?);
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true},\"hoverProvider\":true}}}", result.response.?);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\",\"&\"]}}}}", result.response.?);
 }
 
 test "handleMessage: initialized notification produces no response and doesn't exit" {
@@ -469,10 +653,10 @@ test "handleMessage: exit notification produces no response but does signal shou
 test "handleMessage: an unknown request method gets a real MethodNotFound error, not silence" {
     var server: Server = .{};
     defer server.deinit(std.testing.allocator, std.testing.io);
-    // `textDocument/definition` -- still genuinely unimplemented as of
-    // Stage 5 (`textDocument/hover` is implemented now, so it can no
-    // longer stand in as "an unknown method" the way it used to).
-    const result = try server.handleMessage(std.testing.allocator, std.testing.io, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/definition\",\"params\":{}}");
+    // `textDocument/references` -- still genuinely unimplemented (hover,
+    // definition, and completion are all implemented now, so none of them
+    // can stand in as "an unknown method" the way one of them used to).
+    const result = try server.handleMessage(std.testing.allocator, std.testing.io, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/references\",\"params\":{}}");
     defer std.testing.allocator.free(result.response.?);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32601,\"message\":\"method not found\"}}", result.response.?);
 }
@@ -522,7 +706,7 @@ test "run: a real initialize/initialized/shutdown/exit sequence produces exactly
     var out_reader = std.Io.Reader.fixed(output);
     const first = try Transport.readMessage(&out_reader, gpa);
     defer gpa.free(first);
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true},\"hoverProvider\":true}}}", first);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\",\"&\"]}}}}", first);
     const second = try Transport.readMessage(&out_reader, gpa);
     defer gpa.free(second);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}", second);
@@ -594,6 +778,23 @@ fn encodeSemanticTokensFull(gpa: std.mem.Allocator, id: i64, uri: []const u8) ![
         params: struct { textDocument: struct { uri: []const u8 } },
     };
     return std.json.Stringify.valueAlloc(gpa, Msg{ .id = id, .params = .{ .textDocument = .{ .uri = uri } } }, .{});
+}
+
+fn encodePositionRequest(gpa: std.mem.Allocator, id: i64, method: []const u8, uri: []const u8, line: u32, character: u32) ![]u8 {
+    const Msg = struct {
+        jsonrpc: []const u8 = "2.0",
+        id: i64,
+        method: []const u8,
+        params: struct {
+            textDocument: struct { uri: []const u8 },
+            position: struct { line: u32, character: u32 },
+        },
+    };
+    return std.json.Stringify.valueAlloc(gpa, Msg{
+        .id = id,
+        .method = method,
+        .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } },
+    }, .{});
 }
 
 test "handleMessage: didOpen with a clean .ntx document publishes empty diagnostics" {
@@ -706,4 +907,172 @@ test "handleMessage: semanticTokens/full on a real open document returns real de
     try std.testing.expectEqual(@as(usize, 10), data.items.len);
     try std.testing.expectEqual(@as(i64, 0), data.items[3].integer); // tokenType index for .type
     try std.testing.expectEqual(@as(i64, 0), data.items[8].integer); // tokenType index for .type (closing tag)
+}
+
+// Real, live integration tests against the real, checked-in
+// `examples/ntx-form/guest` fixture -- unlike every test above, these
+// exercise `handleHover`/`handleDefinition`'s *entire* real path
+// end-to-end through `Server.handleMessage` itself (URI-to-filesystem-path
+// derivation, real `go.mod` discovery, spawning a real `gopls`), not just
+// `GoplsClient.zig`'s own narrower client-level tests. Requires a real
+// `gopls` on `PATH`, matching this project's established stance that the
+// dev environment has the tools it needs (`Validate.zig`'s own `go list`
+// tests, `Compile.zig`'s real `tinygo` spawns).
+const ntx_form_guest_dir = "examples/ntx-form/guest";
+
+fn realNtxFormUri(io: Io, gpa: std.mem.Allocator) ![]u8 {
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+    const abs_path = try std.fs.path.join(gpa, &.{ cwd_path, ntx_form_guest_dir, "form.go.ntx" });
+    defer gpa.free(abs_path);
+    return std.fmt.allocPrint(gpa, "file://{s}", .{abs_path});
+}
+
+test "handleMessage: a real textDocument/hover against the real ntx-form fixture returns real gopls info" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const uri = try realNtxFormUri(io, gpa);
+    defer gpa.free(uri);
+
+    var dir = try Io.Dir.cwd().openDir(io, ntx_form_guest_dir, .{});
+    defer dir.close(io);
+    const content = try dir.readFileAlloc(io, "form.go.ntx", gpa, .unlimited);
+    defer gpa.free(content);
+
+    var server: Server = .{};
+    defer server.deinit(gpa, io);
+
+    const open_body = try encodeDidOpen(gpa, uri, content);
+    defer gpa.free(open_body);
+    const open_result = try server.handleMessage(gpa, io, open_body);
+    gpa.free(open_result.notification.?);
+
+    // Real position of "handleSave" inside "onClick={handleSave}"
+    // specifically (not its own `func handleSave() error` declaration,
+    // which also appears in this real file) -- and mid-word (`+3`), the
+    // same real case Stage 5's own click-through caught a bug on.
+    const marker = "onClick={handleSave}";
+    const marker_idx = std.mem.indexOf(u8, content, marker).?;
+    const handle_idx = marker_idx + std.mem.indexOf(u8, marker, "handleSave").?;
+    const pos = Codegen.PositionMap.offsetToPosition(content, handle_idx + 3);
+
+    const hover_body = try encodePositionRequest(gpa, 2, "textDocument/hover", uri, pos.line, pos.character);
+    defer gpa.free(hover_body);
+    const result = try server.handleMessage(gpa, io, hover_body);
+    defer gpa.free(result.response.?);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, result.response.?, .{});
+    defer parsed.deinit();
+    const contents = parsed.value.object.get("result").?.object.get("contents").?.object;
+    try std.testing.expect(std.mem.indexOf(u8, contents.get("value").?.string, "func handleSave() error") != null);
+}
+
+test "handleMessage: a real textDocument/definition against the real ntx-form fixture redirects the real form.go location back into the original .ntx file" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const uri = try realNtxFormUri(io, gpa);
+    defer gpa.free(uri);
+
+    var dir = try Io.Dir.cwd().openDir(io, ntx_form_guest_dir, .{});
+    defer dir.close(io);
+    const content = try dir.readFileAlloc(io, "form.go.ntx", gpa, .unlimited);
+    defer gpa.free(content);
+
+    var server: Server = .{};
+    defer server.deinit(gpa, io);
+
+    const open_body = try encodeDidOpen(gpa, uri, content);
+    defer gpa.free(open_body);
+    const open_result = try server.handleMessage(gpa, io, open_body);
+    gpa.free(open_result.notification.?);
+
+    const marker = "onClick={handleSave}";
+    const marker_idx = std.mem.indexOf(u8, content, marker).?;
+    const handle_idx = marker_idx + std.mem.indexOf(u8, marker, "handleSave").?;
+    const pos = Codegen.PositionMap.offsetToPosition(content, handle_idx + 3);
+
+    const def_body = try encodePositionRequest(gpa, 2, "textDocument/definition", uri, pos.line, pos.character);
+    defer gpa.free(def_body);
+    const result = try server.handleMessage(gpa, io, def_body);
+    defer gpa.free(result.response.?);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, result.response.?, .{});
+    defer parsed.deinit();
+    const locations = parsed.value.object.get("result").?.array;
+    try std.testing.expectEqual(@as(usize, 1), locations.items.len);
+    const loc = locations.items[0].object;
+    // `.ntx` LSP Stage 7: `gopls` itself resolves `handleSave`'s
+    // definition to the real, on-disk `form.go` -- but the user only ever
+    // authors `form.go.ntx`, so `handleDefinition` redirects it back to
+    // that real file instead of forwarding `form.go` as-is (the two-file
+    // split is an implementation detail, not something the user should
+    // ever need to know about).
+    try std.testing.expectEqualStrings(uri, loc.get("uri").?.string);
+    const range = loc.get("range").?.object;
+    const start = range.get("start").?.object;
+    const end = range.get("end").?.object;
+    const start_line: usize = @intCast(start.get("line").?.integer);
+    const start_char: usize = @intCast(start.get("character").?.integer);
+    const end_line: usize = @intCast(end.get("line").?.integer);
+    const end_char: usize = @intCast(end.get("character").?.integer);
+    try std.testing.expectEqual(start_line, end_line);
+    var lines_it = std.mem.splitScalar(u8, content, '\n');
+    var i: usize = 0;
+    var real_line: []const u8 = "";
+    while (lines_it.next()) |l| : (i += 1) {
+        if (i == start_line) {
+            real_line = l;
+            break;
+        }
+    }
+    try std.testing.expectEqualStrings("handleSave", real_line[start_char..end_char]);
+    try std.testing.expect(std.mem.indexOf(u8, real_line, "func handleSave() error") != null);
+}
+
+test "handleMessage: a real textDocument/completion mid-typing 'handle' suggests the real handleSave" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const uri = try realNtxFormUri(io, gpa);
+    defer gpa.free(uri);
+
+    var dir = try Io.Dir.cwd().openDir(io, ntx_form_guest_dir, .{});
+    defer dir.close(io);
+    const full_content = try dir.readFileAlloc(io, "form.go.ntx", gpa, .unlimited);
+    defer gpa.free(full_content);
+
+    // Same real mid-typing shape as `GoplsClient.zig`'s own completion
+    // test: the user has typed "handle" (not yet "handleSave"), cursor
+    // right after it. `.ntx` grammar treats `{...}` as fully opaque text
+    // (`Parser.zig`'s `scanUntilMatchingBrace`), so this still-incomplete
+    // identifier parses exactly as cleanly as the finished one.
+    const partial_content = try std.mem.replaceOwned(u8, gpa, full_content, "onClick={handleSave}", "onClick={handle}");
+    defer gpa.free(partial_content);
+
+    var server: Server = .{};
+    defer server.deinit(gpa, io);
+
+    const open_body = try encodeDidOpen(gpa, uri, partial_content);
+    defer gpa.free(open_body);
+    const open_result = try server.handleMessage(gpa, io, open_body);
+    gpa.free(open_result.notification.?);
+
+    const idx = std.mem.indexOf(u8, partial_content, "onClick={handle}").? + "onClick={handle".len;
+    const pos = Codegen.PositionMap.offsetToPosition(partial_content, idx);
+
+    const completion_body = try encodePositionRequest(gpa, 2, "textDocument/completion", uri, pos.line, pos.character);
+    defer gpa.free(completion_body);
+    const result = try server.handleMessage(gpa, io, completion_body);
+    defer gpa.free(result.response.?);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, result.response.?, .{});
+    defer parsed.deinit();
+    const items = parsed.value.object.get("result").?.array;
+    var found = false;
+    for (items.items) |item| {
+        if (std.mem.eql(u8, item.object.get("label").?.string, "handleSave")) found = true;
+    }
+    try std.testing.expect(found);
 }

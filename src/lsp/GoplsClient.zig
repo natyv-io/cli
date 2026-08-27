@@ -363,6 +363,154 @@ pub const GoplsClient = struct {
         if (line < 0 or character < 0) return null;
         return .{ .line = @intCast(line), .character = @intCast(character) };
     }
+
+    /// A real location `gopls` points at -- `uri` is very often a genuine,
+    /// unrelated, real on-disk file (e.g. `handleSave`'s own definition in
+    /// the logic file, not the virtual generated document at all), which
+    /// needs no `.ntx`-side remapping whatsoever: it's already a real
+    /// position in a real file the editor can jump straight to. Only when
+    /// `uri` happens to equal the caller's own virtual generated-document
+    /// URI does `Server.zig` need to map `range` back through
+    /// `PositionMap.generatedToNtx`.
+    pub const Location = struct {
+        uri: []const u8,
+        range: HoverRange,
+    };
+
+    /// Forwards a real `textDocument/definition` to `gopls`, same
+    /// generated-document-terms contract as `hover`. Real LSP spec allows
+    /// `Location | Location[] | LocationLink[] | null` back -- `gopls`
+    /// returns a plain `Location[]` in practice (confirmed via a live
+    /// protocol probe against this repo's own `examples/ntx-form/guest`
+    /// fixture), so a single `Location` object is also accepted
+    /// defensively, but `LocationLink` (a distinct `targetUri`/
+    /// `targetRange` shape used for "peek definition" previews) isn't --
+    /// never observed from `gopls` for this real use case, and go-to-
+    /// definition doesn't need the extra preview-range data `LocationLink`
+    /// exists to carry. An empty slice (not an error) covers "nothing to
+    /// show," "no result," and any location shape not handled above --
+    /// all real, ordinary "nothing to jump to" outcomes.
+    pub fn definition(self: *GoplsClient, allocator: std.mem.Allocator, arena: std.mem.Allocator, uri: []const u8, line: u32, character: u32) ![]const Location {
+        const id = self.nextId();
+        try self.sendRequest(allocator, id, "textDocument/definition", struct {
+            textDocument: struct { uri: []const u8 },
+            position: struct { line: u32, character: u32 },
+        }, .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } });
+
+        const response = try self.awaitResponse(allocator, arena, id);
+        const obj = switch (response) {
+            .object => |o| o,
+            else => return &.{},
+        };
+        const result = obj.get("result") orelse return &.{};
+        if (result == .null) return &.{};
+
+        var locations: std.ArrayList(Location) = .empty;
+        switch (result) {
+            .array => |arr| for (arr.items) |item| {
+                if (parseLocation(item)) |loc| try locations.append(arena, loc);
+            },
+            .object => if (parseLocation(result)) |loc| try locations.append(arena, loc),
+            else => {},
+        }
+        return locations.toOwnedSlice(arena);
+    }
+
+    fn parseLocation(v: std.json.Value) ?Location {
+        const obj = switch (v) {
+            .object => |o| o,
+            else => return null,
+        };
+        const uri = switch (obj.get("uri") orelse return null) {
+            .string => |s| s,
+            else => return null,
+        };
+        const range = parseRange(obj.get("range") orelse return null) orelse return null;
+        return .{ .uri = uri, .range = range };
+    }
+
+    /// One real completion suggestion -- deliberately narrower than
+    /// `gopls`'s own full `CompletionItem` (no `textEdit`,
+    /// `insertTextFormat`, etc.): unlike `hover`/`definition`, a real
+    /// completion response carries no position that needs mapping back to
+    /// `.ntx` terms at all -- the editor inserts `insertText`/`label`
+    /// directly at the user's own real cursor position in the real `.ntx`
+    /// document, with no coordinates involved. `kind` is `gopls`'s own raw
+    /// real LSP `CompletionItemKind` numeric value, forwarded verbatim
+    /// since this server never interprets it, only passes it through so a
+    /// real editor can pick the right icon.
+    pub const CompletionItem = struct {
+        label: []const u8,
+        kind: ?i64 = null,
+        detail: ?[]const u8 = null,
+        insertText: ?[]const u8 = null,
+    };
+
+    /// Forwards a real `textDocument/completion` to `gopls`, same
+    /// generated-document-terms contract as `hover`/`definition`. Real LSP
+    /// spec allows `CompletionItem[] | CompletionList | null` back -- both
+    /// shapes handled (a live protocol probe against this repo's own
+    /// `examples/ntx-form/guest` fixture, simulating mid-typing
+    /// `onClick={handle}`, returned real suggestions -- `handleSave`
+    /// itself, correctly resolved from a *different* real file in the same
+    /// package -- confirming completion works through this same virtual-
+    /// document mechanism with no new plumbing). An empty slice (not an
+    /// error) covers "nothing to suggest," "no result," and any item shape
+    /// not handled above.
+    pub fn completion(self: *GoplsClient, allocator: std.mem.Allocator, arena: std.mem.Allocator, uri: []const u8, line: u32, character: u32) ![]const CompletionItem {
+        const id = self.nextId();
+        try self.sendRequest(allocator, id, "textDocument/completion", struct {
+            textDocument: struct { uri: []const u8 },
+            position: struct { line: u32, character: u32 },
+        }, .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } });
+
+        const response = try self.awaitResponse(allocator, arena, id);
+        const obj = switch (response) {
+            .object => |o| o,
+            else => return &.{},
+        };
+        const result = obj.get("result") orelse return &.{};
+        if (result == .null) return &.{};
+
+        const items: std.json.Array = switch (result) {
+            .array => |a| a,
+            .object => |o| switch (o.get("items") orelse return &.{}) {
+                .array => |a| a,
+                else => return &.{},
+            },
+            else => return &.{},
+        };
+
+        var out: std.ArrayList(CompletionItem) = .empty;
+        for (items.items) |item| {
+            if (parseCompletionItem(item)) |ci| try out.append(arena, ci);
+        }
+        return out.toOwnedSlice(arena);
+    }
+
+    fn parseCompletionItem(v: std.json.Value) ?CompletionItem {
+        const obj = switch (v) {
+            .object => |o| o,
+            else => return null,
+        };
+        const label = switch (obj.get("label") orelse return null) {
+            .string => |s| s,
+            else => return null,
+        };
+        const kind: ?i64 = if (obj.get("kind")) |k| switch (k) {
+            .integer => |n| n,
+            else => null,
+        } else null;
+        const detail: ?[]const u8 = if (obj.get("detail")) |d| switch (d) {
+            .string => |s| s,
+            else => null,
+        } else null;
+        const insert_text: ?[]const u8 = if (obj.get("insertText")) |t| switch (t) {
+            .string => |s| s,
+            else => null,
+        } else null;
+        return .{ .label = label, .kind = kind, .detail = detail, .insertText = insert_text };
+    }
 };
 
 /// Walks up from `start_dir` looking for a real `go.mod`, returning the
@@ -411,6 +559,23 @@ pub fn derivedGeneratedUri(allocator: std.mem.Allocator, ntx_uri: []const u8) !?
     return try std.fmt.allocPrint(allocator, "{s}.natyv.go", .{stem});
 }
 
+/// Derives the real *logic-file* URI for a given `.ntx` file's own URI --
+/// `src/cli/Prepare.zig`'s own real per-file pipeline writes the logic
+/// file at exactly this path (`base`, the `.ntx` file's own name with just
+/// the trailing `.ntx` stripped -- e.g. `form.go.ntx` -> `form.go`), so
+/// overlaying it here the same load-bearing way `derivedGeneratedUri`
+/// already does keeps `gopls`'s view of hand-written logic-file code (an
+/// `onClick` handler's own body, its doc comment, etc.) in sync with the
+/// user's *live* `.ntx` edits, not whatever was last written to disk by a
+/// previous `natyv prepare` run. `.ntx` LSP Stage 7. `null` if `ntx_uri`
+/// doesn't end in the expected `.go.ntx` shape.
+pub fn derivedLogicUri(allocator: std.mem.Allocator, ntx_uri: []const u8) !?[]u8 {
+    if (!std.mem.endsWith(u8, ntx_uri, ".ntx")) return null;
+    const without_ntx = ntx_uri[0 .. ntx_uri.len - ".ntx".len];
+    if (!std.mem.endsWith(u8, without_ntx, ".go")) return null;
+    return try allocator.dupe(u8, without_ntx);
+}
+
 test "derivedGeneratedUri: a real .go.ntx URI derives its own real .natyv.go sibling" {
     const uri = try derivedGeneratedUri(std.testing.allocator, "file:///a/b/form.go.ntx");
     defer std.testing.allocator.free(uri.?);
@@ -421,6 +586,17 @@ test "derivedGeneratedUri: anything not ending in .go.ntx is a clean null, not a
     try std.testing.expect(try derivedGeneratedUri(std.testing.allocator, "file:///a/b/form.ntx") == null);
     try std.testing.expect(try derivedGeneratedUri(std.testing.allocator, "file:///a/b/form.rs.ntx") == null);
     try std.testing.expect(try derivedGeneratedUri(std.testing.allocator, "file:///a/b/plain.go") == null);
+}
+
+test "derivedLogicUri: a real .go.ntx URI derives its own real .go sibling" {
+    const uri = try derivedLogicUri(std.testing.allocator, "file:///a/b/form.go.ntx");
+    defer std.testing.allocator.free(uri.?);
+    try std.testing.expectEqualStrings("file:///a/b/form.go", uri.?);
+}
+
+test "derivedLogicUri: anything not ending in .go.ntx is a clean null, not a guess" {
+    try std.testing.expect(try derivedLogicUri(std.testing.allocator, "file:///a/b/form.ntx") == null);
+    try std.testing.expect(try derivedLogicUri(std.testing.allocator, "file:///a/b/plain.go") == null);
 }
 
 test "uriToPath: strips the file:// scheme, leaving the plain path" {
@@ -537,4 +713,89 @@ test "GoplsClient: a real hover against a virtual, never-on-disk generated docum
     const result = (try client.hover(allocator, arena_state.allocator(), virtual_uri, pos.line, pos.character)).?;
     try std.testing.expect(std.mem.indexOf(u8, result.contents_markdown, "func handleSave() error") != null);
     try std.testing.expect(result.range != null);
+}
+
+test "GoplsClient: a real go-to-definition on handleSave resolves to its real definition in form.go, not the virtual doc" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd_path);
+    const abs_guest_dir = try std.fs.path.join(allocator, &.{ cwd_path, guest_dir });
+    defer allocator.free(abs_guest_dir);
+
+    var client: GoplsClient = .{};
+    try client.spawn(io, allocator, abs_guest_dir);
+    defer client.deinit(allocator, io);
+
+    const virtual_uri = try std.fmt.allocPrint(allocator, "file://{s}/form.go.ntx.generated.go", .{abs_guest_dir});
+    defer allocator.free(virtual_uri);
+
+    const dir = try Io.Dir.cwd().openDir(io, guest_dir, .{});
+    const content = try dir.readFileAlloc(io, "form.natyv.go", allocator, .unlimited);
+    defer allocator.free(content);
+
+    try client.didOpen(allocator, virtual_uri, content);
+
+    const Codegen = @import("Codegen");
+    const idx = std.mem.indexOf(u8, content, "handleSave").?;
+    const pos = Codegen.PositionMap.offsetToPosition(content, idx);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const locations = try client.definition(allocator, arena_state.allocator(), virtual_uri, pos.line, pos.character);
+    try std.testing.expectEqual(@as(usize, 1), locations.len);
+    // `handleSave` is genuinely defined in the real, on-disk `form.go` --
+    // a real, different file from the virtual `form.go.ntx.generated.go`
+    // this request was made against, proving the common real case needs
+    // no `.ntx`-side position remapping at all.
+    try std.testing.expect(std.mem.endsWith(u8, locations[0].uri, "form.go"));
+    try std.testing.expect(!std.mem.endsWith(u8, locations[0].uri, "form.go.ntx.generated.go"));
+}
+
+test "GoplsClient: a real completion request mid-typing 'handle' suggests the real handleSave from a sibling file" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd_path);
+    const abs_guest_dir = try std.fs.path.join(allocator, &.{ cwd_path, guest_dir });
+    defer allocator.free(abs_guest_dir);
+
+    var client: GoplsClient = .{};
+    try client.spawn(io, allocator, abs_guest_dir);
+    defer client.deinit(allocator, io);
+
+    const virtual_uri = try std.fmt.allocPrint(allocator, "file://{s}/form.go.ntx.generated.go", .{abs_guest_dir});
+    defer allocator.free(virtual_uri);
+
+    const dir = try Io.Dir.cwd().openDir(io, guest_dir, .{});
+    const full_content = try dir.readFileAlloc(io, "form.natyv.go", allocator, .unlimited);
+    defer allocator.free(full_content);
+
+    // Simulates the real mid-typing shape the LSP will actually see: the
+    // user has typed "handle" (not yet "handleSave") and the cursor sits
+    // right after it. `handleSave`'s own `.ntx` `SourceMapping.ntx_len`
+    // reflects this exact same "currently typed so far" length on every
+    // real request, since the whole document is retranspiled fresh each
+    // time -- this fixture just constructs that intermediate state
+    // directly rather than driving a real keystroke-by-keystroke edit.
+    const partial_content = try std.mem.replaceOwned(u8, allocator, full_content, "OnClick(handleSave)", "OnClick(handle");
+    defer allocator.free(partial_content);
+
+    try client.didOpen(allocator, virtual_uri, partial_content);
+
+    const idx = std.mem.indexOf(u8, partial_content, "OnClick(handle").? + "OnClick(handle".len;
+    const Codegen = @import("Codegen");
+    const pos = Codegen.PositionMap.offsetToPosition(partial_content, idx);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const items = try client.completion(allocator, arena_state.allocator(), virtual_uri, pos.line, pos.character);
+
+    var found = false;
+    for (items) |item| {
+        if (std.mem.eql(u8, item.label, "handleSave")) found = true;
+    }
+    try std.testing.expect(found);
 }

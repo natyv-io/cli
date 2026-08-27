@@ -46,15 +46,27 @@ pub const SemanticTokensOptions = struct {
 /// `textDocumentSync = 1` (Full) as of Stage 2 -- real diagnostics need
 /// the client to send the document's current full text on every change,
 /// which `TextDocumentSyncKind.Full` (value `1`) is what asks for.
-/// `semanticTokensProvider` as of Stage 3, `hoverProvider` as of Stage 5.
-/// `definitionProvider`/etc. get added as fields here only once each
-/// corresponding stage actually lands -- advertising a capability before
-/// the handler exists would be a real client-visible lie, not just
-/// premature.
+/// `semanticTokensProvider` as of Stage 3, `hoverProvider` as of Stage 5,
+/// `definitionProvider`/`completionProvider` as of Stage 6. Anything else
+/// gets added here only once its own handler actually lands -- advertising
+/// a capability before the handler exists would be a real client-visible
+/// lie, not just premature.
 pub const ServerCapabilities = struct {
     textDocumentSync: u32 = 1,
     semanticTokensProvider: SemanticTokensOptions = .{},
     hoverProvider: bool = true,
+    definitionProvider: bool = true,
+    completionProvider: CompletionOptions = .{},
+};
+
+pub const CompletionOptions = struct {
+    /// `.`/`&` cover the two real Stage 6 completion targets: a plain Go
+    /// selector expression inside `onClick={...}` (`.`), and a `ref={&...}`
+    /// target identifier (`&`). Real gopls-driven completion still works
+    /// without a trigger character at all (a client can always ask
+    /// on-demand, e.g. Ctrl+Space) -- this list only adds *automatic*
+    /// popup-on-keystroke behavior for these two real cases.
+    triggerCharacters: []const []const u8 = &.{ ".", "&" },
 };
 
 pub const InitializeResult = struct {
@@ -99,4 +111,27 @@ pub const MarkupContent = struct {
 pub const Hover = struct {
     contents: MarkupContent,
     range: ?Range = null,
+};
+
+/// Stage 6 (`.ntx` LSP, gopls proxying): the real `textDocument/definition`
+/// response shape sent to the editor -- always encoded as an array (a
+/// single-element one for a single result), a real, allowed LSP shape,
+/// rather than switching between a bare `Location` and `Location[]`
+/// depending on result count.
+pub const Location = struct {
+    uri: []const u8,
+    range: Range,
+};
+
+/// Stage 6: the real `textDocument/completion` response shape. `kind` is
+/// the real LSP `CompletionItemKind` numeric enum (e.g. `3` = Function,
+/// `6` = Variable) -- forwarded verbatim from `gopls`'s own response
+/// rather than re-declared here, since this server never needs to
+/// interpret it, only pass it through so the editor can pick the right
+/// icon.
+pub const CompletionItem = struct {
+    label: []const u8,
+    kind: ?i64 = null,
+    detail: ?[]const u8 = null,
+    insertText: ?[]const u8 = null,
 };
