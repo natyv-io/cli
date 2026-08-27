@@ -1,0 +1,4 @@
+name = "natyv Stylesheet"
+grammar = "ntss"
+path_suffixes = ["ntss"]
+line_comments = ["// "]

@@ -1,6 +1,6 @@
 id = "ntx"
-name = "natyv .ntx Language Support"
-description = "Real-time diagnostics, hover, go-to-definition, and autocomplete for natyv's .ntx markup files via the ntx-lsp language server, plus real syntax highlighting via a structural tree-sitter grammar and semantic tokens."
+name = "natyv Language Support"
+description = "Real-time diagnostics, hover, go-to-definition, and autocomplete for natyv's .ntx markup files via the ntx-lsp language server, real syntax highlighting via a structural tree-sitter grammar and semantic tokens, plus syntax highlighting for natyv's .ntss stylesheet files."
 version = "0.1.0"
 schema_version = 1
 authors = ["natyv"]
@@ -9,6 +9,10 @@ repository = "https://github.com/natyv/zed-ntx"
 [grammars.ntx]
 repository = "file:///Users/quinnmillican/Desktop/dev/natyv/editors/tree-sitter-ntx"
 commit = "478edb49f57e6f68a790fb845618e24285adb76d"
+
+[grammars.ntss]
+repository = "file:///Users/quinnmillican/Desktop/dev/natyv/editors/tree-sitter-ntss"
+commit = "108285df0a406fa5b439dfe3a2ea5616f1cdddd8"
 
 [language_servers.ntx-lsp]
 name = "ntx-lsp"
