@@ -8,8 +8,15 @@
 ; reimplement Go's own keyword/operator highlighting.
 
 (tag_name) @tag
-(attribute_name) @property
+(attribute_name) @attribute
 (string_literal) @string
-(child_text) @string
 (func_decl name: (identifier) @function)
 (go_type) @type
+
+; Deliberately no capture for `child_text` -- per Quinn's own real
+; click-through feedback during Stage 3 (VS Code), a widget's own child
+; text (e.g. a Button's "Save") reads as plain author-facing content, not
+; `.ntx` syntax, and should render in the editor's default color. The LSP
+; server already agrees (it never emits a semantic token for child text,
+; only for style-token names -- see Codegen.zig's own Stage 3 test), so
+; this grammar must not reintroduce the coloring on its own.
