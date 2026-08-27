@@ -23,10 +23,16 @@
 //! `Transport.zig`).
 
 const std = @import("std");
+const Io = std.Io;
 const Protocol = @import("Protocol.zig");
 const Diagnostics = @import("Diagnostics.zig");
 const SemanticTokens = @import("SemanticTokens.zig");
 const Transport = @import("Transport.zig");
+const GoplsClientModule = @import("GoplsClient.zig");
+const GoplsClient = GoplsClientModule.GoplsClient;
+const Expose = @import("Expose");
+const Codegen = @import("Codegen");
+const PositionMap = Codegen.PositionMap;
 
 pub const HandleResult = struct {
     /// Populated only when a response must be sent back to the client --
@@ -55,14 +61,51 @@ pub const HandleResult = struct {
 /// actual current content).
 pub const Server = struct {
     documents: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Stage 5: one real, persistent `gopls` child process per distinct Go
+    /// module root (`GoplsClient.findModuleRoot`), reused across every
+    /// `.ntx` document that root's own module contains -- lazily spawned
+    /// on that root's first real hover request, never eagerly. Stored as
+    /// `*GoplsClient` (heap-allocated via `gpa.create`), not `GoplsClient`
+    /// by value: a `GoplsClient`'s own `reader`/`writer` fields hold
+    /// pointers into its *own* `read_buf`/`write_buf` sibling fields, so
+    /// storing it by value in a hash map would be unsound the moment the
+    /// map resizes and moves its values to a new address -- a heap
+    /// allocation's address never moves that way.
+    gopls_clients: std.StringHashMapUnmanaged(*GoplsClient) = .empty,
 
-    pub fn deinit(self: *Server, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *Server, gpa: std.mem.Allocator, io: Io) void {
         var it = self.documents.iterator();
         while (it.next()) |entry| {
             gpa.free(entry.key_ptr.*);
             gpa.free(entry.value_ptr.*);
         }
         self.documents.deinit(gpa);
+
+        var git = self.gopls_clients.iterator();
+        while (git.next()) |entry| {
+            gpa.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit(gpa, io);
+            gpa.destroy(entry.value_ptr.*);
+        }
+        self.gopls_clients.deinit(gpa);
+    }
+
+    /// Looks up (or lazily spawns and initializes) the one `GoplsClient`
+    /// for `module_root`. A spawn failure (e.g. `gopls` not installed --
+    /// a real, expected case, not everyone using `.ntx` tooling has it on
+    /// `PATH`) propagates as a real error; `handleHover` treats that as
+    /// "no hover info available" rather than a server-fatal condition.
+    fn getOrSpawnGoplsClient(self: *Server, gpa: std.mem.Allocator, io: Io, module_root: []const u8) !*GoplsClient {
+        if (self.gopls_clients.get(module_root)) |client| return client;
+        const client = try gpa.create(GoplsClient);
+        errdefer gpa.destroy(client);
+        client.* = .{};
+        try client.spawn(io, gpa, module_root);
+        errdefer client.deinit(gpa, io);
+        const owned_root = try gpa.dupe(u8, module_root);
+        errdefer gpa.free(owned_root);
+        try self.gopls_clients.put(gpa, owned_root, client);
+        return client;
     }
 
     /// Parses one already-length-delimited JSON-RPC message body (see
@@ -71,7 +114,7 @@ pub const Server = struct {
     /// unknown method) -- those become real JSON-RPC error responses
     /// instead, exactly what a real client expects back; a Zig error here
     /// means allocation failure, nothing else.
-    pub fn handleMessage(self: *Server, gpa: std.mem.Allocator, body: []const u8) !HandleResult {
+    pub fn handleMessage(self: *Server, gpa: std.mem.Allocator, io: Io, body: []const u8) !HandleResult {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -118,6 +161,9 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, method, "textDocument/semanticTokens/full")) {
             return .{ .response = try self.handleSemanticTokensFull(gpa, id, obj.get("params") orelse .null) };
+        }
+        if (std.mem.eql(u8, method, "textDocument/hover")) {
+            return .{ .response = try self.handleHover(gpa, io, id, obj.get("params") orelse .null) };
         }
 
         if (!is_request) return .{}; // unknown notification: ignore per spec
@@ -170,6 +216,75 @@ pub const Server = struct {
         return try encodeResult(gpa, Result, id, .{ .data = data });
     }
 
+    /// `.ntx` LSP Stage 5: the real Volar-style forwarding this stage
+    /// exists to prove. Every failure mode along the way (document not
+    /// open, source doesn't currently transpile, no `SourceMapping`
+    /// recorded at the exact requested position -- an accepted, honest
+    /// scope limit given `PositionMap.ntxToGenerated`'s own exact-point-
+    /// match design; not every `.ntx` token has a recorded mapping yet,
+    /// `gopls` missing from `PATH`, `gopls` itself returning nothing for
+    /// this position) degrades to a real `null` hover result, never a
+    /// JSON-RPC error -- exactly what a real editor expects when there's
+    /// simply nothing to show at a given position.
+    fn handleHover(self: *Server, gpa: std.mem.Allocator, io: Io, id: std.json.Value, params: std.json.Value) ![]u8 {
+        const uri = textDocumentField(params, "uri") orelse return try encodeNullResult(gpa, id);
+        const pos = parsePositionParam(params) orelse return try encodeNullResult(gpa, id);
+        const text = self.documents.get(uri) orelse return try encodeNullResult(gpa, id);
+
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const found = Expose.findComposers(arena, text) catch return try encodeNullResult(gpa, id);
+        if (found.err != null) return try encodeNullResult(gpa, id);
+        const transpiled = Codegen.generateGo(arena, "main", text, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{}) catch return try encodeNullResult(gpa, id);
+        if (transpiled.err != null) return try encodeNullResult(gpa, id);
+        const output = transpiled.output.?;
+
+        // LSP positions are 0-based; every `Parser`/`Codegen` position is
+        // 1-based -- the same `+1` `publishDiagnosticsFor` applies in the
+        // opposite direction.
+        const ntx_line = pos.line + 1;
+        const ntx_col = pos.character + 1;
+        const mapped = PositionMap.ntxToGenerated(output.source_map, ntx_line, ntx_col) orelse return try encodeNullResult(gpa, id);
+        const gen_pos = PositionMap.offsetToPosition(output.generated, mapped.start);
+
+        const ntx_path = GoplsClientModule.uriToPath(uri) orelse return try encodeNullResult(gpa, id);
+        const ntx_dir = std.fs.path.dirname(ntx_path) orelse return try encodeNullResult(gpa, id);
+        const module_root = GoplsClientModule.findModuleRoot(gpa, io, ntx_dir) catch return try encodeNullResult(gpa, id);
+        defer gpa.free(module_root);
+
+        const client = self.getOrSpawnGoplsClient(gpa, io, module_root) catch return try encodeNullResult(gpa, id);
+        const generated_uri = (GoplsClientModule.derivedGeneratedUri(gpa, uri) catch return try encodeNullResult(gpa, id)) orelse return try encodeNullResult(gpa, id);
+        defer gpa.free(generated_uri);
+
+        client.syncDocument(gpa, generated_uri, output.generated) catch return try encodeNullResult(gpa, id);
+        const hover_result = client.hover(gpa, arena, generated_uri, gen_pos.line, gen_pos.character) catch return try encodeNullResult(gpa, id);
+        const h = hover_result orelse return try encodeNullResult(gpa, id);
+
+        // The real `.ntx`-side span of the hovered token is already fully
+        // known from the mapping itself (`mapped.ntx_col`/`mapped.ntx_len`)
+        // -- deliberately *not* derived from `mapped.end - mapped.start`
+        // (the generated-side span), which is a real, different length for
+        // a `.string_literal`/`.style_token`/`.child_text` mapping: that
+        // span includes the wrapping Go string quotes `writeGoStringLiteral`
+        // adds, which the `.ntx`-side token never has. This is also
+        // simpler and more correct than trying to reverse-map `gopls`'s
+        // own returned range through `generatedToNtx` -- a real bug found
+        // via this stage's own end-to-end smoke test: `generatedToNtx`
+        // only ever resolves to a matching mapping's fixed *start*
+        // position for any offset inside its span (that's what it's for --
+        // "which token contains this offset," not "where exactly inside
+        // this token"), so reverse-mapping a multi-byte range's *end* that
+        // way collapsed it down to the same single-character span as the
+        // start every time.
+        const ntx_range = Protocol.Range{
+            .start = .{ .line = ntx_line - 1, .character = mapped.ntx_col - 1 },
+            .end = .{ .line = ntx_line - 1, .character = mapped.ntx_col - 1 + mapped.ntx_len },
+        };
+        return try encodeResult(gpa, Protocol.Hover, id, .{ .contents = .{ .value = h.contents_markdown }, .range = ntx_range });
+    }
+
     /// Stores (or replaces) `uri`'s current text -- both `uri` and `text`
     /// are duped into `gpa`-owned memory, since the JSON-RPC message
     /// they're parsed from is freed by the caller right after
@@ -200,12 +315,12 @@ pub const Server = struct {
     /// there's no meaningful way to recover mid-stream from a broken
     /// framing layer or an OOM, so `run` just surfaces the error to
     /// `main`, matching every other CLI entry point in this repo.
-    pub fn run(self: *Server, gpa: std.mem.Allocator, reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
+    pub fn run(self: *Server, gpa: std.mem.Allocator, io: Io, reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
         while (true) {
             const body = try Transport.readMessage(reader, gpa);
             defer gpa.free(body);
 
-            const result = try self.handleMessage(gpa, body);
+            const result = try self.handleMessage(gpa, io, body);
             if (result.response) |response| {
                 defer gpa.free(response);
                 try Transport.writeMessage(writer, response);
@@ -232,6 +347,30 @@ fn textDocumentField(params: std.json.Value, field: []const u8) ?[]const u8 {
         .string => |s| s,
         else => null,
     };
+}
+
+/// Reads `params.position.{line,character}` as a real, non-negative 0-based
+/// LSP position -- `null` for any malformed shape, matching
+/// `textDocumentField`'s own "malformed input means nothing to do" posture.
+fn parsePositionParam(params: std.json.Value) ?struct { line: u32, character: u32 } {
+    const position = switch (params) {
+        .object => |o| o.get("position") orelse return null,
+        else => return null,
+    };
+    const pos_obj = switch (position) {
+        .object => |o| o,
+        else => return null,
+    };
+    const line = switch (pos_obj.get("line") orelse return null) {
+        .integer => |n| n,
+        else => return null,
+    };
+    const character = switch (pos_obj.get("character") orelse return null) {
+        .integer => |n| n,
+        else => return null,
+    };
+    if (line < 0 or character < 0) return null;
+    return .{ .line = @intCast(line), .character = @intCast(character) };
 }
 
 fn publishDiagnosticsFor(gpa: std.mem.Allocator, uri: []const u8, text: []const u8) !?[]u8 {
@@ -288,73 +427,76 @@ fn encodeError(gpa: std.mem.Allocator, id: std.json.Value, code: Protocol.ErrorC
 
 test "handleMessage: initialize returns a real result advertising full document sync" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
-    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+    defer server.deinit(std.testing.allocator, std.testing.io);
+    const result = try server.handleMessage(std.testing.allocator, std.testing.io, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
     defer std.testing.allocator.free(result.response.?);
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true}}}}", result.response.?);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true},\"hoverProvider\":true}}}", result.response.?);
     try std.testing.expect(!result.should_exit);
 }
 
 test "handleMessage: initialize echoes back a real string id, not just a number one" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
-    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"method\":\"initialize\",\"params\":{}}");
+    defer server.deinit(std.testing.allocator, std.testing.io);
+    const result = try server.handleMessage(std.testing.allocator, std.testing.io, "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"method\":\"initialize\",\"params\":{}}");
     defer std.testing.allocator.free(result.response.?);
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true}}}}", result.response.?);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true},\"hoverProvider\":true}}}", result.response.?);
 }
 
 test "handleMessage: initialized notification produces no response and doesn't exit" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
-    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
+    defer server.deinit(std.testing.allocator, std.testing.io);
+    const result = try server.handleMessage(std.testing.allocator, std.testing.io, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
     try std.testing.expect(result.response == null);
     try std.testing.expect(!result.should_exit);
 }
 
 test "handleMessage: shutdown responds with a real null result" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
-    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\"}");
+    defer server.deinit(std.testing.allocator, std.testing.io);
+    const result = try server.handleMessage(std.testing.allocator, std.testing.io, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\"}");
     defer std.testing.allocator.free(result.response.?);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}", result.response.?);
 }
 
 test "handleMessage: exit notification produces no response but does signal should_exit" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
-    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}");
+    defer server.deinit(std.testing.allocator, std.testing.io);
+    const result = try server.handleMessage(std.testing.allocator, std.testing.io, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}");
     try std.testing.expect(result.response == null);
     try std.testing.expect(result.should_exit);
 }
 
 test "handleMessage: an unknown request method gets a real MethodNotFound error, not silence" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
-    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{}}");
+    defer server.deinit(std.testing.allocator, std.testing.io);
+    // `textDocument/definition` -- still genuinely unimplemented as of
+    // Stage 5 (`textDocument/hover` is implemented now, so it can no
+    // longer stand in as "an unknown method" the way it used to).
+    const result = try server.handleMessage(std.testing.allocator, std.testing.io, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/definition\",\"params\":{}}");
     defer std.testing.allocator.free(result.response.?);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32601,\"message\":\"method not found\"}}", result.response.?);
 }
 
 test "handleMessage: an unknown notification (no id) is silently ignored, not errored" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
-    const result = try server.handleMessage(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"$/someUnknownNotification\"}");
+    defer server.deinit(std.testing.allocator, std.testing.io);
+    const result = try server.handleMessage(std.testing.allocator, std.testing.io, "{\"jsonrpc\":\"2.0\",\"method\":\"$/someUnknownNotification\"}");
     try std.testing.expect(result.response == null);
     try std.testing.expect(!result.should_exit);
 }
 
 test "handleMessage: malformed JSON gets a real ParseError response with a null id" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
-    const result = try server.handleMessage(std.testing.allocator, "not json at all");
+    defer server.deinit(std.testing.allocator, std.testing.io);
+    const result = try server.handleMessage(std.testing.allocator, std.testing.io, "not json at all");
     defer std.testing.allocator.free(result.response.?);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"request was not valid JSON\"}}", result.response.?);
 }
 
 test "handleMessage: a JSON value that isn't an object is a real InvalidRequest error" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
-    const result = try server.handleMessage(std.testing.allocator, "[1,2,3]");
+    defer server.deinit(std.testing.allocator, std.testing.io);
+    const result = try server.handleMessage(std.testing.allocator, std.testing.io, "[1,2,3]");
     defer std.testing.allocator.free(result.response.?);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"JSON-RPC message must be an object\"}}", result.response.?);
 }
@@ -362,7 +504,7 @@ test "handleMessage: a JSON value that isn't an object is a real InvalidRequest 
 test "run: a real initialize/initialized/shutdown/exit sequence produces exactly the two expected responses" {
     const gpa = std.testing.allocator;
     var server: Server = .{};
-    defer server.deinit(gpa);
+    defer server.deinit(gpa, std.testing.io);
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
 
@@ -374,13 +516,13 @@ test "run: a real initialize/initialized/shutdown/exit sequence produces exactly
     try Transport.writeMessage(&input.writer, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}");
 
     var reader = std.Io.Reader.fixed(input.writer.buffered());
-    try server.run(gpa, &reader, &aw.writer);
+    try server.run(gpa, std.testing.io, &reader, &aw.writer);
 
     const output = aw.writer.buffered();
     var out_reader = std.Io.Reader.fixed(output);
     const first = try Transport.readMessage(&out_reader, gpa);
     defer gpa.free(first);
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true}}}}", first);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"type\",\"property\",\"string\"],\"tokenModifiers\":[]},\"full\":true},\"hoverProvider\":true}}}", first);
     const second = try Transport.readMessage(&out_reader, gpa);
     defer gpa.free(second);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}", second);
@@ -456,12 +598,12 @@ fn encodeSemanticTokensFull(gpa: std.mem.Allocator, id: i64, uri: []const u8) ![
 
 test "handleMessage: didOpen with a clean .ntx document publishes empty diagnostics" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
+    defer server.deinit(std.testing.allocator, std.testing.io);
     const gpa = std.testing.allocator;
     const body = try encodeDidOpen(gpa, "file:///test.go.ntx", clean_ntx_source);
     defer gpa.free(body);
 
-    const result = try server.handleMessage(gpa, body);
+    const result = try server.handleMessage(gpa, std.testing.io, body);
     try std.testing.expect(result.response == null);
     defer gpa.free(result.notification.?);
     try std.testing.expectEqualStrings(
@@ -472,12 +614,12 @@ test "handleMessage: didOpen with a clean .ntx document publishes empty diagnost
 
 test "handleMessage: didOpen with a broken .ntx document publishes a real diagnostic with a real position" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
+    defer server.deinit(std.testing.allocator, std.testing.io);
     const gpa = std.testing.allocator;
     const body = try encodeDidOpen(gpa, "file:///test.go.ntx", broken_ntx_source);
     defer gpa.free(body);
 
-    const result = try server.handleMessage(gpa, body);
+    const result = try server.handleMessage(gpa, std.testing.io, body);
     defer gpa.free(result.notification.?);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, result.notification.?, .{});
@@ -494,17 +636,17 @@ test "handleMessage: didOpen with a broken .ntx document publishes a real diagno
 
 test "handleMessage: didChange that fixes a broken document clears its diagnostics" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
+    defer server.deinit(std.testing.allocator, std.testing.io);
     const gpa = std.testing.allocator;
 
     const open_body = try encodeDidOpen(gpa, "file:///test.go.ntx", broken_ntx_source);
     defer gpa.free(open_body);
-    const open_result = try server.handleMessage(gpa, open_body);
+    const open_result = try server.handleMessage(gpa, std.testing.io, open_body);
     gpa.free(open_result.notification.?);
 
     const change_body = try encodeDidChange(gpa, "file:///test.go.ntx", clean_ntx_source);
     defer gpa.free(change_body);
-    const change_result = try server.handleMessage(gpa, change_body);
+    const change_result = try server.handleMessage(gpa, std.testing.io, change_body);
     defer gpa.free(change_result.notification.?);
     try std.testing.expectEqualStrings(
         "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///test.go.ntx\",\"diagnostics\":[]}}",
@@ -514,12 +656,12 @@ test "handleMessage: didChange that fixes a broken document clears its diagnosti
 
 test "handleMessage: didClose publishes an empty diagnostics list for that document" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
+    defer server.deinit(std.testing.allocator, std.testing.io);
     const gpa = std.testing.allocator;
     const body = try encodeDidClose(gpa, "file:///test.go.ntx");
     defer gpa.free(body);
 
-    const result = try server.handleMessage(gpa, body);
+    const result = try server.handleMessage(gpa, std.testing.io, body);
     defer gpa.free(result.notification.?);
     try std.testing.expectEqualStrings(
         "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///test.go.ntx\",\"diagnostics\":[]}}",
@@ -529,29 +671,29 @@ test "handleMessage: didClose publishes an empty diagnostics list for that docum
 
 test "handleMessage: semanticTokens/full on a never-opened uri returns a real empty token array, not an error" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
+    defer server.deinit(std.testing.allocator, std.testing.io);
     const gpa = std.testing.allocator;
     const body = try encodeSemanticTokensFull(gpa, 5, "file:///never-opened.go.ntx");
     defer gpa.free(body);
 
-    const result = try server.handleMessage(gpa, body);
+    const result = try server.handleMessage(gpa, std.testing.io, body);
     defer gpa.free(result.response.?);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"data\":[]}}", result.response.?);
 }
 
 test "handleMessage: semanticTokens/full on a real open document returns real delta-encoded tokens" {
     var server: Server = .{};
-    defer server.deinit(std.testing.allocator);
+    defer server.deinit(std.testing.allocator, std.testing.io);
     const gpa = std.testing.allocator;
 
     const open_body = try encodeDidOpen(gpa, "file:///test.go.ntx", clean_ntx_source);
     defer gpa.free(open_body);
-    const open_result = try server.handleMessage(gpa, open_body);
+    const open_result = try server.handleMessage(gpa, std.testing.io, open_body);
     gpa.free(open_result.notification.?);
 
     const tokens_body = try encodeSemanticTokensFull(gpa, 7, "file:///test.go.ntx");
     defer gpa.free(tokens_body);
-    const result = try server.handleMessage(gpa, tokens_body);
+    const result = try server.handleMessage(gpa, std.testing.io, tokens_body);
     defer gpa.free(result.response.?);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, result.response.?, .{});

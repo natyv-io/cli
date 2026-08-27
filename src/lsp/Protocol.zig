@@ -46,14 +46,15 @@ pub const SemanticTokensOptions = struct {
 /// `textDocumentSync = 1` (Full) as of Stage 2 -- real diagnostics need
 /// the client to send the document's current full text on every change,
 /// which `TextDocumentSyncKind.Full` (value `1`) is what asks for.
-/// `semanticTokensProvider` as of Stage 3. `hoverProvider`/
+/// `semanticTokensProvider` as of Stage 3, `hoverProvider` as of Stage 5.
 /// `definitionProvider`/etc. get added as fields here only once each
-/// corresponding stage actually lands (Stage 5) -- advertising a
-/// capability before the handler exists would be a real client-visible
-/// lie, not just premature.
+/// corresponding stage actually lands -- advertising a capability before
+/// the handler exists would be a real client-visible lie, not just
+/// premature.
 pub const ServerCapabilities = struct {
     textDocumentSync: u32 = 1,
     semanticTokensProvider: SemanticTokensOptions = .{},
+    hoverProvider: bool = true,
 };
 
 pub const InitializeResult = struct {
@@ -83,4 +84,19 @@ pub const Diagnostic = struct {
 pub const PublishDiagnosticsParams = struct {
     uri: []const u8,
     diagnostics: []const Diagnostic,
+};
+
+/// Stage 5 (`.ntx` LSP, gopls proxying): the real `textDocument/hover`
+/// response shape sent back to the *editor* -- distinct from
+/// `GoplsClient.HoverResult`, which carries `gopls`'s own raw
+/// generated-document-relative response before `Server.zig` maps its
+/// `range` back to a real `.ntx` position.
+pub const MarkupContent = struct {
+    kind: []const u8 = "markdown",
+    value: []const u8,
+};
+
+pub const Hover = struct {
+    contents: MarkupContent,
+    range: ?Range = null,
 };

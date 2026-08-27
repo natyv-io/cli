@@ -47,8 +47,11 @@ pub const AttrValue = union(enum) {
     /// `ref={&x}` -- the raw text after the `&` (usually a bare
     /// identifier, but not constrained to one: `&self.field` etc. are
     /// captured verbatim too, since this parser never validates real Go
-    /// expression shapes).
-    ref: []const u8,
+    /// expression shapes), with its own real position (`.ntx` LSP Stage 5,
+    /// ~/.claude/plans/lexical-wishing-penguin.md) -- `attr.line`/`attr.col`
+    /// (below) only locate the word "ref" itself, not `x`, which is the
+    /// position a real hover/go-to-definition request actually needs.
+    ref: RefValue,
     /// `styles={a, b}` -- the bare comma-separated style-token-name list,
     /// each with its own real position (`.ntx` LSP Stage 4,
     /// ~/.claude/plans/lexical-wishing-penguin.md) -- distinct names in one
@@ -57,7 +60,10 @@ pub const AttrValue = union(enum) {
     styles: []StyleRef,
     /// Any other `{...}` value -- opaque host-language text, pasted
     /// verbatim into generated code by a later stage. Never parsed here.
-    expr: []const u8,
+    /// Carries its own real position for the same reason `ref` does --
+    /// `onClick={handleSave}`'s real hover target is `handleSave`'s own
+    /// position, not `onClick`'s.
+    expr: ExprValue,
 };
 
 /// One name inside a `styles={...}` list, with its own real position --
@@ -65,6 +71,18 @@ pub const AttrValue = union(enum) {
 /// not any individual name in the list.
 pub const StyleRef = struct {
     name: []const u8,
+    line: u32,
+    col: u32,
+};
+
+pub const RefValue = struct {
+    target: []const u8,
+    line: u32,
+    col: u32,
+};
+
+pub const ExprValue = struct {
+    expr: []const u8,
     line: u32,
     col: u32,
 };
@@ -322,11 +340,13 @@ pub const Parser = struct {
 
         if (std.mem.eql(u8, attr_name, "ref")) {
             try self.expectByte('&');
+            const target_line = self.line;
+            const target_col = self.col;
             const target_start = self.pos;
             const target_end = try self.scanUntilMatchingBrace(brace_line, brace_col);
             const target = std.mem.trim(u8, self.src[target_start..target_end], " \t\r\n");
             if (target.len == 0) return self.fail(brace_line, brace_col, "ref={{&...}} is missing its target", .{});
-            return .{ .ref = target };
+            return .{ .ref = .{ .target = target, .line = target_line, .col = target_col } };
         }
 
         if (std.mem.eql(u8, attr_name, "styles")) {
@@ -334,12 +354,17 @@ pub const Parser = struct {
             // Fallback rule (confirmed design): anything that doesn't
             // parse as a bare comma-separated token-name list falls
             // through to a real host-language expression -- re-scan the
-            // same span as opaque text instead of erroring.
+            // same span as opaque text instead of erroring. `tryParseStylesList`
+            // restores the cursor to right after this function's own
+            // leading `skipWhitespace` on failure, so `self.line`/`self.col`
+            // below are still exactly where the real expression starts.
         }
 
+        const expr_line = self.line;
+        const expr_col = self.col;
         const expr_start = self.pos;
         const expr_end = try self.scanUntilMatchingBrace(brace_line, brace_col);
-        return .{ .expr = std.mem.trim(u8, self.src[expr_start..expr_end], " \t\r\n") };
+        return .{ .expr = .{ .expr = std.mem.trim(u8, self.src[expr_start..expr_end], " \t\r\n"), .line = expr_line, .col = expr_col } };
     }
 
     /// Attempts the `styles={a, b}` bare-list grammar starting right after
@@ -570,7 +595,7 @@ test "parses a self-closing element with a string and a braced attribute" {
     try std.testing.expectEqualStrings("placeholder", el.attrs[0].name);
     try std.testing.expectEqualStrings("Your name", el.attrs[0].value.string_literal);
     try std.testing.expectEqualStrings("onChange", el.attrs[1].name);
-    try std.testing.expectEqualStrings("handleChange", el.attrs[1].value.expr);
+    try std.testing.expectEqualStrings("handleChange", el.attrs[1].value.expr.expr);
 }
 
 test "parses nested tags, ref, styles, and text children (the confirmed design doc example shape)" {
@@ -599,7 +624,7 @@ test "parses nested tags, ref, styles, and text children (the confirmed design d
     try std.testing.expectEqualStrings("form-title", label1.attrs[0].value.styles[0].name);
 
     const text_field = container.children[1].element;
-    try std.testing.expectEqualStrings("nameField", text_field.attrs[0].value.ref);
+    try std.testing.expectEqualStrings("nameField", text_field.attrs[0].value.ref.target);
     try std.testing.expectEqualStrings("input", text_field.attrs[1].value.styles[0].name);
     try std.testing.expectEqualStrings("Your name", text_field.attrs[2].value.string_literal);
 
@@ -607,10 +632,10 @@ test "parses nested tags, ref, styles, and text children (the confirmed design d
     try std.testing.expectEqual(@as(usize, 1), button.children.len);
     try std.testing.expectEqualStrings("Save", button.children[0].text.text);
     try std.testing.expectEqualStrings("primary-button", button.attrs[0].value.styles[0].name);
-    try std.testing.expectEqualStrings("handleSave", button.attrs[1].value.expr);
+    try std.testing.expectEqualStrings("handleSave", button.attrs[1].value.expr.expr);
 
     const label2 = container.children[3].element;
-    try std.testing.expectEqualStrings("statusLabel", label2.attrs[0].value.ref);
+    try std.testing.expectEqualStrings("statusLabel", label2.attrs[0].value.ref.target);
 }
 
 test "styles={a, b} parses multiple bare token names" {
@@ -633,7 +658,7 @@ test "styles={...} falls back to an opaque expression when it isn't a bare ident
     const node = try parser.parseTopLevel();
     const value = node.element.attrs[0].value;
     try std.testing.expect(value == .expr);
-    try std.testing.expectEqualStrings("isActive ? \"active\" : \"default\"", value.expr);
+    try std.testing.expectEqualStrings("isActive ? \"active\" : \"default\"", value.expr.expr);
 }
 
 test "a Go string literal inside a braced attribute can contain '{' and '}' without ending the block early" {
@@ -642,7 +667,7 @@ test "a Go string literal inside a braced attribute can contain '{' and '}' with
     defer arena.deinit();
     var parser = Parser.init(arena.allocator(), src);
     const node = try parser.parseTopLevel();
-    const expr = node.element.attrs[0].value.expr;
+    const expr = node.element.attrs[0].value.expr.expr;
     try std.testing.expectEqualStrings("func() { fmt.Println(\"weird } input {\") }", expr);
 }
 
@@ -652,8 +677,33 @@ test "a line comment inside a braced attribute containing '}' doesn't end the bl
     defer arena.deinit();
     var parser = Parser.init(arena.allocator(), src);
     const node = try parser.parseTopLevel();
-    const expr = node.element.attrs[0].value.expr;
+    const expr = node.element.attrs[0].value.expr.expr;
     try std.testing.expect(std.mem.indexOf(u8, expr, "handleClick") != null);
+}
+
+test ".ntx LSP Stage 5: ref/expr each carry the real position of their own identifier, not the attribute name's" {
+    // Column reasoning (1-based): "<Button onClick={handleSave} ref={&x}>"
+    //  <Button. -> 'o' of onClick starts at col 9; 'h' of handleSave (right
+    //  after '{') starts at col 18. 'r' of ref starts at col 30; 'x' (right
+    //  after '&') starts at col 36.
+    const src = "<Button onClick={handleSave} ref={&x}></Button>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), src);
+    const node = try parser.parseTopLevel();
+    const el = node.element;
+
+    const on_click = el.attrs[0];
+    try std.testing.expectEqualStrings("onClick", on_click.name);
+    try std.testing.expectEqual(@as(u32, 9), on_click.col); // the attribute name's own position...
+    try std.testing.expectEqualStrings("handleSave", on_click.value.expr.expr);
+    try std.testing.expectEqual(@as(u32, 18), on_click.value.expr.col); // ...distinct from the identifier's.
+
+    const ref = el.attrs[1];
+    try std.testing.expectEqualStrings("ref", ref.name);
+    try std.testing.expectEqual(@as(u32, 30), ref.col);
+    try std.testing.expectEqualStrings("x", ref.value.ref.target);
+    try std.testing.expectEqual(@as(u32, 36), ref.value.ref.col);
 }
 
 test "reports a real line/column on a mismatched closing tag" {

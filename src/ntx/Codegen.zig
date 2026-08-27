@@ -130,7 +130,16 @@ const std = @import("std");
 const Parser = @import("Parser");
 const Expose = @import("Expose");
 const Resolver = @import("Resolver");
-const PositionMap = @import("PositionMap.zig");
+/// Re-exported (not just imported) so `.ntx` LSP Stage 5's `GoplsClient.zig`
+/// can reach `offsetToPosition`/`positionToOffset` via the `Codegen` named
+/// module `ntx-lsp` already imports, without promoting `PositionMap.zig`
+/// itself into a second, separate named module -- that would create a real
+/// circular *module* dependency (`PositionMap.zig` needs `Codegen.SourceMapping`'s
+/// type; `Codegen.zig`'s own tests call `PositionMap`'s functions), which a
+/// plain relative import between two files in the same module tolerates
+/// fine but Zig's build graph does not allow between two separate named
+/// modules.
+pub const PositionMap = @import("PositionMap.zig");
 
 pub const CodegenError = struct {
     line: u32,
@@ -209,6 +218,19 @@ pub const SourceMappingKind = enum {
 pub const SourceMapping = struct {
     ntx_line: u32,
     ntx_col: u32,
+    /// The `.ntx`-side token's own real length, in bytes -- needed so a
+    /// real hover/go-to-definition request landing *anywhere* inside the
+    /// token (not just its exact first character) still resolves. Real,
+    /// necessary field, not redundant with `gen_end - gen_start`: for a
+    /// `.string_literal`/`.style_token`/`.child_text` mapping, the
+    /// generated-side span includes the wrapping Go string quotes (and any
+    /// escaping) `writeGoStringLiteral` adds, which the `.ntx`-side token
+    /// never has -- confirmed as a real, live Stage 5 bug (VS Code click-
+    /// through with Quinn: a hover request landing mid-word, e.g. on the
+    /// "S" of "handleSave" rather than its leading "h", returned nothing,
+    /// since `ntxToGenerated`'s original exact-point-match design only
+    /// ever matched a token's very first character).
+    ntx_len: u32,
     gen_start: usize,
     gen_end: usize,
     kind: SourceMappingKind,
@@ -387,7 +409,7 @@ const Emitter = struct {
             const gen_start = self.out.items.len;
             try writeGoStringLiteral(self.out, self.allocator, n.name);
             const gen_end = self.out.items.len;
-            try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .style_token });
+            try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(n.name.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .style_token });
             try self.semantic_tokens.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(n.name.len), .token_type = .string });
         }
         try self.out.appendSlice(self.allocator, "); err != nil {\n\t\treturn err\n\t}\n");
@@ -414,7 +436,7 @@ const Emitter = struct {
             const gen_start = self.out.items.len;
             try writeGoStringLiteral(self.out, self.allocator, n.name);
             const gen_end = self.out.items.len;
-            try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .style_token });
+            try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(n.name.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .style_token });
             try self.semantic_tokens.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(n.name.len), .token_type = .string });
         }
         try self.out.appendSlice(self.allocator, "); err != nil {\n\t\treturn err\n\t}\n");
@@ -435,7 +457,7 @@ const Emitter = struct {
         const gen_start = self.out.items.len;
         try self.out.appendSlice(self.allocator, target);
         const gen_end = self.out.items.len;
-        try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .ref_target });
+        try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(target.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .ref_target });
         try self.out.appendSlice(self.allocator, " = &");
         try self.out.appendSlice(self.allocator, var_name);
         try self.out.appendSlice(self.allocator, "\n");
@@ -475,7 +497,7 @@ const Emitter = struct {
         const gen_start = self.out.items.len;
         try self.out.appendSlice(self.allocator, handler_expr);
         const gen_end = self.out.items.len;
-        try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .event_handler });
+        try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(handler_expr.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .event_handler });
         try self.out.appendSlice(self.allocator, ")\n");
     }
 
@@ -717,11 +739,11 @@ const Emitter = struct {
                     const gen_start = args.items.len;
                     try writeGoStringLiteral(&args, self.allocator, s);
                     const gen_end = args.items.len;
-                    try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .string_literal });
+                    try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(s.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .string_literal });
                 },
                 .expr => |e| {
                     if (args.items.len > 0) try args.appendSlice(self.allocator, ", ");
-                    try args.appendSlice(self.allocator, e);
+                    try args.appendSlice(self.allocator, e.expr);
                 },
             }
         }
@@ -771,7 +793,7 @@ const Emitter = struct {
         const call_gen_start = self.out.items.len;
         try self.out.appendSlice(self.allocator, call_target);
         const call_gen_end = self.out.items.len;
-        try self.mappings.append(self.allocator, .{ .ntx_line = call_abs.line, .ntx_col = call_abs.col, .gen_start = call_gen_start, .gen_end = call_gen_end, .kind = .component_call });
+        try self.mappings.append(self.allocator, .{ .ntx_line = call_abs.line, .ntx_col = call_abs.col, .ntx_len = @intCast(el.tag.len), .gen_start = call_gen_start, .gen_end = call_gen_end, .kind = .component_call });
         try self.out.appendSlice(self.allocator, "(uint32(");
         try self.out.appendSlice(self.allocator, parent_expr);
         try self.out.appendSlice(self.allocator, ")");
@@ -874,7 +896,7 @@ const Emitter = struct {
             const gen_end = self.out.items.len;
             if (text_child) |t| {
                 const abs = translatePosition(self.body_line, self.body_col, t.line, t.col);
-                try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .child_text });
+                try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(t.text.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .child_text });
                 // Deliberately no semantic token here (unlike style-token
                 // names above) -- child text is a widget's own real,
                 // author-facing label, not string-literal *syntax* from
@@ -899,7 +921,7 @@ const Emitter = struct {
             const gen_end = self.out.items.len;
             if (text_child) |t| {
                 const abs = translatePosition(self.body_line, self.body_col, t.line, t.col);
-                try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .child_text });
+                try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(t.text.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .child_text });
                 // Deliberately no semantic token here -- see the matching
                 // Label branch's own comment above.
             }
@@ -918,7 +940,7 @@ const Emitter = struct {
             const gen_end = self.out.items.len;
             if (placeholder_attr) |pa| {
                 const abs = translatePosition(self.body_line, self.body_col, pa.line, pa.col);
-                try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .gen_start = gen_start, .gen_end = gen_end, .kind = .string_literal });
+                try self.mappings.append(self.allocator, .{ .ntx_line = abs.line, .ntx_col = abs.col, .ntx_len = @intCast(pa.value.len), .gen_start = gen_start, .gen_end = gen_end, .kind = .string_literal });
             }
             try self.out.appendSlice(self.allocator, ")\n\tif err != nil {\n\t\treturn err\n\t}\n");
             skip_attr = "placeholder";
@@ -974,12 +996,20 @@ const Emitter = struct {
                 }
             } else if (std.mem.eql(u8, attr.name, "ref")) {
                 switch (attr.value) {
-                    .ref => |target| try self.emitRefAssign(target, var_name, attr.line, attr.col),
+                    // `.ntx` LSP Stage 5: `r.line`/`r.col` mark the real
+                    // target identifier's own position (e.g. "nameField"
+                    // in `ref={&nameField}`), not `ref`'s own position --
+                    // the position a real hover/go-to-definition request
+                    // against that identifier actually needs.
+                    .ref => |r| try self.emitRefAssign(r.target, var_name, r.line, r.col),
                     else => return self.fail(attr.line, attr.col, "malformed 'ref' attribute", .{}),
                 }
             } else if (isEventAttr(attr.name)) {
                 switch (attr.value) {
-                    .expr => |handler| try self.emitEventBinding(var_name, attr.name, handler, attr.line, attr.col),
+                    // Same Stage 5 fix as `ref` above: `ex.line`/`ex.col`
+                    // mark `handleSave`'s own position in
+                    // `onClick={handleSave}`, not `onClick`'s.
+                    .expr => |ex| try self.emitEventBinding(var_name, attr.name, ex.expr, ex.line, ex.col),
                     else => return self.fail(attr.line, attr.col, "'{s}' must be a real handler expression, e.g. {s}={{handleX}}", .{ attr.name, attr.name }),
                 }
             } else {

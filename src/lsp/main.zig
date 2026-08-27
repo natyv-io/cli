@@ -37,6 +37,6 @@ pub fn main(init: std.process.Init) !void {
     // skipping this trips the debug allocator's real leak detector on
     // every open document, not just a theoretical concern.
     var server: ServerModule.Server = .{};
-    defer server.deinit(gpa);
-    try server.run(gpa, &reader.interface, &writer.interface);
+    defer server.deinit(gpa, io);
+    try server.run(gpa, io, &reader.interface, &writer.interface);
 }
