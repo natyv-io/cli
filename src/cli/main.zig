@@ -230,7 +230,16 @@ pub fn parseGetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Get
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
-    const argv = init.minimal.args.vector;
+    // `Args.Iterator.initAllocator`, not raw `argv[i]` indexing --
+    // `init.minimal.args.vector` isn't an array of C-string pointers on
+    // every target the way it is on POSIX: on Windows it's the single raw
+    // UTF-16 command-line string the OS actually hands a process, which
+    // `std.mem.span`-style indexing can't even typecheck against. The
+    // iterator does the real cross-platform (and Windows-specific)
+    // parsing so this file doesn't have to.
+    var arg_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer arg_iter.deinit();
+    _ = arg_iter.skip(); // argv[0] is this executable's own path.
 
     // 64, not the original 8 -- `natyv get`'s repeatable
     // `--include-dir=`/`--link=` flags (Stage 2.3) can realistically add
@@ -239,9 +248,9 @@ pub fn main(init: std.process.Init) !void {
     // no error at all.
     var arg_slices: [64][]const u8 = undefined;
     var arg_count: usize = 0;
-    var i: usize = 1; // argv[0] is this executable's own path.
-    while (i < argv.len and arg_count < arg_slices.len) : (i += 1) {
-        arg_slices[arg_count] = std.mem.span(argv[i]);
+    while (arg_count < arg_slices.len) {
+        const arg = arg_iter.next() orelse break;
+        arg_slices[arg_count] = arg;
         arg_count += 1;
     }
     const args = arg_slices[0..arg_count];

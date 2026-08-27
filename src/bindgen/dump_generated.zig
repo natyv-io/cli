@@ -42,17 +42,27 @@ const allowlist = [_][]const u8{
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const argv = init.minimal.args.vector;
-    if (argv.len != 3) {
-        std.debug.print("usage: dump_generated <zig-out-path> <go-out-path>\n", .{});
-        return error.BadArgs;
-    }
-    const zig_out_path = std.mem.span(argv[1]);
-    const go_out_path = std.mem.span(argv[2]);
 
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
+
+    // Args.Iterator.initAllocator, not raw argv[i] indexing --
+    // init.minimal.args.vector isn't an array of C-string pointers on
+    // every target the way it is on POSIX (on Windows it's the single raw
+    // UTF-16 command-line string itself, which std.mem.span-style
+    // indexing can't even typecheck against).
+    var arg_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer arg_iter.deinit();
+    _ = arg_iter.skip();
+    const zig_out_path = arg_iter.next() orelse {
+        std.debug.print("usage: dump_generated <zig-out-path> <go-out-path>\n", .{});
+        return error.BadArgs;
+    };
+    const go_out_path = arg_iter.next() orelse {
+        std.debug.print("usage: dump_generated <zig-out-path> <go-out-path>\n", .{});
+        return error.BadArgs;
+    };
 
     var descs: [allowlist.len]Reflect.FnDescriptor = undefined;
     inline for (allowlist, 0..) |name, i| {
