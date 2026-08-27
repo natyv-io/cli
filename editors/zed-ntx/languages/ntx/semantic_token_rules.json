@@ -1,0 +1,5 @@
+[
+  { "token_type": "type", "style": ["type"] },
+  { "token_type": "property", "style": ["property"] },
+  { "token_type": "string", "style": ["string"] }
+]
