@@ -39,15 +39,20 @@
 //! established "shell out to a real system tool rather than reimplement
 //! it" precedent) -- no icon means the bundle just gets macOS's own
 //! generic app icon rather than the previous bare-executable glyph.
-//! Windows/Linux equivalents (a `.ico` resource embed, a `.desktop` file
-//! + freedesktop icon theme) are real, separate mechanisms, not yet
-//! designed -- see `project_natyv_distribution_packaging` memory; the
-//! non-macOS branch below keeps the pre-existing flat-binary behavior
-//! unchanged for now.
+//! Windows and Linux each have their own, structurally different real
+//! mechanism, both built: Windows compiles a real `.ico` (see
+//! `WindowsIcon.zig`) into the exe as a genuine PE resource via `build.zig`'s
+//! `-Dwindows-icon-rc=` (needs to happen *before* the `zig build` call
+//! below, unlike macOS/Linux's own post-build packaging); Linux ships the
+//! icon inside its `AppImage`'s own `AppDir` when `linux_package:
+//! "appimage"` is set (see `PackageAppImage.zig`) -- a flat Linux binary
+//! with no `linux_package` set has no icon concept to attach one to at all,
+//! same as before.
 
 const std = @import("std");
 const Io = std.Io;
 const PackageAppImage = @import("PackageAppImage.zig");
+const WindowsIcon = @import("WindowsIcon.zig");
 
 /// Which OS the *target being built* is, not the natyv CLI's own compile
 /// target (`builtin.target.os.tag`, which used to drive this file's own
@@ -107,9 +112,10 @@ pub const Result = struct {
 ///
 /// `bundle_id` (`Config.effectiveBundleId`'s already-resolved result --
 /// either the dev's real one or the synthesized `dev.natyv.<name>`
-/// default) and `icon_path` (`Config.icon`, resolved relative to the
-/// config file's own directory, or `null`) only matter on macOS -- see
-/// this file's own doc comment.
+/// default) only matters on macOS. `icon_path` (`Config.icon`, resolved
+/// relative to the config file's own directory, or `null`) matters on
+/// macOS and Windows (and Linux, when `linux_package` is set) -- see this
+/// file's own doc comment for each OS's real mechanism.
 ///
 /// `config_path` is the app's own real `conf.natyv.json`, copied to
 /// `embedded_config.json` the same way `wasm_path` is copied to
@@ -167,6 +173,19 @@ pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, was
     const dist_abs_len = try dist_dir.realPath(io, &path_buf);
     const dist_abs = path_buf[0..dist_abs_len];
 
+    // Windows icon embedding: must happen *before* the `zig build` call
+    // below, not in the post-build `target_os` switch like macOS/Linux's
+    // own icon handling -- a `.rc`/`.ico` resource is compiled *into* the
+    // exe by `build.zig` itself (`-Dwindows-icon-rc=`, see
+    // `WindowsIcon.zig`'s own doc comment), not attached to an
+    // already-built binary afterward the way `.app`/AppImage packaging
+    // wraps one. The generated `.ico`/`.rc` live in a scratch directory
+    // inside `dist_dir`, cleaned up unconditionally on the way out --
+    // `build.zig` only ever needs them to exist for the duration of the one
+    // `zig build` invocation below.
+    var windows_icon_scratch_created = false;
+    defer if (windows_icon_scratch_created) dist_dir.deleteTree(io, ".natyv-windows-icon-scratch") catch {};
+
     var argv: std.ArrayList([]const u8) = .empty;
     // `install-core`, not the bare default step -- the default "install"
     // step installs every artifact in natyv-core's build graph, including
@@ -189,6 +208,26 @@ pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, was
     // get the real binary-size win of not compiling vendored sqlite3 in at
     // all. Mirrors the app's own `conf.natyv.json` `sqlite.enabled` exactly.
     try argv.append(allocator, if (sqlite_enabled) "-Dsqlite=true" else "-Dsqlite=false");
+
+    if (target_os == .windows) {
+        if (icon_path) |icon| {
+            var scratch_dir = dist_dir.createDirPathOpen(io, ".natyv-windows-icon-scratch", .{}) catch |e| {
+                return .{ .ok = false, .err = .{
+                    .message = try std.fmt.allocPrint(allocator, "natyv build: could not create '{s}/.natyv-windows-icon-scratch': {s}", .{ dist_abs, @errorName(e) }),
+                } };
+            };
+            defer scratch_dir.close(io);
+            windows_icon_scratch_created = true;
+
+            var scratch_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const scratch_abs_len = try scratch_dir.realPath(io, &scratch_path_buf);
+            const scratch_abs = scratch_path_buf[0..scratch_abs_len];
+
+            const icon_result = try WindowsIcon.build(allocator, io, icon, scratch_dir, scratch_abs);
+            if (icon_result.err) |e| return .{ .ok = false, .err = .{ .message = e.message } };
+            try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dwindows-icon-rc={s}", .{icon_result.rc_path}));
+        }
+    }
 
     const result = std.process.run(allocator, io, .{
         .argv = argv.items,
@@ -233,11 +272,11 @@ pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, was
             if (app_result.err) |e| return .{ .ok = false, .err = e };
         },
         .windows => {
-            // Real icon embedding (a `.rc`/`.ico` resource compiled into
-            // the `.exe`) is designed but deliberately not implemented in
-            // this pass -- a plain flat binary, same as before
-            // `compile_targets` existed. See `project_natyv_distribution_packaging`
-            // memory for the real design once this gets picked up.
+            // Icon embedding itself already happened above, before `zig
+            // build` ran (see this file's own comment there for why it has
+            // to happen pre-build, unlike macOS/Linux's post-build
+            // packaging) -- nothing left to do here but move the already
+            // icon-bearing exe out of Zig's own `bin/` directory.
             bin_dir.rename("natyv-core.exe", dist_dir, try std.fmt.allocPrint(allocator, "{s}.exe", .{output_name}), io) catch |e| {
                 return .{ .ok = false, .err = .{
                     .message = try std.fmt.allocPrint(allocator, "natyv build: bundling reported success but the built binary couldn't be moved out of '{s}/bin': {s}", .{ dist_abs, @errorName(e) }),
