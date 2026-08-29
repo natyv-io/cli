@@ -124,11 +124,6 @@ fn confNatyvJson(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
         \\  "network": {{
         \\    "enabled": false
         \\  }},
-        \\  "widgets": {{
-        \\    "button": false,
-        \\    "textfield": false,
-        \\    "label": false
-        \\  }},
         \\  "ui": {{
         \\    "backend": "clay"
         \\  }}

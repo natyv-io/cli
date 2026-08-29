@@ -330,8 +330,7 @@ test "every other config section round-trips unchanged" {
         \\  "name": "bookstore",
         \\  "wasm_compile": "tinygo build -target wasip1 -buildmode=c-shared -o bookstore.wasm .",
         \\  "sqlite": {"enabled": true, "filename": "books.sqlite3"},
-        \\  "network": {"enabled": true, "allowed_hosts": ["www.google.com"]},
-        \\  "widgets": {"button": true, "label": true}
+        \\  "network": {"enabled": true, "allowed_hosts": ["www.google.com"]}
         \\}
     });
 
@@ -344,7 +343,6 @@ test "every other config section round-trips unchanged" {
     try std.testing.expectEqualStrings("books.sqlite3", reparsed.value.sqlite.filename);
     try std.testing.expect(reparsed.value.network.enabled);
     try std.testing.expectEqualStrings("www.google.com", reparsed.value.network.allowed_hosts[0]);
-    try std.testing.expect(reparsed.value.widgets.button and reparsed.value.widgets.label);
 }
 
 test "a missing config file is a clear, natyv-attributed error" {
