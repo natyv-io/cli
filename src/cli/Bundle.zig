@@ -47,7 +47,17 @@
 
 const std = @import("std");
 const Io = std.Io;
-const builtin = @import("builtin");
+const PackageAppImage = @import("PackageAppImage.zig");
+
+/// Which OS the *target being built* is, not the natyv CLI's own compile
+/// target (`builtin.target.os.tag`, which used to drive this file's own
+/// macOS-`.app`-vs-flat-binary branching -- correct only by accident, back
+/// when a single `natyv build` invocation could only ever produce a binary
+/// for whatever OS it was itself running on). Now that `compile_targets`
+/// lets one host cross-compile for more than one OS in a single `natyv
+/// build` run (see `cli/main.zig`/`cli/CompileTargets.zig`), the caller
+/// resolves this explicitly per target instead.
+pub const TargetOs = enum { macos, windows, linux };
 
 pub const BundleError = struct {
     message: []const u8,
@@ -109,7 +119,16 @@ pub const Result = struct {
 /// copy instead of a cwd-relative disk file whenever `-Dembed-app-wasm`
 /// is set. See `EmbeddedWasmPresent.zig`'s own doc comment for the real
 /// launch failure this fixes.
-pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, wasm_path: []const u8, config_path: []const u8, dist_dir: Io.Dir, output_name: []const u8, has_bindings: bool, binding_include_dirs: []const u8, binding_lib_dirs: []const u8, binding_link: []const u8, binding_zig_deps: []const u8, binding_vendor_c_files: []const u8, has_textures: bool, sqlite_enabled: bool, bundle_id: []const u8, icon_path: ?[]const u8) !Result {
+/// `target`/`target_os`: `null`/the host's own OS (today's existing
+/// behavior, unchanged) unless the caller resolved a real
+/// `compile_targets` entry via `CompileTargets.resolve` -- `target` (a raw
+/// Zig triple, e.g. `"aarch64-linux-gnu"`) becomes a real `-Dtarget=` flag
+/// below; `target_os` drives this function's own macOS/Linux branching
+/// instead of `builtin.target.os.tag` (see `TargetOs`'s own doc comment
+/// for why). `linux_package` (only meaningful when `target_os == .linux`)
+/// is `Config.linux_package` verbatim -- `"appimage"` wraps the built
+/// binary via `PackageAppImage.zig`, `null` ships the plain flat binary.
+pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, wasm_path: []const u8, config_path: []const u8, dist_dir: Io.Dir, output_name: []const u8, has_bindings: bool, binding_include_dirs: []const u8, binding_lib_dirs: []const u8, binding_link: []const u8, binding_zig_deps: []const u8, binding_vendor_c_files: []const u8, has_textures: bool, sqlite_enabled: bool, bundle_id: []const u8, icon_path: ?[]const u8, target: ?[]const u8, target_os: TargetOs, linux_package: ?[]const u8) !Result {
     var core_dir = std.Io.Dir.cwd().openDir(io, natyv_core_src, .{}) catch |e| {
         return .{ .ok = false, .err = .{
             .message = try std.fmt.allocPrint(allocator, "natyv build: could not open NATYV_CORE_SRC ('{s}'): {s}", .{ natyv_core_src, @errorName(e) }),
@@ -155,6 +174,7 @@ pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, was
     // binary inside the app's own bundled output (confirmed by actually
     // running a bundle and inspecting what came out).
     try argv.appendSlice(allocator, &.{ "zig", "build", "install-core", "-Dembed-app-wasm=true", "--prefix", dist_abs });
+    if (target) |t| try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dtarget={s}", .{t}));
     if (has_bindings) try argv.append(allocator, "-Dhas-bindings=true");
     if (binding_include_dirs.len > 0) try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dbinding-include-dirs={s}", .{binding_include_dirs}));
     if (binding_lib_dirs.len > 0) try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dbinding-lib-dirs={s}", .{binding_lib_dirs}));
@@ -207,18 +227,55 @@ pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, was
     };
     defer bin_dir.close(io);
 
-    if (builtin.target.os.tag == .macos) {
-        const app_result = try buildMacosApp(allocator, io, dist_dir, dist_abs, bin_dir, output_name, bundle_id, icon_path);
-        if (app_result.err) |e| return .{ .ok = false, .err = e };
-    } else {
-        // Windows/Linux: keep the pre-existing flat-binary behavior --
-        // real icon embedding for those platforms is a distinct,
-        // not-yet-designed mechanism (see this file's own doc comment).
-        bin_dir.rename("natyv-core", dist_dir, output_name, io) catch |e| {
-            return .{ .ok = false, .err = .{
-                .message = try std.fmt.allocPrint(allocator, "natyv build: bundling reported success but the built binary couldn't be moved out of '{s}/bin': {s}", .{ dist_abs, @errorName(e) }),
-            } };
-        };
+    switch (target_os) {
+        .macos => {
+            const app_result = try buildMacosApp(allocator, io, dist_dir, dist_abs, bin_dir, output_name, bundle_id, icon_path);
+            if (app_result.err) |e| return .{ .ok = false, .err = e };
+        },
+        .windows => {
+            // Real icon embedding (a `.rc`/`.ico` resource compiled into
+            // the `.exe`) is designed but deliberately not implemented in
+            // this pass -- a plain flat binary, same as before
+            // `compile_targets` existed. See `project_natyv_distribution_packaging`
+            // memory for the real design once this gets picked up.
+            bin_dir.rename("natyv-core.exe", dist_dir, try std.fmt.allocPrint(allocator, "{s}.exe", .{output_name}), io) catch |e| {
+                return .{ .ok = false, .err = .{
+                    .message = try std.fmt.allocPrint(allocator, "natyv build: bundling reported success but the built binary couldn't be moved out of '{s}/bin': {s}", .{ dist_abs, @errorName(e) }),
+                } };
+            };
+            // A real, un-stripped windows-gnu build also produces a real
+            // ~30MB `.pdb` (debug symbols) -- moved out alongside the
+            // `.exe` (real, potentially useful for a dev debugging a crash
+            // report, not just discarded) rather than left behind, since a
+            // leftover file is exactly what makes the final `bin`
+            // directory non-empty and silently defeats this function's
+            // own cleanup `deleteDir` call below (confirmed the hard way:
+            // a real `dist/windows-x64/bin/natyv-core.pdb` left sitting
+            // there, found by actually running a multi-target build and
+            // inspecting the output, not predicted upfront). A soft
+            // `catch` rather than a hard error -- unlike the `.exe` itself,
+            // a `.pdb`'s existence depends on optimize mode/future stripping
+            // support this function has no control over, so its absence
+            // shouldn't fail an otherwise-successful build.
+            bin_dir.rename("natyv-core.pdb", dist_dir, try std.fmt.allocPrint(allocator, "{s}.pdb", .{output_name}), io) catch {};
+        },
+        .linux => {
+            bin_dir.rename("natyv-core", dist_dir, output_name, io) catch |e| {
+                return .{ .ok = false, .err = .{
+                    .message = try std.fmt.allocPrint(allocator, "natyv build: bundling reported success but the built binary couldn't be moved out of '{s}/bin': {s}", .{ dist_abs, @errorName(e) }),
+                } };
+            };
+            if (linux_package) |pkg| {
+                if (std.mem.eql(u8, pkg, "appimage")) {
+                    const pkg_result = try PackageAppImage.run(allocator, io, dist_dir, dist_abs, output_name, bundle_id, icon_path, target);
+                    if (pkg_result.err) |e| return .{ .ok = false, .err = .{ .message = e.message } };
+                } else {
+                    return .{ .ok = false, .err = .{
+                        .message = try std.fmt.allocPrint(allocator, "natyv build: unrecognized linux_package '{s}' (only \"appimage\" is supported)", .{pkg}),
+                    } };
+                }
+            }
+        },
     }
     dist_dir.deleteDir(io, "bin") catch {};
 
@@ -418,7 +475,7 @@ test "a NATYV_CORE_SRC that doesn't exist is a clear error" {
     defer tmp.cleanup();
     const io = std.testing.io;
 
-    const result = try run(std.testing.allocator, io, "/definitely/not/a/real/path", "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null);
+    const result = try run(std.testing.allocator, io, "/definitely/not/a/real/path", "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null);
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "NATYV_CORE_SRC") != null);
@@ -440,7 +497,7 @@ test "a NATYV_CORE_SRC with no build.zig is a clear error" {
     const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/not-natyv-core", .{ cwd_path, tmp.sub_path });
     defer std.testing.allocator.free(abs_path);
 
-    const result = try run(std.testing.allocator, io, abs_path, "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null);
+    const result = try run(std.testing.allocator, io, abs_path, "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null);
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "build.zig") != null);
@@ -458,7 +515,7 @@ test "a missing compiled wasm file is a clear error" {
     const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_path, tmp.sub_path });
     defer std.testing.allocator.free(abs_path);
 
-    const result = try run(std.testing.allocator, io, abs_path, "/definitely/not/a/real/wasm/path.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null);
+    const result = try run(std.testing.allocator, io, abs_path, "/definitely/not/a/real/wasm/path.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null);
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "compiled wasm") != null);
@@ -479,7 +536,7 @@ test "a missing config file is a clear error" {
     const wasm_abs = try std.fmt.allocPrint(std.testing.allocator, "{s}/app.wasm", .{abs_path});
     defer std.testing.allocator.free(wasm_abs);
 
-    const result = try run(std.testing.allocator, io, abs_path, wasm_abs, "/definitely/not/a/real/conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null);
+    const result = try run(std.testing.allocator, io, abs_path, wasm_abs, "/definitely/not/a/real/conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null);
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "conf.natyv.json") != null);

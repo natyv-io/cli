@@ -1,0 +1,15 @@
+[package]
+name = "appimage_packer"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+backhand = { version = "0.25.1", default-features = false, features = ["gzip"] }
+extism-pdk = "1.4.1"
+serde = { version = "1.0.229", features = ["derive"] }
+
+[patch.crates-io]
+backhand = { path = "../backhand-patched" }

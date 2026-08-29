@@ -5,7 +5,12 @@
 //! runtime `natyv build` eventually bundles a compiled guest into): this
 //! one only ever reads/writes files and spawns the dev's own configured
 //! compile command (`Compile.zig`), so it carries none of natyv-core's
-//! SDL3/Extism/Clay dependencies.
+//! SDL3/Clay/FreeType dependencies. **Confirmed 2026-08-29: it does now
+//! link real Extism** (see `build.zig`'s `linkExtism`) -- the Linux
+//! AppImage-packing plugin (`PackageAppImage.zig`, reached via `Bundle.zig`)
+//! calls a real embedded Extism plugin, and there's no standalone tool to
+//! shell out to the way `sips`/`iconutil` already exist on every Mac for
+//! macOS packaging.
 //!
 //! `natyv build` runs the full prepare -> wasm_compile -> bundle chain
 //! (skipping straight to bundling when nothing's changed since the last
@@ -33,6 +38,7 @@ const Prepare = @import("Prepare");
 const Compile = @import("Compile.zig");
 const BuildCache = @import("BuildCache");
 const Bundle = @import("Bundle.zig");
+const CompileTargets = @import("CompileTargets.zig");
 const Get = @import("Get.zig");
 const Init = @import("Init.zig");
 const ZigVersion = @import("ZigVersion.zig");
@@ -471,10 +477,6 @@ pub fn main(init: std.process.Init) !void {
             // Bundling always runs regardless of freshness -- freshness
             // only ever skips prepare/wasm_compile, never the final
             // bundle step, per Quinn's own explicit design.
-            const dist_dir_path = try std.fs.path.join(arena_alloc, &.{ config_dir, "dist" });
-            var dist_dir = try std.Io.Dir.cwd().createDirPathOpen(io, dist_dir_path, .{});
-            defer dist_dir.close(io);
-
             const wasm_full_path = try std.fs.path.join(arena_alloc, &.{ guest_dir_path, wasm_basename });
 
             // Only meaningful on macOS (see `Bundle.zig`'s own doc
@@ -485,14 +487,76 @@ pub fn main(init: std.process.Init) !void {
             const bundle_id = try config.value.effectiveBundleId(arena_alloc);
             const icon_path: ?[]const u8 = if (config.value.icon) |icon| try std.fs.path.join(arena_alloc, &.{ config_dir, icon }) else null;
 
-            std.debug.print("natyv build: {s} -- bundling...\n", .{config.value.name});
-            const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, config.value.sqlite.enabled, bundle_id, icon_path);
-            if (bundle_result.err) |e| {
-                std.debug.print("{s}\n", .{e.message});
-                return error.BundleFailed;
+            // `compile_targets` fan-out (confirmed 2026-08-29): empty (the
+            // default) means "build for whatever OS `natyv build` itself
+            // is running on," exactly the original single-target behavior
+            // -- one `dist/` directly, `target`/`target_os` resolved from
+            // the CLI's own compile-time OS. A non-empty list produces one
+            // real cross-compiled binary per declared friendly name (see
+            // `CompileTargets.resolve`), each into its own `dist/<name>/`
+            // subdirectory so multiple targets never collide with each
+            // other or with the single-target default layout.
+            if (config.value.compile_targets.len == 0) {
+                const dist_dir_path = try std.fs.path.join(arena_alloc, &.{ config_dir, "dist" });
+                var dist_dir = try std.Io.Dir.cwd().createDirPathOpen(io, dist_dir_path, .{});
+                defer dist_dir.close(io);
+
+                const native_os: Bundle.TargetOs = switch (builtin.target.os.tag) {
+                    .macos => .macos,
+                    .windows => .windows,
+                    .linux => .linux,
+                    else => std.process.fatal("natyv build: unsupported host OS {s}", .{@tagName(builtin.target.os.tag)}),
+                };
+
+                std.debug.print("natyv build: {s} -- bundling...\n", .{config.value.name});
+                const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, config.value.sqlite.enabled, bundle_id, icon_path, null, native_os, config.value.linux_package);
+                if (bundle_result.err) |e| {
+                    std.debug.print("{s}\n", .{e.message});
+                    return error.BundleFailed;
+                }
+                const output_suffix = switch (native_os) {
+                    .macos => ".app",
+                    .windows => ".exe",
+                    .linux => "",
+                };
+                std.debug.print("natyv build: {s} -- built {s}/{s}{s}\n", .{ config.value.name, dist_dir_path, config.value.name, output_suffix });
+            } else {
+                for (config.value.compile_targets) |target_name| {
+                    const resolved = CompileTargets.resolve(target_name) orelse {
+                        const accepted = try CompileTargets.acceptedNamesJoined(arena_alloc);
+                        std.debug.print("natyv build: unrecognized compile_targets entry '{s}' (accepted: {s})\n", .{ target_name, accepted });
+                        return error.BundleFailed;
+                    };
+                    const dist_dir_path = try std.fs.path.join(arena_alloc, &.{ config_dir, "dist", target_name });
+                    var dist_dir = try std.Io.Dir.cwd().createDirPathOpen(io, dist_dir_path, .{});
+                    defer dist_dir.close(io);
+
+                    const resolved_os: Bundle.TargetOs = switch (resolved.os) {
+                        .macos => .macos,
+                        .windows => .windows,
+                        .linux => .linux,
+                    };
+                    // See `CompileTargets.isNativeTarget`'s own doc comment --
+                    // a declared target matching the host exactly is built
+                    // the same way an empty `compile_targets` list already
+                    // is (no `-Dtarget=` flag at all), not by passing its
+                    // triple through anyway.
+                    const target_triple: ?[]const u8 = if (CompileTargets.isNativeTarget(resolved)) null else resolved.triple;
+
+                    std.debug.print("natyv build: {s} -- bundling for {s}...\n", .{ config.value.name, target_name });
+                    const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, config.value.sqlite.enabled, bundle_id, icon_path, target_triple, resolved_os, config.value.linux_package);
+                    if (bundle_result.err) |e| {
+                        std.debug.print("{s}\n", .{e.message});
+                        return error.BundleFailed;
+                    }
+                    const output_suffix = switch (resolved.os) {
+                        .macos => ".app",
+                        .windows => ".exe",
+                        .linux => "",
+                    };
+                    std.debug.print("natyv build: {s} -- built {s}/{s}{s}\n", .{ config.value.name, dist_dir_path, config.value.name, output_suffix });
+                }
             }
-            const output_suffix = if (builtin.target.os.tag == .macos) ".app" else "";
-            std.debug.print("natyv build: {s} -- built {s}/{s}{s}\n", .{ config.value.name, dist_dir_path, config.value.name, output_suffix });
         },
         .init, .get => unreachable, // both handled above
     }
