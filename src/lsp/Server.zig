@@ -930,6 +930,7 @@ fn realNtxFormUri(io: Io, gpa: std.mem.Allocator) ![]u8 {
 
 test "handleMessage: a real textDocument/hover against the real ntx-form fixture returns real gopls info" {
     const io = std.testing.io;
+    std.Io.Dir.cwd().access(std.testing.io, "examples/ntx-form/guest", .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
 
     const uri = try realNtxFormUri(io, gpa);
@@ -970,6 +971,7 @@ test "handleMessage: a real textDocument/hover against the real ntx-form fixture
 
 test "handleMessage: a real textDocument/definition against the real ntx-form fixture redirects the real form.go location back into the original .ntx file" {
     const io = std.testing.io;
+    std.Io.Dir.cwd().access(std.testing.io, "examples/ntx-form/guest", .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
 
     const uri = try realNtxFormUri(io, gpa);
@@ -1033,6 +1035,7 @@ test "handleMessage: a real textDocument/definition against the real ntx-form fi
 
 test "handleMessage: a real textDocument/completion mid-typing 'handle' suggests the real handleSave" {
     const io = std.testing.io;
+    std.Io.Dir.cwd().access(std.testing.io, "examples/ntx-form/guest", .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
 
     const uri = try realNtxFormUri(io, gpa);

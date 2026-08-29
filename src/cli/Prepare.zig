@@ -534,6 +534,7 @@ test "transpiles nested .go.ntx files across sub-packages, output lands in each 
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const io = std.testing.io;
+    std.Io.Dir.cwd().access(std.testing.io, "sdk/go", .{}) catch return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();

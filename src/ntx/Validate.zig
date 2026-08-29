@@ -117,6 +117,7 @@ test "a genuine two-package import cycle fails with a clear, natyv-attributed me
 
 test "the Stage 6a component-reuse fixture (non-cyclic) passes cleanly for real" {
     const io = std.testing.io;
+    std.Io.Dir.cwd().access(std.testing.io, "examples/ntx-components/guest", .{}) catch return error.SkipZigTest;
     var dir = try Io.Dir.cwd().openDir(io, "examples/ntx-components/guest", .{});
     defer dir.close(io);
 

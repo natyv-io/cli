@@ -658,6 +658,7 @@ const guest_dir = "examples/ntx-form/guest";
 
 test "GoplsClient: a real spawn+initialize handshake against the real ntx-form fixture succeeds" {
     const io = std.testing.io;
+    std.Io.Dir.cwd().access(std.testing.io, "examples/ntx-form/guest", .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     const cwd_path = try std.process.currentPathAlloc(io, allocator);
@@ -672,6 +673,7 @@ test "GoplsClient: a real spawn+initialize handshake against the real ntx-form f
 
 test "GoplsClient: a real hover against a virtual, never-on-disk generated document returns gopls's real real type info" {
     const io = std.testing.io;
+    std.Io.Dir.cwd().access(std.testing.io, "examples/ntx-form/guest", .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     const cwd_path = try std.process.currentPathAlloc(io, allocator);
@@ -717,6 +719,7 @@ test "GoplsClient: a real hover against a virtual, never-on-disk generated docum
 
 test "GoplsClient: a real go-to-definition on handleSave resolves to its real definition in form.go, not the virtual doc" {
     const io = std.testing.io;
+    std.Io.Dir.cwd().access(std.testing.io, "examples/ntx-form/guest", .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     const cwd_path = try std.process.currentPathAlloc(io, allocator);
@@ -755,6 +758,7 @@ test "GoplsClient: a real go-to-definition on handleSave resolves to its real de
 
 test "GoplsClient: a real completion request mid-typing 'handle' suggests the real handleSave from a sibling file" {
     const io = std.testing.io;
+    std.Io.Dir.cwd().access(std.testing.io, "examples/ntx-form/guest", .{}) catch return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     const cwd_path = try std.process.currentPathAlloc(io, allocator);

@@ -1,0 +1,29 @@
+.zig-cache/
+zig-out/
+zig-pkg/
+.DS_Store
+
+# Binding generator: natyv get/natyv bind's own real scratch/vendor
+# output, written into this repo's own src/bindgen/ during local dev.
+src/bindgen/_natyv_bind_scratch_*
+src/bindgen/_natyv_bind_vendor_*
+src/bindgen/_natyv_vendor_locate_*
+src/bindgen/*_bindings_generated.zig
+.natyv-vendor-discover-*
+
+# Stage 1's own real-compile-check fixture output (dev-only, regenerated
+# every zig build test if that step is ever re-added here).
+src/bindgen/generated_check.zig
+src/bindgen/generated_check.go
+
+# editors/ dev-extension build caches.
+editors/vscode-ntx/node_modules/
+editors/vscode-ntx/out/
+editors/zed-ntx/grammars/
+editors/zed-ntx/target/
+editors/zed-ntx/extension.wasm
+editors/intellij-ntss/.intellijPlatform/
+
+# tools/appimage-packer's own real Cargo build-artifact directories.
+tools/appimage-packer/plugin/target/
+tools/appimage-packer/backhand-patched/target/
