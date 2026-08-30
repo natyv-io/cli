@@ -413,6 +413,25 @@ pub fn main(init: std.process.Init) !void {
             // there are any `bindings` entries.
             const natyv_core_src = init.environ_map.get("NATYV_CORE_SRC") orelse build_options.natyv_core_src_default;
 
+            // `zig build install-core` writes its own real `.zig-cache`/
+            // `zig-pkg` directories into wherever it's invoked from
+            // (`natyv_core_src`) -- fine for a normal project checkout a
+            // dev already gitignores, but confirmed for real to be a
+            // genuine problem once `natyv_core_src` is a Homebrew-managed
+            // (or any other packaging-managed) install location: repeated
+            // `natyv build` runs would keep growing a package directory
+            // that's supposed to stay read-only after install (found via
+            // a real natyv-core Homebrew formula ballooning to 2GB after
+            // one real app build). Redirected here to a real, dedicated
+            // location instead -- `natyv cache --clear`/`natyv cache
+            // --dir=` (an explicit override) are confirmed future,
+            // post-v1 work; hardcoded to `~/.cache/natyv` for now.
+            const home = init.environ_map.get("HOME") orelse {
+                std.debug.print("natyv build: could not determine cache directory (HOME is not set)\n", .{});
+                return error.BundleFailed;
+            };
+            const cache_dir = try std.fs.path.join(arena_alloc, &.{ home, ".cache", "natyv" });
+
             // Checked once, up front, before running anything -- Quinn's
             // own design: if nothing that affects the compiled wasm has
             // changed since the last successful wasm_compile, skip
@@ -509,7 +528,7 @@ pub fn main(init: std.process.Init) !void {
                 };
 
                 std.debug.print("natyv build: {s} -- bundling...\n", .{config.value.name});
-                const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, config.value.sqlite.enabled, bundle_id, icon_path, null, native_os, config.value.linux_package);
+                const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, config.value.sqlite.enabled, bundle_id, icon_path, null, native_os, config.value.linux_package, cache_dir);
                 if (bundle_result.err) |e| {
                     std.debug.print("{s}\n", .{e.message});
                     return error.BundleFailed;
@@ -544,7 +563,7 @@ pub fn main(init: std.process.Init) !void {
                     const target_triple: ?[]const u8 = if (CompileTargets.isNativeTarget(resolved)) null else resolved.triple;
 
                     std.debug.print("natyv build: {s} -- bundling for {s}...\n", .{ config.value.name, target_name });
-                    const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, config.value.sqlite.enabled, bundle_id, icon_path, target_triple, resolved_os, config.value.linux_package);
+                    const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, config.value.sqlite.enabled, bundle_id, icon_path, target_triple, resolved_os, config.value.linux_package, cache_dir);
                     if (bundle_result.err) |e| {
                         std.debug.print("{s}\n", .{e.message});
                         return error.BundleFailed;

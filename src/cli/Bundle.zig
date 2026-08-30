@@ -134,7 +134,18 @@ pub const Result = struct {
 /// for why). `linux_package` (only meaningful when `target_os == .linux`)
 /// is `Config.linux_package` verbatim -- `"appimage"` wraps the built
 /// binary via `PackageAppImage.zig`, `null` ships the plain flat binary.
-pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, wasm_path: []const u8, config_path: []const u8, dist_dir: Io.Dir, output_name: []const u8, has_bindings: bool, binding_include_dirs: []const u8, binding_lib_dirs: []const u8, binding_link: []const u8, binding_zig_deps: []const u8, binding_vendor_c_files: []const u8, has_textures: bool, sqlite_enabled: bool, bundle_id: []const u8, icon_path: ?[]const u8, target: ?[]const u8, target_os: TargetOs, linux_package: ?[]const u8) !Result {
+///
+/// `cache_dir` (`~/.cache/natyv` today, hardcoded by the caller -- a real
+/// `natyv cache --dir=` override is confirmed future, post-v1 work) is
+/// where `zig build`'s own `.zig-cache`/`zig-pkg` directories get
+/// redirected to via `--cache-dir`/`--global-cache-dir` below. Without
+/// this, `zig build` writes those directly into `natyv_core_src` itself
+/// (wherever it's invoked from) -- harmless for a normal project checkout
+/// a dev already gitignores, but a real, confirmed problem the moment
+/// `natyv_core_src` is a packaging-managed install location (a real
+/// Homebrew-installed natyv-core directory grew to 2GB after one app
+/// build) that's supposed to stay read-only after install.
+pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, wasm_path: []const u8, config_path: []const u8, dist_dir: Io.Dir, output_name: []const u8, has_bindings: bool, binding_include_dirs: []const u8, binding_lib_dirs: []const u8, binding_link: []const u8, binding_zig_deps: []const u8, binding_vendor_c_files: []const u8, has_textures: bool, sqlite_enabled: bool, bundle_id: []const u8, icon_path: ?[]const u8, target: ?[]const u8, target_os: TargetOs, linux_package: ?[]const u8, cache_dir: []const u8) !Result {
     var core_dir = std.Io.Dir.cwd().openDir(io, natyv_core_src, .{}) catch |e| {
         return .{ .ok = false, .err = .{
             .message = try std.fmt.allocPrint(allocator, "natyv build: could not open NATYV_CORE_SRC ('{s}'): {s}", .{ natyv_core_src, @errorName(e) }),
@@ -186,13 +197,57 @@ pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, was
     var windows_icon_scratch_created = false;
     defer if (windows_icon_scratch_created) dist_dir.deleteTree(io, ".natyv-windows-icon-scratch") catch {};
 
+    // Redirecting `zig build`'s own caches to `cache_dir` needs three real
+    // pieces, not just the two documented flags -- confirmed the hard way
+    // against natyv-core's own real dependency graph (SDL3's own nested
+    // `libusb`/`fribidi` sub-dependencies): (1) `--cache-dir` correctly
+    // redirects `.zig-cache`; (2) `--global-cache-dir` correctly redirects
+    // the standard `<dir>/p/<hash>` package cache; but (3) natyv-core's
+    // build graph *also* writes a real, separate `zig-pkg/<hash>`
+    // directory relative to wherever `zig build` is invoked from,
+    // unconditionally, regardless of either flag or their
+    // `ZIG_*_CACHE_DIR` env var equivalents -- worked around with a real
+    // symlink at `natyv_core_src/zig-pkg` pointing at the desired
+    // location instead, so even an unconditional relative write lands
+    // where intended. Also confirmed the hard way: a *custom* (non-
+    // default) global cache dir hits a real Zig bug fetching a `.zip`-
+    // packaged dependency specifically (fribidi's `.tar.gz` fetches fine;
+    // libusb's `.zip` fails with "failed to create temporary zip file:
+    // FileNotFound") unless its own `tmp/`/`p/` subdirectories already
+    // exist -- pre-created below rather than left for `zig` to create
+    // lazily.
+    const zig_cache_dir = try std.fs.path.join(allocator, &.{ cache_dir, "zig-cache" });
+    const zig_global_cache_dir = try std.fs.path.join(allocator, &.{ cache_dir, "zig-global-cache" });
+    const zig_pkg_dir = try std.fs.path.join(allocator, &.{ cache_dir, "zig-pkg" });
+    {
+        var d_dir = try std.Io.Dir.cwd().createDirPathOpen(io, zig_cache_dir, .{});
+        d_dir.close(io);
+    }
+    // `tmp/`/`p/` need pre-creating under *both* real package-cache
+    // locations (`zig_global_cache_dir`, the documented `--global-cache-
+    // dir` target, and `zig_pkg_dir`, the symlinked one) -- confirmed the
+    // hard way that omitting either one still reproduces the same real
+    // "failed to create temporary zip file" error the moment a `.zip`-
+    // packaged dependency's fetch happens to land in the one missing its
+    // own `tmp/`.
+    for ([_][]const u8{ zig_global_cache_dir, zig_pkg_dir }) |base| {
+        for ([_][]const u8{ "tmp", "p" }) |sub| {
+            var sub_dir = try std.Io.Dir.cwd().createDirPathOpen(io, try std.fs.path.join(allocator, &.{ base, sub }), .{});
+            sub_dir.close(io);
+        }
+    }
+    core_dir.symLink(io, zig_pkg_dir, "zig-pkg", .{ .is_directory = true }) catch |e| switch (e) {
+        error.PathAlreadyExists => {},
+        else => return e,
+    };
+
     var argv: std.ArrayList([]const u8) = .empty;
     // `install-core`, not the bare default step -- the default "install"
     // step installs every artifact in natyv-core's build graph, including
     // the `natyv` CLI itself, which would leave a stray, useless second
     // binary inside the app's own bundled output (confirmed by actually
     // running a bundle and inspecting what came out).
-    try argv.appendSlice(allocator, &.{ "zig", "build", "install-core", "-Dembed-app-wasm=true", "--prefix", dist_abs });
+    try argv.appendSlice(allocator, &.{ "zig", "build", "install-core", "-Dembed-app-wasm=true", "--prefix", dist_abs, "--cache-dir", zig_cache_dir, "--global-cache-dir", zig_global_cache_dir });
     if (target) |t| try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dtarget={s}", .{t}));
     if (has_bindings) try argv.append(allocator, "-Dhas-bindings=true");
     if (binding_include_dirs.len > 0) try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dbinding-include-dirs={s}", .{binding_include_dirs}));
@@ -514,7 +569,7 @@ test "a NATYV_CORE_SRC that doesn't exist is a clear error" {
     defer tmp.cleanup();
     const io = std.testing.io;
 
-    const result = try run(std.testing.allocator, io, "/definitely/not/a/real/path", "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null);
+    const result = try run(std.testing.allocator, io, "/definitely/not/a/real/path", "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null, "/tmp/natyv-test-cache");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "NATYV_CORE_SRC") != null);
@@ -536,7 +591,7 @@ test "a NATYV_CORE_SRC with no build.zig is a clear error" {
     const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/not-natyv-core", .{ cwd_path, tmp.sub_path });
     defer std.testing.allocator.free(abs_path);
 
-    const result = try run(std.testing.allocator, io, abs_path, "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null);
+    const result = try run(std.testing.allocator, io, abs_path, "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null, "/tmp/natyv-test-cache");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "build.zig") != null);
@@ -554,7 +609,7 @@ test "a missing compiled wasm file is a clear error" {
     const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_path, tmp.sub_path });
     defer std.testing.allocator.free(abs_path);
 
-    const result = try run(std.testing.allocator, io, abs_path, "/definitely/not/a/real/wasm/path.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null);
+    const result = try run(std.testing.allocator, io, abs_path, "/definitely/not/a/real/wasm/path.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null, "/tmp/natyv-test-cache");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "compiled wasm") != null);
@@ -575,7 +630,7 @@ test "a missing config file is a clear error" {
     const wasm_abs = try std.fmt.allocPrint(std.testing.allocator, "{s}/app.wasm", .{abs_path});
     defer std.testing.allocator.free(wasm_abs);
 
-    const result = try run(std.testing.allocator, io, abs_path, wasm_abs, "/definitely/not/a/real/conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null);
+    const result = try run(std.testing.allocator, io, abs_path, wasm_abs, "/definitely/not/a/real/conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null, "/tmp/natyv-test-cache");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "conf.natyv.json") != null);
