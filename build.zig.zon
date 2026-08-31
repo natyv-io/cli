@@ -29,8 +29,8 @@
             .hash = "N-V-__8AACLxny4duQDp3FGCPOH31CSIZ2WJAe2AEo9XajH0",
         },
         .shared = .{
-            .url = "git+https://github.com/natyv-io/shared#ed008d38953fb791c31ca8cb2561c9497342c2bc",
-            .hash = "natyv_shared-0.1.0-cp-g4HGJAADGKUQ37Gxg_zUrjoX1FXBGed09X2AOS0O8",
+            .url = "git+https://github.com/natyv-io/shared#f5a057ef164781ebefdc814fe14555702f911a44",
+            .hash = "natyv_shared-0.1.0-cp-g4KKeAACOaKnkX38aNq1uqntAMdGGGFOFzYegk_iU",
         },
     },
     .paths = .{

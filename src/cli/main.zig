@@ -126,6 +126,35 @@ fn parseFlag(arg: []const u8, comptime prefix: []const u8) ?[]const u8 {
     return null;
 }
 
+const CaCertEntry = struct {
+    host: []const u8,
+    port: u16,
+    pem: []const u8,
+};
+
+/// Builds the real `embedded_ca_certs.json` payload `Bundle.run` stages --
+/// reads every `allowed_sockets[].ca_cert_path` (relative to `config_dir`,
+/// same convention as `icon`) now, at real `natyv build` time, so a bundled
+/// `.app` never needs to resolve a relative path against a directory it
+/// has no reliable notion of at runtime (see `EmbeddedWasmPresent.zig`'s
+/// own doc comment). `std.json.Stringify.valueAlloc` (not manual string
+/// building) handles real PEM content correctly -- a PEM file's own
+/// embedded newlines need real JSON string escaping, not just naive
+/// concatenation.
+fn buildCaCertsJson(allocator: std.mem.Allocator, io: std.Io, allowed_sockets: []const Config.AllowedSocket, config_dir: []const u8) ![]const u8 {
+    var entries: std.ArrayList(CaCertEntry) = .empty;
+    for (allowed_sockets) |entry| {
+        const cert_path = entry.ca_cert_path orelse continue;
+        const full_path = try std.fs.path.join(allocator, &.{ config_dir, cert_path });
+        const pem = std.Io.Dir.cwd().readFileAlloc(io, full_path, allocator, .unlimited) catch |e| {
+            std.debug.print("natyv build: could not read ca_cert_path '{s}' for {s}:{d}: {s}\n", .{ full_path, entry.host, entry.port, @errorName(e) });
+            return error.CaCertReadFailed;
+        };
+        try entries.append(allocator, .{ .host = entry.host, .port = entry.port, .pem = pem });
+    }
+    return std.json.Stringify.valueAlloc(allocator, entries.items, .{});
+}
+
 /// Parses `natyv get`'s own flag-heavy shape: `args[0]` is `<library>`,
 /// the rest are `-c`/`-zig` (bare mode-selector flags, optional -- mode
 /// defaults to `.manual`, Stage 2.3's original behavior) and
@@ -506,6 +535,15 @@ pub fn main(init: std.process.Init) !void {
             const bundle_id = try config.value.effectiveBundleId(arena_alloc);
             const icon_path: ?[]const u8 = if (config.value.icon) |icon| try std.fs.path.join(arena_alloc, &.{ config_dir, icon }) else null;
 
+            // Real custom-CA staging: read each `allowed_sockets[].
+            // ca_cert_path` (relative to `config_dir`, same convention as
+            // `icon` above) now, at real `natyv build` time, so
+            // `Bundle.run` just stages already-resolved bytes -- see its
+            // own doc comment and `EmbeddedWasmPresent.zig`'s for why a
+            // bundled `.app` can't do this relative-path resolution again
+            // at runtime.
+            const ca_certs_json = try buildCaCertsJson(arena_alloc, io, config.value.network.tcp.allowed_sockets, config_dir);
+
             // `compile_targets` fan-out (confirmed 2026-08-29): empty (the
             // default) means "build for whatever OS `natyv build` itself
             // is running on," exactly the original single-target behavior
@@ -528,7 +566,7 @@ pub fn main(init: std.process.Init) !void {
                 };
 
                 std.debug.print("natyv build: {s} -- bundling...\n", .{config.value.name});
-                const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, config.value.sqlite.enabled, bundle_id, icon_path, null, native_os, config.value.linux_package, cache_dir);
+                const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, config.value.sqlite.enabled, bundle_id, icon_path, null, native_os, config.value.linux_package, ca_certs_json, cache_dir);
                 if (bundle_result.err) |e| {
                     std.debug.print("{s}\n", .{e.message});
                     return error.BundleFailed;
@@ -563,7 +601,7 @@ pub fn main(init: std.process.Init) !void {
                     const target_triple: ?[]const u8 = if (CompileTargets.isNativeTarget(resolved)) null else resolved.triple;
 
                     std.debug.print("natyv build: {s} -- bundling for {s}...\n", .{ config.value.name, target_name });
-                    const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, config.value.sqlite.enabled, bundle_id, icon_path, target_triple, resolved_os, config.value.linux_package, cache_dir);
+                    const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, config.value.sqlite.enabled, bundle_id, icon_path, target_triple, resolved_os, config.value.linux_package, ca_certs_json, cache_dir);
                     if (bundle_result.err) |e| {
                         std.debug.print("{s}\n", .{e.message});
                         return error.BundleFailed;
@@ -777,4 +815,43 @@ test "parseGetArgs: -c=<url> with --c-build= and --link= is a valid tier-2 vendo
     });
     try std.testing.expectEqualStrings("./configure && make", args.vendor_c_build.?);
     try std.testing.expectEqual(@as(usize, 1), args.link.len);
+}
+
+test "buildCaCertsJson: reads a real PEM file relative to config_dir, escapes real newlines correctly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    const config_dir = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_path, tmp.sub_path });
+    const pem = "-----BEGIN CERTIFICATE-----\nFAKEFAKEFAKE\n-----END CERTIFICATE-----\n";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(allocator, "{s}/internal-ca.pem", .{config_dir}), .data = pem });
+
+    const allowed_sockets = [_]Config.AllowedSocket{
+        .{ .host = "internal.example.com", .port = 993, .tls = .implicit, .ca_cert_path = "internal-ca.pem" },
+        .{ .host = "imap.gmail.com", .port = 993, .tls = .implicit }, // no ca_cert_path -- must be skipped
+    };
+    const json = try buildCaCertsJson(allocator, io, &allowed_sockets, config_dir);
+
+    const parsed = try std.json.parseFromSlice([]const CaCertEntry, allocator, json, .{});
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.len); // only the entry with ca_cert_path set
+    try std.testing.expectEqualStrings("internal.example.com", parsed.value[0].host);
+    try std.testing.expectEqual(@as(u16, 993), parsed.value[0].port);
+    try std.testing.expectEqualStrings(pem, parsed.value[0].pem); // real newlines survived the JSON round trip
+}
+
+test "buildCaCertsJson: no ca_cert_path anywhere produces a real empty array, not an error" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const allowed_sockets = [_]Config.AllowedSocket{
+        .{ .host = "imap.gmail.com", .port = 993, .tls = .implicit },
+    };
+    const json = try buildCaCertsJson(allocator, io, &allowed_sockets, "/irrelevant");
+    try std.testing.expectEqualStrings("[]", json);
 }
