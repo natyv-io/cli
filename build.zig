@@ -86,33 +86,15 @@ pub fn build(b: *std.Build) void {
 
     const extism_prefix = extismPrefixOverride(b);
 
-    // `Config` comes from natyv-io/shared -- see natyv-io/core's own
-    // build.zig for the full reasoning (identical here: both repos need
-    // the exact same conf.natyv.json schema/parser).
+    // `Config`, and (2026-09-01, moved out of this repo so
+    // natyv-io/ntx-lsp can share them too) the whole `.ntx` transpiler
+    // core -- `Stylesheet`/`Resolver`/`Parser`/`Expose`/`Codegen` -- all
+    // come from natyv-io/shared now. Their own unit tests moved with them
+    // and run as part of `shared`'s own `zig build test`, not this repo's.
     const shared_dep = b.dependency("shared", .{ .target = target, .optimize = optimize });
     const config_mod = shared_dep.module("Config");
-
-    // Styling system: pure text-in/tree-out, zero SDL/Clay dependency.
-    // Named module since Stage 7's real stylesheet discovery (`Prepare`)
-    // and `Resolver` both need to reach the exact same compiled
-    // `Stylesheet.zig` so a `Stylesheet.StyleSheet` produced by one is
-    // accepted by the other's own `resolve()`.
-    const stylesheet_mod = b.createModule(.{
-        .root_source_file = b.path("src/styling/Stylesheet.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const stylesheet_tests = b.addTest(.{ .root_module = stylesheet_mod });
-    const run_stylesheet_tests = b.addRunArtifact(stylesheet_tests);
-
-    const resolver_mod = b.createModule(.{
-        .root_source_file = b.path("src/styling/Resolver.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    resolver_mod.addImport("Stylesheet", stylesheet_mod);
-    const resolver_tests = b.addTest(.{ .root_module = resolver_mod });
-    const run_resolver_tests = b.addRunArtifact(resolver_tests);
+    const stylesheet_mod = shared_dep.module("Stylesheet");
+    const resolver_mod = shared_dep.module("Resolver");
 
     const styling_codegen_mod = b.createModule(.{
         .root_source_file = b.path("src/styling/Codegen.zig"),
@@ -123,43 +105,13 @@ pub fn build(b: *std.Build) void {
     const codegen_tests = b.addTest(.{ .root_module = styling_codegen_mod });
     const run_codegen_tests = b.addRunArtifact(codegen_tests);
 
-    // `.ntx` tooling: pure text-in/tree-out, same "zero SDL/Clay
-    // dependency" reasoning as the stylesheet tests above.
-    const ntx_parser_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/ntx/Parser.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_ntx_parser_tests = b.addRunArtifact(ntx_parser_tests);
-
-    const ntx_parser_mod = b.createModule(.{
-        .root_source_file = b.path("src/ntx/Parser.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const ntx_expose_mod = b.createModule(.{
-        .root_source_file = b.path("src/ntx/Expose.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ntx_expose_mod.addImport("Parser", ntx_parser_mod);
-
-    const ntx_expose_tests = b.addTest(.{ .root_module = ntx_expose_mod });
-    const run_ntx_expose_tests = b.addRunArtifact(ntx_expose_tests);
-
-    const ntx_codegen_module = b.createModule(.{
-        .root_source_file = b.path("src/ntx/Codegen.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ntx_codegen_module.addImport("Resolver", resolver_mod);
-    ntx_codegen_module.addImport("Expose", ntx_expose_mod);
-    ntx_codegen_module.addImport("Parser", ntx_parser_mod);
-    const ntx_codegen_tests = b.addTest(.{ .root_module = ntx_codegen_module });
-    const run_ntx_codegen_tests = b.addRunArtifact(ntx_codegen_tests);
+    // `.ntx` tooling: `Expose`/`Codegen` also come from natyv-io/shared now
+    // (see the `shared_dep` note above; their own internal `Parser` wiring
+    // is already baked into `shared`'s own build.zig, so nothing here
+    // needs to reference `Parser` directly) -- `Validate` below is
+    // `cli`-only (not needed by `ntx-lsp`), so it stays local.
+    const ntx_expose_mod = shared_dep.module("Expose");
+    const ntx_codegen_module = shared_dep.module("Codegen");
 
     const ntx_validate_module = b.createModule(.{
         .root_source_file = b.path("src/ntx/Validate.zig"),
@@ -388,12 +340,7 @@ pub fn build(b: *std.Build) void {
     const run_ntx_lsp_tests = b.addRunArtifact(ntx_lsp_tests);
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_stylesheet_tests.step);
-    test_step.dependOn(&run_resolver_tests.step);
     test_step.dependOn(&run_codegen_tests.step);
-    test_step.dependOn(&run_ntx_parser_tests.step);
-    test_step.dependOn(&run_ntx_expose_tests.step);
-    test_step.dependOn(&run_ntx_codegen_tests.step);
     test_step.dependOn(&run_ntx_validate_tests.step);
     test_step.dependOn(&run_bindgen_reflect_tests.step);
     test_step.dependOn(&run_bindgen_codegen_tests.step);
