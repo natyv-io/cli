@@ -313,32 +313,6 @@ pub fn build(b: *std.Build) void {
     const cli_tests = b.addTest(.{ .root_module = cli_test_module });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
-    // The `ntx-lsp` binary, deliberately standalone rather than a `natyv`
-    // subcommand -- decouples its stdio/JSON-RPC process lifecycle from
-    // the CLI's own argv/exit-code conventions.
-    const ntx_lsp_module = b.createModule(.{
-        .root_source_file = b.path("src/lsp/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ntx_lsp_module.addImport("Expose", ntx_expose_mod);
-    ntx_lsp_module.addImport("Codegen", ntx_codegen_module);
-    const ntx_lsp_exe = b.addExecutable(.{
-        .name = "ntx-lsp",
-        .root_module = ntx_lsp_module,
-    });
-    b.installArtifact(ntx_lsp_exe);
-
-    const ntx_lsp_test_module = b.createModule(.{
-        .root_source_file = b.path("src/lsp/Server.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ntx_lsp_test_module.addImport("Expose", ntx_expose_mod);
-    ntx_lsp_test_module.addImport("Codegen", ntx_codegen_module);
-    const ntx_lsp_tests = b.addTest(.{ .root_module = ntx_lsp_test_module });
-    const run_ntx_lsp_tests = b.addRunArtifact(ntx_lsp_tests);
-
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_codegen_tests.step);
     test_step.dependOn(&run_ntx_validate_tests.step);
@@ -355,5 +329,4 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_vendor_tests.step);
     test_step.dependOn(&run_get_tests.step);
     test_step.dependOn(&run_cli_tests.step);
-    test_step.dependOn(&run_ntx_lsp_tests.step);
 }
