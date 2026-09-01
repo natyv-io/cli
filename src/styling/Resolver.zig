@@ -36,6 +36,35 @@ pub const Border = struct { width: u16, color: Color };
 pub const GradientStop = struct { pos: GradientAnchor, color: Color };
 pub const Gradient = struct { start: GradientStop, end: GradientStop };
 
+/// A Container's own child-flow direction -- matches `widgets.TopToBottom`/
+/// `widgets.LeftToRight` (raw string constants on the Go side, real enum
+/// here since the resolver's whole point is catching a typo before it ever
+/// reaches generated code).
+pub const Direction = enum { topToBottom, leftToRight };
+
+pub const AlignX = enum { left, right, center };
+pub const AlignY = enum { top, bottom, center };
+
+/// Mirrors `widgets.SizingAxis`'s own four real shapes (Fixed/Grow/Fit/
+/// Percent) -- `value` is only meaningful for `.fixed` (pixels) and
+/// `.percent` (a 0..1 fraction); `.grow`/`.fit` take no value at all,
+/// matching the SDK's own `Grow()`/`Fit()` constructors.
+pub const SizingKind = enum { fixed, grow, fit, percent };
+pub const Sizing = struct { kind: SizingKind, value: f32 = 0 };
+
+/// Layout properties (`direction`/`childGap`/`width`/`height`/`alignX`/
+/// `alignY`, alongside the already-existing `margin`) are deliberately
+/// **never** emitted into `styling/Codegen.zig`'s `widgets.ResolvedStyle`
+/// Go map, and never touch the runtime `ApplyStyle`/`natyv_set_style`
+/// mechanism -- see that file's own doc comment on `margin` for why: Clay's
+/// layout model bakes these into a widget's `Layout` struct once, at
+/// creation time, not something a running widget can be told to
+/// re-flow later the way background color/border/corner radius can.
+/// `ntx/Codegen.zig` consumes these fields directly (see its own
+/// `layoutStyleFor`), overriding its per-tag `LayoutDefaults` at
+/// `.ntx`-transpile time -- the exact same architecture `margin` already
+/// established, just generalized to the rest of Clay's real layout
+/// vocabulary.
 pub const ResolvedStyleToken = struct {
     name: []const u8,
     corner_radius: ?[4]u16 = null,
@@ -45,6 +74,12 @@ pub const ResolvedStyleToken = struct {
     padding: ?u16 = null,
     margin: ?u16 = null,
     texture: ?[]const u8 = null,
+    direction: ?Direction = null,
+    child_gap: ?u16 = null,
+    width: ?Sizing = null,
+    height: ?Sizing = null,
+    align_x: ?AlignX = null,
+    align_y: ?AlignY = null,
     /// Raw passthrough -- see file doc comment.
     text: ?Stylesheet.Value = null,
     /// Raw passthrough -- see file doc comment.
@@ -175,6 +210,58 @@ const Resolver = struct {
         };
     }
 
+    fn resolveDirection(self: *Resolver, field: Stylesheet.Field) Error!Direction {
+        const id = switch (field.value) {
+            .ident => |i| i,
+            else => return self.fail(field.line, field.col, "field 'direction' must be a bare keyword ('topToBottom' or 'leftToRight')", .{}),
+        };
+        return std.meta.stringToEnum(Direction, id) orelse
+            self.fail(field.line, field.col, "field 'direction': '{s}' is not 'topToBottom' or 'leftToRight'", .{id});
+    }
+
+    fn resolveAlignX(self: *Resolver, field: Stylesheet.Field) Error!AlignX {
+        const id = switch (field.value) {
+            .ident => |i| i,
+            else => return self.fail(field.line, field.col, "field 'alignX' must be a bare keyword ('left', 'right', or 'center')", .{}),
+        };
+        return std.meta.stringToEnum(AlignX, id) orelse
+            self.fail(field.line, field.col, "field 'alignX': '{s}' is not 'left', 'right', or 'center'", .{id});
+    }
+
+    fn resolveAlignY(self: *Resolver, field: Stylesheet.Field) Error!AlignY {
+        const id = switch (field.value) {
+            .ident => |i| i,
+            else => return self.fail(field.line, field.col, "field 'alignY' must be a bare keyword ('top', 'bottom', or 'center')", .{}),
+        };
+        return std.meta.stringToEnum(AlignY, id) orelse
+            self.fail(field.line, field.col, "field 'alignY': '{s}' is not 'top', 'bottom', or 'center'", .{id});
+    }
+
+    /// A bare number means a fixed pixel size (matches `padding`/`margin`'s
+    /// own convention); the bare idents `grow`/`fit` need no value; a
+    /// fraction needs a block since a lone number is already claimed by
+    /// the fixed-pixel case above.
+    fn resolveSizing(self: *Resolver, field: Stylesheet.Field) Error!Sizing {
+        return switch (field.value) {
+            .number => |n| block: {
+                if (n < 0) return self.fail(field.line, field.col, "field '{s}' value {d} must be non-negative", .{ field.key, n });
+                break :block .{ .kind = .fixed, .value = @floatCast(n) };
+            },
+            .ident => |id| block: {
+                if (std.mem.eql(u8, id, "grow")) break :block .{ .kind = .grow };
+                if (std.mem.eql(u8, id, "fit")) break :block .{ .kind = .fit };
+                return self.fail(field.line, field.col, "field '{s}': '{s}' is not 'grow' or 'fit' (use a number for a fixed size, or {{ percent: N }})", .{ field.key, id });
+            },
+            .block => |b| block: {
+                const percent_field = findField(b, "percent") orelse return self.fail(field.line, field.col, "field '{s}' block must set 'percent'", .{field.key});
+                const n = try self.expectNumber(percent_field);
+                if (n < 0 or n > 1) return self.fail(percent_field.line, percent_field.col, "field 'percent' must be between 0 and 1, got {d}", .{n});
+                break :block .{ .kind = .percent, .value = @floatCast(n) };
+            },
+            else => self.fail(field.line, field.col, "field '{s}' must be a number (fixed px), 'grow', 'fit', or {{ percent: N }}", .{field.key}),
+        };
+    }
+
     fn resolveToken(self: *Resolver, token: Stylesheet.StyleToken) Error!ResolvedStyleToken {
         var out: ResolvedStyleToken = .{ .name = token.name };
         for (token.fields) |field| {
@@ -190,6 +277,18 @@ const Resolver = struct {
                 out.padding = try self.expectU16(field);
             } else if (std.mem.eql(u8, field.key, "margin")) {
                 out.margin = try self.expectU16(field);
+            } else if (std.mem.eql(u8, field.key, "direction")) {
+                out.direction = try self.resolveDirection(field);
+            } else if (std.mem.eql(u8, field.key, "childGap")) {
+                out.child_gap = try self.expectU16(field);
+            } else if (std.mem.eql(u8, field.key, "width")) {
+                out.width = try self.resolveSizing(field);
+            } else if (std.mem.eql(u8, field.key, "height")) {
+                out.height = try self.resolveSizing(field);
+            } else if (std.mem.eql(u8, field.key, "alignX")) {
+                out.align_x = try self.resolveAlignX(field);
+            } else if (std.mem.eql(u8, field.key, "alignY")) {
+                out.align_y = try self.resolveAlignY(field);
             } else if (std.mem.eql(u8, field.key, "texture")) {
                 out.texture = try self.expectString(field);
             } else if (std.mem.eql(u8, field.key, "text")) {
@@ -252,6 +351,69 @@ test "resolves a full valid token" {
     try std.testing.expectEqual(GradientAnchor.bottomRight, tok.gradient.?.end.pos);
     try std.testing.expectEqual(@as(u16, 8), tok.padding.?);
     try std.testing.expectEqual(@as(u16, 4), tok.margin.?);
+}
+
+test "resolves the real layout vocabulary: direction, childGap, width/height, alignX/alignY" {
+    const src =
+        \\toolbar {
+        \\  direction: leftToRight
+        \\  childGap: 8
+        \\  width: grow
+        \\  height: 40
+        \\  alignX: center
+        \\  alignY: center
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err == null);
+    const tok = result.tokens[0];
+    try std.testing.expectEqual(Direction.leftToRight, tok.direction.?);
+    try std.testing.expectEqual(@as(u16, 8), tok.child_gap.?);
+    try std.testing.expectEqual(SizingKind.grow, tok.width.?.kind);
+    try std.testing.expectEqual(SizingKind.fixed, tok.height.?.kind);
+    try std.testing.expectEqual(@as(f32, 40), tok.height.?.value);
+    try std.testing.expectEqual(AlignX.center, tok.align_x.?);
+    try std.testing.expectEqual(AlignY.center, tok.align_y.?);
+}
+
+test "resolves width as a percent block and as 'fit'" {
+    const src =
+        \\a { width: { percent: 0.5 } }
+        \\b { width: fit }
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err == null);
+    try std.testing.expectEqual(SizingKind.percent, result.tokens[0].width.?.kind);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), result.tokens[0].width.?.value, 0.001);
+    try std.testing.expectEqual(SizingKind.fit, result.tokens[1].width.?.kind);
+}
+
+test "rejects an invalid direction keyword" {
+    const src = "bad { direction: diagonal }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err != null);
+}
+
+test "rejects a percent value out of 0..1 range" {
+    const src = "bad { width: { percent: 1.5 } }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err != null);
+}
+
+test "rejects a negative fixed sizing value" {
+    const src = "bad { width: -5 }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try parseAndResolve(arena.allocator(), src);
+    try std.testing.expect(result.resolve_err != null);
 }
 
 test "rejects an unrecognized field name" {

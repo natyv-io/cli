@@ -525,14 +525,44 @@ const Emitter = struct {
         direction: ?[]const u8 = null, // raw Go expr, e.g. "widgets.TopToBottom"
         child_gap: ?u16 = null,
         padding: ?u16 = null, // uniform on all four sides
-        width_fixed: ?f32 = null,
-        height_fixed: ?f32 = null,
+        width: ?Resolver.Sizing = null,
+        height: ?Resolver.Sizing = null,
+        align_x: ?[]const u8 = null, // raw Go expr, e.g. "widgets.AlignXCenter"
+        align_y: ?[]const u8 = null,
     };
+
+    /// `.ntx`-authored `width_fixed`/`height_fixed`-shaped convenience for
+    /// call sites that only ever want a fixed size (every leaf widget's own
+    /// hardcoded per-tag default) -- avoids every one of those call sites
+    /// needing to spell out `Resolver.Sizing{ .kind = .fixed, .value = n }`.
+    fn fixedSizing(px: f32) Resolver.Sizing {
+        return .{ .kind = .fixed, .value = px };
+    }
 
     fn appendNum(self: *Emitter, comptime fmt: []const u8, value: anytype) EmitError!void {
         var buf: [32]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, fmt, .{value}) catch unreachable; // 32 bytes is ample for any u16/f32 here
         try self.out.appendSlice(self.allocator, s);
+    }
+
+    /// Emits one real SDK sizing-axis constructor call (`widgets.Fixed(n)`/
+    /// `widgets.Grow()`/`widgets.Fit()`/`widgets.Percent(n)`) for a resolved
+    /// `Resolver.Sizing` -- shared by both axes in `emitLayout` below.
+    fn appendSizingExpr(self: *Emitter, s: Resolver.Sizing) EmitError!void {
+        switch (s.kind) {
+            .fixed => {
+                try self.out.appendSlice(self.allocator, "widgets.Fixed(");
+                try self.appendNum("{d}", s.value);
+                try self.out.appendSlice(self.allocator, ")");
+            },
+            .grow => try self.out.appendSlice(self.allocator, "widgets.Grow()"),
+            .fit => try self.out.appendSlice(self.allocator, "widgets.Fit()"),
+            .percent => {
+                try self.out.appendSlice(self.allocator, "widgets.Percent(");
+                try self.appendNum("{d}", s.value);
+                try self.out.appendSlice(self.allocator, ")");
+            },
+        }
     }
 
     /// Emits `<layout_var> := widgets.ParentID(uint32(<parent_expr>))`
@@ -573,15 +603,31 @@ const Emitter = struct {
             try self.appendNum("{d}", p);
             try self.out.appendSlice(self.allocator, "}\n");
         }
-        if (d.width_fixed) |w| {
-            const h = d.height_fixed orelse 0;
+        if (d.width != null or d.height != null) {
+            const w = d.width orelse fixedSizing(0);
+            const h = d.height orelse fixedSizing(0);
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, layout_var);
-            try self.out.appendSlice(self.allocator, ".Sizing = widgets.Sizing{Width: widgets.Fixed(");
-            try self.appendNum("{d}", w);
-            try self.out.appendSlice(self.allocator, "), Height: widgets.Fixed(");
-            try self.appendNum("{d}", h);
-            try self.out.appendSlice(self.allocator, ")}\n");
+            try self.out.appendSlice(self.allocator, ".Sizing = widgets.Sizing{Width: ");
+            try self.appendSizingExpr(w);
+            try self.out.appendSlice(self.allocator, ", Height: ");
+            try self.appendSizingExpr(h);
+            try self.out.appendSlice(self.allocator, "}\n");
+        }
+        if (d.align_x != null or d.align_y != null) {
+            try self.out.appendSlice(self.allocator, "\t");
+            try self.out.appendSlice(self.allocator, layout_var);
+            try self.out.appendSlice(self.allocator, ".ChildAlignment = widgets.Alignment{");
+            if (d.align_x) |ax| {
+                try self.out.appendSlice(self.allocator, "X: ");
+                try self.out.appendSlice(self.allocator, ax);
+            }
+            if (d.align_y) |ay| {
+                if (d.align_x != null) try self.out.appendSlice(self.allocator, ", ");
+                try self.out.appendSlice(self.allocator, "Y: ");
+                try self.out.appendSlice(self.allocator, ay);
+            }
+            try self.out.appendSlice(self.allocator, "}\n");
         }
     }
 
@@ -591,25 +637,88 @@ const Emitter = struct {
     /// resolved margin, or `null` if no name sets one (including when the
     /// attribute is absent, dynamic, or names an unknown token: unknown
     /// names are a runtime `ApplyStyle` concern, not re-validated here).
-    fn marginFor(self: *Emitter, el: Parser.Element) ?u16 {
+    /// A `styles={...}` attribute's real effect on this element's own
+    /// `LayoutDefaults` -- generalizes what used to be `marginFor`'s
+    /// single-purpose lookup to the rest of Clay's real layout vocabulary
+    /// (`direction`/`childGap`/`width`/`height`/`alignX`/`alignY`), all of
+    /// which share the exact same "look up each named token, later-wins"
+    /// resolution `margin` already established. See `Resolver.
+    /// ResolvedStyleToken`'s own doc comment for why these fields are
+    /// resolved here, at `.ntx`-transpile time, rather than through the
+    /// runtime `ApplyStyle` mechanism the way background/border/gradient
+    /// are.
+    const LayoutStyleOverride = struct {
+        margin: ?u16 = null,
+        direction: ?Resolver.Direction = null,
+        child_gap: ?u16 = null,
+        width: ?Resolver.Sizing = null,
+        height: ?Resolver.Sizing = null,
+        align_x: ?Resolver.AlignX = null,
+        align_y: ?Resolver.AlignY = null,
+    };
+
+    fn layoutStyleFor(self: *Emitter, el: Parser.Element) LayoutStyleOverride {
+        var out: LayoutStyleOverride = .{};
         for (el.attrs) |attr| {
             if (!std.mem.eql(u8, attr.name, "styles")) continue;
             const names = switch (attr.value) {
                 .styles => |n| n,
-                else => return null,
+                else => return out,
             };
-            var margin: ?u16 = null;
             for (names) |name| {
                 for (self.style_tokens) |tok| {
                     if (std.mem.eql(u8, tok.name, name.name)) {
-                        if (tok.margin) |m| margin = m;
+                        if (tok.margin) |m| out.margin = m;
+                        if (tok.direction) |d| out.direction = d;
+                        if (tok.child_gap) |g| out.child_gap = g;
+                        if (tok.width) |w| out.width = w;
+                        if (tok.height) |h| out.height = h;
+                        if (tok.align_x) |ax| out.align_x = ax;
+                        if (tok.align_y) |ay| out.align_y = ay;
                         break;
                     }
                 }
             }
-            return margin;
         }
-        return null;
+        return out;
+    }
+
+    fn directionExpr(d: Resolver.Direction) []const u8 {
+        return switch (d) {
+            .topToBottom => "widgets.TopToBottom",
+            .leftToRight => "widgets.LeftToRight",
+        };
+    }
+
+    fn alignXExpr(a: Resolver.AlignX) []const u8 {
+        return switch (a) {
+            .left => "widgets.AlignXLeft",
+            .right => "widgets.AlignXRight",
+            .center => "widgets.AlignXCenter",
+        };
+    }
+
+    fn alignYExpr(a: Resolver.AlignY) []const u8 {
+        return switch (a) {
+            .top => "widgets.AlignYTop",
+            .bottom => "widgets.AlignYBottom",
+            .center => "widgets.AlignYCenter",
+        };
+    }
+
+    /// Merges a resolved `styles={...}` override onto a tag's own
+    /// hardcoded default `LayoutDefaults` -- only the fields the style
+    /// token actually set are overridden, everything else keeps the tag's
+    /// own default.
+    fn applyLayoutStyle(base: LayoutDefaults, style: LayoutStyleOverride) LayoutDefaults {
+        var out = base;
+        if (style.direction) |d| out.direction = directionExpr(d);
+        if (style.child_gap) |g| out.child_gap = g;
+        if (style.width) |w| out.width = w;
+        if (style.height) |h| out.height = h;
+        if (style.align_x) |ax| out.align_x = alignXExpr(ax);
+        if (style.align_y) |ay| out.align_y = alignYExpr(ay);
+        return out;
     }
 
     /// Inserts a wrapper `<Container>` between `parent_expr` and whatever
@@ -868,7 +977,8 @@ const Emitter = struct {
         }
 
         var attach_expr = parent_expr;
-        if (self.marginFor(el)) |margin| {
+        const layout_style = self.layoutStyleFor(el);
+        if (layout_style.margin) |margin| {
             if (margin > 0) attach_expr = try self.emitMarginWrapper(parent_expr, margin);
         }
 
@@ -884,7 +994,7 @@ const Emitter = struct {
         var image_styles_emitted = false;
 
         if (std.mem.eql(u8, el.tag, "Container")) {
-            try self.emitLayout(layout_var, attach_expr, .{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 });
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .direction = "widgets.TopToBottom", .child_gap = 8, .padding = 8 }, layout_style));
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateContainer(");
@@ -893,7 +1003,7 @@ const Emitter = struct {
         } else if (std.mem.eql(u8, el.tag, "Label")) {
             const text_child = try self.childText(el);
             const text = if (text_child) |t| t.text else "";
-            try self.emitLayout(layout_var, attach_expr, .{ .width_fixed = 300, .height_fixed = 24 });
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(300), .height = fixedSizing(24) }, layout_style));
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateLabel(");
@@ -918,7 +1028,7 @@ const Emitter = struct {
         } else if (std.mem.eql(u8, el.tag, "Button")) {
             const text_child = try self.childText(el);
             const text = if (text_child) |t| t.text else "";
-            try self.emitLayout(layout_var, attach_expr, .{ .width_fixed = 120, .height_fixed = 32 });
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(120), .height = fixedSizing(32) }, layout_style));
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateButton(");
@@ -937,7 +1047,7 @@ const Emitter = struct {
         } else if (std.mem.eql(u8, el.tag, "TextField")) {
             const placeholder_attr = try self.stringAttr(el, "placeholder");
             const placeholder = if (placeholder_attr) |pa| pa.value else "";
-            try self.emitLayout(layout_var, attach_expr, .{ .width_fixed = 240, .height_fixed = 32 });
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(240), .height = fixedSizing(32) }, layout_style));
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateTextField(");
@@ -968,7 +1078,7 @@ const Emitter = struct {
             // 300x200 is a plain, reasonable default "image box" size
             // (no real sizing/layout attribute grammar exists yet, see the
             // LayoutDefaults doc comment above), not a real design.
-            try self.emitLayout(layout_var, attach_expr, .{ .width_fixed = 300, .height_fixed = 200 });
+            try self.emitLayout(layout_var, attach_expr, applyLayoutStyle(.{ .width = fixedSizing(300), .height = fixedSizing(200) }, layout_style));
             try self.out.appendSlice(self.allocator, "\t");
             try self.out.appendSlice(self.allocator, var_name);
             try self.out.appendSlice(self.allocator, ", err := widgets.CreateContainer(");
@@ -1945,6 +2055,69 @@ test "a token with no margin never inserts a wrapper" {
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateContainer") == null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "Label0Layout := widgets.ParentID(uint32(parent))") != null);
+}
+
+test "styles naming a token overrides direction, childGap, width, and alignment on a Container" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Container styles={toolbar}>
+        \\    <Label>hi</Label>
+        \\  </Container>
+        \\}
+    ;
+    const tokens = [_]Resolver.ResolvedStyleToken{.{
+        .name = "toolbar",
+        .direction = .leftToRight,
+        .child_gap = 8,
+        .width = .{ .kind = .grow },
+        .align_y = .center,
+    }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    // Direction overridden from the Container tag's own TopToBottom default.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.Direction = widgets.LeftToRight") != null);
+    // ChildGap overridden from the Container tag's own default of 8 -- same
+    // numeric value here is a coincidence of this test's own token, not a
+    // no-op check; a real override always writes the assignment regardless.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.ChildGap = 8") != null);
+    // Width set to Grow (the Container tag has no width/height default at
+    // all normally, so this line only appears because of the override).
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.Sizing = widgets.Sizing{Width: widgets.Grow(), Height: widgets.Fixed(0)}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.ChildAlignment = widgets.Alignment{Y: widgets.AlignYCenter}") != null);
+    // The Container tag's own hardcoded Padding default (8) survives
+    // untouched -- the style token above never set `padding`.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Container0Layout.Padding = widgets.Padding{Left: 8, Right: 8, Top: 8, Bottom: 8}") != null);
+}
+
+test "styles naming a token overrides a leaf widget's own hardcoded fixed size" {
+    const src =
+        \\expose Foo
+        \\
+        \\func Foo(parent widgets.Container) error {
+        \\  <Button styles={wide}>Save</Button>
+        \\}
+    ;
+    const tokens = [_]Resolver.ResolvedStyleToken{.{
+        .name = "wide",
+        .width = .{ .kind = .fixed, .value = 200 },
+    }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const found = try Expose.findComposers(allocator, src);
+    const result = try generateGo(allocator, "main", src, found.composers, &tokens, &.{}, 0, 0, .{});
+    try std.testing.expect(result.err == null);
+    const gen = result.output.?.generated;
+    // Width overridden from Button's own hardcoded 120; Height (32) is
+    // untouched since the token never set it.
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.Sizing{Width: widgets.Fixed(200), Height: widgets.Fixed(32)}") != null);
 }
 
 test "an unknown style name contributes no margin and causes no error" {
