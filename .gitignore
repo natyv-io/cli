@@ -16,14 +16,6 @@ src/bindgen/*_bindings_generated.zig
 src/bindgen/generated_check.zig
 src/bindgen/generated_check.go
 
-# editors/ dev-extension build caches.
-editors/vscode-ntx/node_modules/
-editors/vscode-ntx/out/
-editors/zed-ntx/grammars/
-editors/zed-ntx/target/
-editors/zed-ntx/extension.wasm
-editors/intellij-ntss/.intellijPlatform/
-
 # tools/appimage-packer's own real Cargo build-artifact directories.
 tools/appimage-packer/plugin/target/
 tools/appimage-packer/backhand-patched/target/
