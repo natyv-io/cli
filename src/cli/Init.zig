@@ -9,13 +9,21 @@
 //! silent stub -- matches every other closed-vocabulary surface in this
 //! project (widget kinds, `.ntx` guest-language dispatch, etc.).
 //!
-//! The scaffold's `go.mod` `replace` directive points at natyv-core's own
-//! `sdk/go`, resolved via the exact same "where's natyv-core" mechanism
-//! `src/cli/Bundle.zig` already needed (env var override, else the
-//! compile-time-baked `-Dnatyv-core-src` default) -- `main.zig` resolves
-//! it once and passes it in here, rather than this file reading the env
-//! var/build_options itself, for the same testability reason `Bundle.zig`
-//! takes `natyv_core_src` as a parameter instead of resolving it inline.
+//! The scaffold's `go.mod` `require`s the real, publicly-resolvable SDK
+//! module path (`github.com/natyv-io/sdks/go`) -- no `replace` directive,
+//! no local-checkout path to resolve. Post-split, the SDK is a separate
+//! repo from natyv-core, fetched through Go's own normal module resolution
+//! (`go get`/`go mod tidy`) like any other dependency, not something
+//! `natyv init` needs to locate on disk. (Real, temporary caveat as of
+//! 2026-09-01: `natyv-io/sdks` is still private, so a fresh scaffold's
+//! `go mod tidy` won't actually succeed until either the repo goes public
+//! or the dev adds their own `replace` line pointing at a local checkout
+//! they have access to -- not natyv init's job to paper over.) A previous
+//! version of this scaffold generated a `replace natyv/sdk =>
+//! {natyv_core_src}/sdk/go` line, which broke outright once the SDK moved
+//! to its own repo during the natyv-io split -- fixed by removing the
+//! `replace` concept from this file entirely rather than reworking it to
+//! point at yet another env var.
 //!
 //! **Deliberately does not run `Prepare.run`** -- Quinn's own explicit
 //! call: `natyv init` only ever scaffolds, it never transpiles. The
@@ -45,7 +53,7 @@ const main_go_content =
     \\package main
     \\
     \\import (
-    \\    "natyv/sdk/widgets"
+    \\    "github.com/natyv-io/sdks/go/widgets"
     \\
     \\    "github.com/extism/go-pdk"
     \\)
@@ -73,7 +81,7 @@ const main_go_content =
 const app_go_ntx_content =
     \\package main
     \\
-    \\import "natyv/sdk/widgets"
+    \\import "github.com/natyv-io/sdks/go/widgets"
     \\
     \\expose App
     \\
@@ -132,7 +140,7 @@ fn confNatyvJson(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     , .{ name, name });
 }
 
-fn goMod(allocator: std.mem.Allocator, name: []const u8, natyv_core_src: []const u8) ![]const u8 {
+fn goMod(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator,
         \\module natyv/{s}-guest
         \\
@@ -140,12 +148,10 @@ fn goMod(allocator: std.mem.Allocator, name: []const u8, natyv_core_src: []const
         \\
         \\require (
         \\    github.com/extism/go-pdk v1.1.3
-        \\    natyv/sdk v0.0.0
+        \\    github.com/natyv-io/sdks/go v0.0.0
         \\)
         \\
-        \\replace natyv/sdk => {s}/sdk/go
-        \\
-    , .{ name, natyv_core_src });
+    , .{name});
 }
 
 /// Reads one line from stdin, trimmed of whitespace/line endings. Empty
@@ -163,9 +169,8 @@ pub fn readLine(io: Io, buffer: []u8) ![]const u8 {
 /// kept as a plain parameter, not read from stdin inside this function,
 /// so the actual scaffolding logic is testable without a real terminal.
 /// `cwd_name` is the raw current-directory basename the app's own name
-/// gets sanitized from; `natyv_core_src` is natyv-core's own resolved
-/// source root (see this file's own doc comment).
-pub fn run(allocator: std.mem.Allocator, io: Io, language: []const u8, cwd_name: []const u8, natyv_core_src: []const u8, cwd: Io.Dir) !Result {
+/// gets sanitized from.
+pub fn run(allocator: std.mem.Allocator, io: Io, language: []const u8, cwd_name: []const u8, cwd: Io.Dir) !Result {
     if (!std.ascii.eqlIgnoreCase(language, "go")) {
         return .{ .ok = false, .err = .{
             .message = try std.fmt.allocPrint(allocator, "natyv init: '{s}' isn't a supported guest language yet (only 'go' is implemented)", .{language}),
@@ -191,7 +196,7 @@ pub fn run(allocator: std.mem.Allocator, io: Io, language: []const u8, cwd_name:
     var guest_dir = try cwd.createDirPathOpen(io, "guest", .{ .open_options = .{ .iterate = true } });
     defer guest_dir.close(io);
 
-    const go_mod_content = try goMod(allocator, name, natyv_core_src);
+    const go_mod_content = try goMod(allocator, name);
     try guest_dir.writeFile(io, .{ .sub_path = "go.mod", .data = go_mod_content });
     try guest_dir.writeFile(io, .{ .sub_path = "go.sum", .data = go_sum_content });
     try guest_dir.writeFile(io, .{ .sub_path = "main.go", .data = main_go_content });
@@ -218,7 +223,7 @@ test "an unsupported language is a clear, natyv-attributed error, no files writt
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const result = try run(allocator, io, "rust", "myapp", "/fake/natyv/src", tmp.dir);
+    const result = try run(allocator, io, "rust", "myapp", tmp.dir);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "rust") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "supported") != null);
@@ -233,7 +238,7 @@ test "a real Go scaffold produces every real file, untranspiled" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const result = try run(allocator, io, "Go", "My Cool App", "/fake/natyv/src", tmp.dir);
+    const result = try run(allocator, io, "Go", "My Cool App", tmp.dir);
     try std.testing.expect(result.ok);
     try std.testing.expect(result.err == null);
 
@@ -246,7 +251,8 @@ test "a real Go scaffold produces every real file, untranspiled" {
 
     const go_mod_content = try guest_dir.readFileAlloc(io, "go.mod", allocator, .unlimited);
     try std.testing.expect(std.mem.indexOf(u8, go_mod_content, "module natyv/my-cool-app-guest") != null);
-    try std.testing.expect(std.mem.indexOf(u8, go_mod_content, "replace natyv/sdk => /fake/natyv/src/sdk/go") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_mod_content, "github.com/natyv-io/sdks/go v0.0.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, go_mod_content, "replace") == null);
 
     _ = try guest_dir.readFileAlloc(io, "go.sum", allocator, .unlimited);
     _ = try guest_dir.readFileAlloc(io, "main.go", allocator, .unlimited);
@@ -269,7 +275,7 @@ test "refuses to scaffold over an existing conf.natyv.json" {
 
     try tmp.dir.writeFile(io, .{ .sub_path = "conf.natyv.json", .data = "{}" });
 
-    const result = try run(allocator, io, "go", "myapp", "/fake/natyv/src", tmp.dir);
+    const result = try run(allocator, io, "go", "myapp", tmp.dir);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "already exists") != null);
 }

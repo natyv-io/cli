@@ -1259,7 +1259,7 @@ pub fn generateGo(allocator: std.mem.Allocator, package_name: []const u8, src: [
     const uses_widgets = std.mem.indexOf(u8, body.items, "widgets.") != null;
 
     var all_imports: std.ArrayList([]const u8) = .empty;
-    if (uses_widgets) try all_imports.append(allocator, "natyv/sdk/widgets");
+    if (uses_widgets) try all_imports.append(allocator, "github.com/natyv-io/sdks/go/widgets");
     try all_imports.appendSlice(allocator, used_paths.items);
 
     if (all_imports.items.len == 1) {
@@ -2063,7 +2063,7 @@ test "a bare tag resolved via 'uses' compiles to a qualified cross-package compo
     const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
-    try std.testing.expect(std.mem.indexOf(u8, gen, "import (\n\t\"natyv/sdk/widgets\"\n\t\"natyv/ntx-components-guest/components\"\n)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "import (\n\t\"github.com/natyv-io/sdks/go/widgets\"\n\t\"natyv/ntx-components-guest/components\"\n)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "if err := components.UserCard(uint32(parent), \"Bob\", user.Age); err != nil {\n\t\treturn err\n\t}\n") != null);
     // The `uses (...)` block is .ntx-only syntax -- a real bug (caught by
     // actually compiling examples/ntx-components) had it survive into the
@@ -2124,7 +2124,7 @@ test "a component tag not referenced by any composer body adds no unused import"
     const found = try Expose.findComposers(allocator, src);
     const result = try generateGo(allocator, "main", src, found.composers, &.{}, found.uses, found.uses_start, found.uses_end, .{});
     try std.testing.expect(result.err == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "import \"natyv/sdk/widgets\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "import \"github.com/natyv-io/sdks/go/widgets\"\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "components") == null);
 }
 
@@ -2316,7 +2316,7 @@ test "a composer body that never references a real widget kind gets no unused 'w
     const found = try Expose.findComposers(allocator, src);
     const result = try generateGo(allocator, "main", src, found.composers, &.{}, &.{}, 0, 0, .{});
     try std.testing.expect(result.err == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "import \"natyv/sdk/widgets\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.?.generated, "import \"github.com/natyv-io/sdks/go/widgets\"\n") != null);
 }
 
 test "a composer body whose signature and body both never mention 'widgets' gets no import block at all" {
@@ -2359,7 +2359,7 @@ test "a component-only composer body needing a 'uses' import but no real widget 
     try std.testing.expect(result.err == null);
     const gen = result.output.?.generated;
     try std.testing.expect(std.mem.indexOf(u8, gen, "import \"some/other/pkg\"\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gen, "natyv/sdk/widgets") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "github.com/natyv-io/sdks/go/widgets") == null);
 }
 
 test "<Image src=...> with no styles= still applies its texture, background true" {

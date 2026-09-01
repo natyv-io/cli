@@ -348,9 +348,8 @@ pub fn main(init: std.process.Init) !void {
 
         const cwd_path = try std.process.currentPathAlloc(io, arena_alloc);
         const cwd_name = std.fs.path.basename(cwd_path);
-        const natyv_core_src = init.environ_map.get("NATYV_CORE_SRC") orelse build_options.natyv_core_src_default;
 
-        const result = try Init.run(arena_alloc, io, language, cwd_name, natyv_core_src, std.Io.Dir.cwd());
+        const result = try Init.run(arena_alloc, io, language, cwd_name, std.Io.Dir.cwd());
         if (result.err) |e| {
             std.debug.print("{s}\n", .{e.message});
             return error.InitFailed;
