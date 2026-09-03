@@ -145,7 +145,7 @@ pub const Result = struct {
 /// `natyv_core_src` is a packaging-managed install location (a real
 /// Homebrew-installed natyv-core directory grew to 2GB after one app
 /// build) that's supposed to stay read-only after install.
-pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, wasm_path: []const u8, config_path: []const u8, dist_dir: Io.Dir, output_name: []const u8, has_bindings: bool, binding_include_dirs: []const u8, binding_lib_dirs: []const u8, binding_link: []const u8, binding_zig_deps: []const u8, binding_vendor_c_files: []const u8, has_textures: bool, sqlite_enabled: bool, bundle_id: []const u8, icon_path: ?[]const u8, target: ?[]const u8, target_os: TargetOs, linux_package: ?[]const u8, ca_certs_json: []const u8, cache_dir: []const u8) !Result {
+pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, wasm_path: []const u8, config_path: []const u8, dist_dir: Io.Dir, output_name: []const u8, has_bindings: bool, binding_include_dirs: []const u8, binding_lib_dirs: []const u8, binding_link: []const u8, binding_zig_deps: []const u8, binding_vendor_c_files: []const u8, has_textures: bool, sqlite_enabled: bool, bundle_id: []const u8, icon_path: ?[]const u8, target: ?[]const u8, target_os: TargetOs, linux_package: ?[]const u8, ca_certs_json: []const u8, cache_dir: []const u8, optimize_flag: []const u8) !Result {
     var core_dir = std.Io.Dir.cwd().openDir(io, natyv_core_src, .{}) catch |e| {
         return .{ .ok = false, .err = .{
             .message = try std.fmt.allocPrint(allocator, "natyv build: could not open NATYV_CORE_SRC ('{s}'): {s}", .{ natyv_core_src, @errorName(e) }),
@@ -248,7 +248,7 @@ pub fn run(allocator: std.mem.Allocator, io: Io, natyv_core_src: []const u8, was
     // the `natyv` CLI itself, which would leave a stray, useless second
     // binary inside the app's own bundled output (confirmed by actually
     // running a bundle and inspecting what came out).
-    try argv.appendSlice(allocator, &.{ "zig", "build", "install-core", "-Dembed-app-wasm=true", "--prefix", dist_abs, "--cache-dir", zig_cache_dir, "--global-cache-dir", zig_global_cache_dir });
+    try argv.appendSlice(allocator, &.{ "zig", "build", "install-core", "-Dembed-app-wasm=true", optimize_flag, "--prefix", dist_abs, "--cache-dir", zig_cache_dir, "--global-cache-dir", zig_global_cache_dir });
     if (target) |t| try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dtarget={s}", .{t}));
     if (has_bindings) try argv.append(allocator, "-Dhas-bindings=true");
     if (binding_include_dirs.len > 0) try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dbinding-include-dirs={s}", .{binding_include_dirs}));
@@ -570,7 +570,7 @@ test "a NATYV_CORE_SRC that doesn't exist is a clear error" {
     defer tmp.cleanup();
     const io = std.testing.io;
 
-    const result = try run(std.testing.allocator, io, "/definitely/not/a/real/path", "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null, "", "/tmp/natyv-test-cache");
+    const result = try run(std.testing.allocator, io, "/definitely/not/a/real/path", "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null, "", "/tmp/natyv-test-cache", "-Doptimize=Debug");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "NATYV_CORE_SRC") != null);
@@ -592,7 +592,7 @@ test "a NATYV_CORE_SRC with no build.zig is a clear error" {
     const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/not-natyv-core", .{ cwd_path, tmp.sub_path });
     defer std.testing.allocator.free(abs_path);
 
-    const result = try run(std.testing.allocator, io, abs_path, "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null, "", "/tmp/natyv-test-cache");
+    const result = try run(std.testing.allocator, io, abs_path, "app.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null, "", "/tmp/natyv-test-cache", "-Doptimize=Debug");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "build.zig") != null);
@@ -610,7 +610,7 @@ test "a missing compiled wasm file is a clear error" {
     const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_path, tmp.sub_path });
     defer std.testing.allocator.free(abs_path);
 
-    const result = try run(std.testing.allocator, io, abs_path, "/definitely/not/a/real/wasm/path.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null, "", "/tmp/natyv-test-cache");
+    const result = try run(std.testing.allocator, io, abs_path, "/definitely/not/a/real/wasm/path.wasm", "conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null, "", "/tmp/natyv-test-cache", "-Doptimize=Debug");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "compiled wasm") != null);
@@ -631,7 +631,7 @@ test "a missing config file is a clear error" {
     const wasm_abs = try std.fmt.allocPrint(std.testing.allocator, "{s}/app.wasm", .{abs_path});
     defer std.testing.allocator.free(wasm_abs);
 
-    const result = try run(std.testing.allocator, io, abs_path, wasm_abs, "/definitely/not/a/real/conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null, "", "/tmp/natyv-test-cache");
+    const result = try run(std.testing.allocator, io, abs_path, wasm_abs, "/definitely/not/a/real/conf.natyv.json", tmp.dir, "myapp", false, "", "", "", "", "", false, true, "dev.natyv.myapp", null, null, .macos, null, "", "/tmp/natyv-test-cache", "-Doptimize=Debug");
     defer if (result.err) |e| std.testing.allocator.free(e.message);
     try std.testing.expect(!result.ok);
     try std.testing.expect(std.mem.indexOf(u8, result.err.?.message, "conf.natyv.json") != null);
