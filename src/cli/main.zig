@@ -57,6 +57,17 @@ pub const ParsedArgs = struct {
     /// own equivalent mode from `BuildCache`'s freshness check instead of
     /// reading this field.
     codegen: bool = false,
+    /// Only meaningful for `.build` -- unconditionally treats
+    /// `BuildCache`'s freshness check as stale for this invocation, so
+    /// `prepare`/`wasm_compile` always re-run regardless of the cached
+    /// hash. A manual escape hatch alongside the freshness check itself
+    /// now also hashing `wasm_compile` (see `BuildCache.zig`) -- that fix
+    /// closes the specific gap that motivated adding this flag (editing
+    /// compile flags alone didn't invalidate the cache), but a flag is
+    /// still worth having for any other cache surprise (e.g. a corrupted
+    /// `.natyv-build-cache` file) without resorting to deleting the wasm
+    /// output by hand.
+    force: bool = false,
 };
 
 pub const UsageError = error{
@@ -76,10 +87,11 @@ pub const UsageError = error{
 /// both, `args[1..]` is deliberately ignored/left for the caller to
 /// reinterpret rather than misparsed as a config path here.
 ///
-/// `--codegen` (Stage 2.7, only meaningful for `.prepare`) can appear
-/// anywhere in `args[1..]`, in either order relative to an optional config
+/// `--codegen` (Stage 2.7, only meaningful for `.prepare`) and `--force`
+/// (only meaningful for `.build`, see `ParsedArgs.force`) can each appear
+/// anywhere in `args[1..]`, in any order relative to an optional config
 /// path -- the first non-flag argument is still taken as `config_path`,
-/// exactly matching pre-Stage-2.7 behavior when `--codegen` is absent.
+/// exactly matching pre-Stage-2.7 behavior when neither flag is present.
 ///
 /// Kept as a pure function, separate from `main`, so it's testable without
 /// a real process.
@@ -98,14 +110,17 @@ pub fn parseArgs(args: []const []const u8) UsageError!ParsedArgs {
 
     var config_path: []const u8 = "conf.natyv.json";
     var codegen = false;
+    var force = false;
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--codegen")) {
             codegen = true;
+        } else if (std.mem.eql(u8, arg, "--force")) {
+            force = true;
         } else {
             config_path = arg;
         }
     }
-    return .{ .subcommand = subcommand, .config_path = config_path, .codegen = codegen };
+    return .{ .subcommand = subcommand, .config_path = config_path, .codegen = codegen, .force = force };
 }
 
 pub const GetUsageError = error{
@@ -472,7 +487,7 @@ pub fn main(init: std.process.Init) !void {
             // invocation, fresh or not; only the `.ntx` walk/transpile
             // itself (and, further down, `wasm_compile`) are skippable.
             const wasm_basename = try config.value.wasmFilename(arena_alloc);
-            const fresh = try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename);
+            const fresh = !parsed.force and try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename, config.value.wasm_compile);
             const mode: Prepare.Mode = if (fresh) .codegen_only else .full;
 
             const outcome = try Prepare.run(arena_alloc, io, guest_dir, config.value.bindings, natyv_core_src, mode, config.value.images.enabled, assets_dir_opt);
@@ -517,7 +532,7 @@ pub fn main(init: std.process.Init) !void {
                     return error.WasmCompileFailed;
                 }
 
-                const new_hash = try BuildCache.computeSourceHash(arena_alloc, io, guest_dir);
+                const new_hash = try BuildCache.computeSourceHash(arena_alloc, io, guest_dir, config.value.wasm_compile);
                 try BuildCache.writeCachedHash(io, guest_dir, new_hash);
             }
 
@@ -633,6 +648,17 @@ test "parseArgs: build with explicit config path" {
     const parsed = try parseArgs(&.{ "build", "examples/clay-fixture/conf.natyv.json" });
     try std.testing.expectEqual(Subcommand.build, parsed.subcommand);
     try std.testing.expectEqualStrings("examples/clay-fixture/conf.natyv.json", parsed.config_path);
+    try std.testing.expect(!parsed.force);
+}
+
+test "parseArgs: build --force, either order relative to the config path" {
+    const before = try parseArgs(&.{ "build", "--force", "examples/clay-fixture/conf.natyv.json" });
+    try std.testing.expect(before.force);
+    try std.testing.expectEqualStrings("examples/clay-fixture/conf.natyv.json", before.config_path);
+
+    const after = try parseArgs(&.{ "build", "examples/clay-fixture/conf.natyv.json", "--force" });
+    try std.testing.expect(after.force);
+    try std.testing.expectEqualStrings("examples/clay-fixture/conf.natyv.json", after.config_path);
 }
 
 test "parseArgs: missing subcommand errors clearly" {
