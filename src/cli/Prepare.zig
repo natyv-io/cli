@@ -868,7 +868,7 @@ test "texture-fill: <Image src=...> in a .go.ntx file (no .ntss at all) gets its
 
     const gen = try tmp.dir.readFileAlloc(io, "page.natyv.go", allocator, .unlimited);
     try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.CreateContainer(Image0Layout, true, 0)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.ApplyStyleWithTexture(uint32(Image0), StyleTokens, 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "widgets.ApplyStyleToLayoutWithTexture(&Image0Layout, StyleTokens, 0)") != null);
 }
 
 test "texture-fill: <Image src=...> without images enabled is a clear, natyv-attributed error" {
