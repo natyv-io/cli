@@ -487,7 +487,7 @@ pub fn main(init: std.process.Init) !void {
             // invocation, fresh or not; only the `.ntx` walk/transpile
             // itself (and, further down, `wasm_compile`) are skippable.
             const wasm_basename = try config.value.wasmFilename(arena_alloc);
-            const fresh = !parsed.force and try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename, config.value.wasm_compile);
+            const fresh = !parsed.force and try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename, config.value.wasm_compile, config.value.memory.recycle_threshold_mb);
             const mode: Prepare.Mode = if (fresh) .codegen_only else .full;
 
             const outcome = try Prepare.run(arena_alloc, io, guest_dir, config.value.bindings, natyv_core_src, mode, config.value.images.enabled, assets_dir_opt);
@@ -532,7 +532,7 @@ pub fn main(init: std.process.Init) !void {
                     return error.WasmCompileFailed;
                 }
 
-                const new_hash = try BuildCache.computeSourceHash(arena_alloc, io, guest_dir, config.value.wasm_compile);
+                const new_hash = try BuildCache.computeSourceHash(arena_alloc, io, guest_dir, config.value.wasm_compile, config.value.memory.recycle_threshold_mb);
                 try BuildCache.writeCachedHash(io, guest_dir, new_hash);
             }
 

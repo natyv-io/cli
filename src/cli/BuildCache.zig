@@ -47,13 +47,17 @@ fn lessThanPath(_: void, a: []const u8, b: []const u8) bool {
 }
 
 /// Computes one combined hash over every real input file in `guest_dir`
-/// that affects the compiled wasm, plus `wasm_compile` itself (the exact
-/// command string from `conf.natyv.json` -- lives outside `guest_dir`,
-/// but changing it changes the compiled output just as much as changing
-/// a source file does). Sorted by path first, so the result is stable
+/// that affects the compiled wasm, plus `wasm_compile` and
+/// `recycle_threshold_mb` (both live in `conf.natyv.json`, outside
+/// `guest_dir`, but changing either changes what the compiled wasm must
+/// actually support -- `recycle_threshold_mb` specifically gates whether
+/// codegen emits real handler-reattachment/ref-persistence plumbing at
+/// all, so flipping it with zero `.ntx`/`.go` edits must still invalidate
+/// the cache, the same class of gap `wasm_compile`'s own inclusion here
+/// already fixed once). Sorted by path first, so the result is stable
 /// regardless of filesystem iteration order -- the same directory hashed
 /// twice always produces the same digest.
-pub fn computeSourceHash(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir, wasm_compile: []const u8) ![64]u8 {
+pub fn computeSourceHash(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir, wasm_compile: []const u8, recycle_threshold_mb: ?u32) ![64]u8 {
     var walker = try guest_dir.walk(allocator);
     defer walker.deinit();
 
@@ -68,6 +72,11 @@ pub fn computeSourceHash(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir
     var combined: std.ArrayList(u8) = .empty;
     try combined.appendSlice(allocator, wasm_compile);
     try combined.append(allocator, '\n');
+    if (recycle_threshold_mb) |mb| {
+        try combined.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}\n", .{mb}));
+    } else {
+        try combined.appendSlice(allocator, "null\n");
+    }
     for (paths.items) |path| {
         const content = try guest_dir.readFileAlloc(io, path, allocator, .unlimited);
         try combined.appendSlice(allocator, path);
@@ -100,12 +109,12 @@ pub fn writeCachedHash(io: Io, guest_dir: Io.Dir, hash: [64]u8) !void {
 /// True only if the compiled wasm still actually exists on disk (a fresh
 /// hash with a since-deleted wasm has nothing to bundle) *and* the
 /// guest directory's current combined source hash (including the current
-/// `wasm_compile` string) matches the one cached after the last
-/// successful `wasm_compile`.
-pub fn isFresh(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir, wasm_basename: []const u8, wasm_compile: []const u8) !bool {
+/// `wasm_compile` string and `recycle_threshold_mb`) matches the one
+/// cached after the last successful `wasm_compile`.
+pub fn isFresh(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir, wasm_basename: []const u8, wasm_compile: []const u8, recycle_threshold_mb: ?u32) !bool {
     guest_dir.access(io, wasm_basename, .{}) catch return false;
     const cached = try readCachedHash(allocator, io, guest_dir) orelse return false;
-    const current = try computeSourceHash(allocator, io, guest_dir, wasm_compile);
+    const current = try computeSourceHash(allocator, io, guest_dir, wasm_compile, recycle_threshold_mb);
     return std.mem.eql(u8, &cached, &current);
 }
 
@@ -121,8 +130,8 @@ test "computeSourceHash is stable across repeated calls over the same directory"
     try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data = "package main\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "page.go.ntx", .data = "package main\nexpose Page\n" });
 
-    const first = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
-    const second = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const first = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
+    const second = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
     try std.testing.expectEqualStrings(&first, &second);
 }
 
@@ -135,10 +144,10 @@ test "changing a .ntx file's content changes the hash" {
     const allocator = arena.allocator();
 
     try tmp.dir.writeFile(io, .{ .sub_path = "page.go.ntx", .data = "package main\nexpose Page\n" });
-    const before = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const before = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
 
     try tmp.dir.writeFile(io, .{ .sub_path = "page.go.ntx", .data = "package main\nexpose Page\n// edited\n" });
-    const after = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const after = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
 
     try std.testing.expect(!std.mem.eql(u8, &before, &after));
 }
@@ -152,10 +161,10 @@ test "changing an unrelated hand-written .go file also changes the hash" {
     const allocator = arena.allocator();
 
     try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data = "package main\nfunc main() {}\n" });
-    const before = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const before = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
 
     try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data = "package main\nfunc main() { println(1) }\n" });
-    const after = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const after = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
 
     try std.testing.expect(!std.mem.eql(u8, &before, &after));
 }
@@ -169,12 +178,12 @@ test "changing wasm_compile alone changes the hash" {
     const allocator = arena.allocator();
 
     try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data = "package main\nfunc main() {}\n" });
-    const before = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const before = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
 
     // Same source files, only the compile command itself changes (e.g. a
     // dev adding -no-debug) -- this must be caught the same way an edited
     // source file is, since it changes the compiled wasm just as much.
-    const after = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -no-debug -o app.wasm .");
+    const after = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -no-debug -o app.wasm .", null);
 
     try std.testing.expect(!std.mem.eql(u8, &before, &after));
 }
@@ -190,14 +199,14 @@ test "generated output files are excluded from the hash" {
     try tmp.dir.writeFile(io, .{ .sub_path = "page.go.ntx", .data = "package main\nexpose Page\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "page.natyv.go", .data = "// generated v1\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "styletokens_generated.go", .data = "// generated v1\n" });
-    const before = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const before = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
 
     // Rewriting the generated files (as a real `natyv prepare` re-run
     // would, even byte-for-byte identically) must never change the hash
     // -- only the real .ntx/.ntss/hand-written source should.
     try tmp.dir.writeFile(io, .{ .sub_path = "page.natyv.go", .data = "// generated v2, totally different\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "styletokens_generated.go", .data = "// generated v2, totally different\n" });
-    const after = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const after = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
 
     try std.testing.expectEqualStrings(&before, &after);
 }
@@ -211,10 +220,10 @@ test "a go.mod change affects the hash" {
     const allocator = arena.allocator();
 
     try tmp.dir.writeFile(io, .{ .sub_path = "go.mod", .data = "module x\n\ngo 1.23\n" });
-    const before = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const before = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
 
     try tmp.dir.writeFile(io, .{ .sub_path = "go.mod", .data = "module x\n\ngo 1.23\n\nrequire y v1.0.0\n" });
-    const after = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const after = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
 
     try std.testing.expect(!std.mem.eql(u8, &before, &after));
 }
@@ -246,7 +255,7 @@ test "isFresh: no cache yet is never fresh" {
     const allocator = arena.allocator();
 
     try tmp.dir.writeFile(io, .{ .sub_path = "app.wasm", .data = "fake wasm bytes" });
-    try std.testing.expect(!(try isFresh(allocator, io, tmp.dir, "app.wasm", "tinygo build -o app.wasm .")));
+    try std.testing.expect(!(try isFresh(allocator, io, tmp.dir, "app.wasm", "tinygo build -o app.wasm .", null)));
 }
 
 test "isFresh: a matching cached hash with the wasm present is fresh" {
@@ -259,10 +268,10 @@ test "isFresh: a matching cached hash with the wasm present is fresh" {
 
     try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data = "package main\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "app.wasm", .data = "fake wasm bytes" });
-    const hash = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const hash = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
     try writeCachedHash(io, tmp.dir, hash);
 
-    try std.testing.expect(try isFresh(allocator, io, tmp.dir, "app.wasm", "tinygo build -o app.wasm ."));
+    try std.testing.expect(try isFresh(allocator, io, tmp.dir, "app.wasm", "tinygo build -o app.wasm .", null));
 }
 
 test "isFresh: a matching cached hash but a missing wasm is not fresh" {
@@ -274,10 +283,10 @@ test "isFresh: a matching cached hash but a missing wasm is not fresh" {
     const allocator = arena.allocator();
 
     try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data = "package main\n" });
-    const hash = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const hash = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
     try writeCachedHash(io, tmp.dir, hash);
 
-    try std.testing.expect(!(try isFresh(allocator, io, tmp.dir, "app.wasm", "tinygo build -o app.wasm .")));
+    try std.testing.expect(!(try isFresh(allocator, io, tmp.dir, "app.wasm", "tinygo build -o app.wasm .", null)));
 }
 
 test "isFresh: source changed since the cached hash is not fresh" {
@@ -290,11 +299,11 @@ test "isFresh: source changed since the cached hash is not fresh" {
 
     try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data = "package main\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "app.wasm", .data = "fake wasm bytes" });
-    const hash = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const hash = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
     try writeCachedHash(io, tmp.dir, hash);
 
     try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data = "package main\nfunc main() {}\n" });
-    try std.testing.expect(!(try isFresh(allocator, io, tmp.dir, "app.wasm", "tinygo build -o app.wasm .")));
+    try std.testing.expect(!(try isFresh(allocator, io, tmp.dir, "app.wasm", "tinygo build -o app.wasm .", null)));
 }
 
 test "isFresh: wasm_compile changed since the cached hash is not fresh" {
@@ -307,12 +316,42 @@ test "isFresh: wasm_compile changed since the cached hash is not fresh" {
 
     try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data = "package main\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "app.wasm", .data = "fake wasm bytes" });
-    const hash = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .");
+    const hash = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
     try writeCachedHash(io, tmp.dir, hash);
 
     // No source file touched at all -- only conf.natyv.json's wasm_compile
     // itself changed (e.g. a dev adding -no-debug). Must not be reported
     // fresh, since the previously-compiled wasm no longer reflects the
     // current compile command.
-    try std.testing.expect(!(try isFresh(allocator, io, tmp.dir, "app.wasm", "tinygo build -no-debug -o app.wasm .")));
+    try std.testing.expect(!(try isFresh(allocator, io, tmp.dir, "app.wasm", "tinygo build -no-debug -o app.wasm .", null)));
+}
+
+test "isFresh: recycle_threshold_mb changed since the cached hash is not fresh" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.go", .data = "package main\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.wasm", .data = "fake wasm bytes" });
+    const hash = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", null);
+    try writeCachedHash(io, tmp.dir, hash);
+
+    // No source file touched at all -- only conf.natyv.json's
+    // memory.recycle_threshold_mb itself changed (null -> a real value,
+    // opting an already-built app into recycling). Must not be reported
+    // fresh: the previously-compiled wasm was built without any handler-
+    // reattachment/ref-persistence codegen, so the host would believe
+    // recycling is safe for a guest that was never built to support it.
+    try std.testing.expect(!(try isFresh(allocator, io, tmp.dir, "app.wasm", "tinygo build -o app.wasm .", 105)));
+
+    // Round-trip: caching the new value makes it fresh again, and a
+    // *different* nonzero value still invalidates (not just "null vs.
+    // set").
+    const hash_with_threshold = try computeSourceHash(allocator, io, tmp.dir, "tinygo build -o app.wasm .", 105);
+    try writeCachedHash(io, tmp.dir, hash_with_threshold);
+    try std.testing.expect(try isFresh(allocator, io, tmp.dir, "app.wasm", "tinygo build -o app.wasm .", 105));
+    try std.testing.expect(!(try isFresh(allocator, io, tmp.dir, "app.wasm", "tinygo build -o app.wasm .", 80)));
 }
