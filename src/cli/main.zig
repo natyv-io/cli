@@ -429,7 +429,7 @@ pub fn main(init: std.process.Init) !void {
             // `bindings` entries at all.
             const natyv_core_src = init.environ_map.get("NATYV_CORE_SRC") orelse build_options.natyv_core_src_default;
             const mode: Prepare.Mode = if (parsed.codegen) .codegen_only else .full;
-            const outcome = try Prepare.run(arena.allocator(), io, guest_dir, config.value.bindings, natyv_core_src, mode, config.value.images.enabled, assets_dir_opt);
+            const outcome = try Prepare.run(arena.allocator(), io, guest_dir, config.value.bindings, natyv_core_src, mode, config.value.images.enabled, assets_dir_opt, config.value.memory.recycle_threshold_mb != null);
             if (outcome.err) |e| {
                 std.debug.print("{s}\n", .{e.message});
                 return error.PrepareFailed;
@@ -490,7 +490,7 @@ pub fn main(init: std.process.Init) !void {
             const fresh = !parsed.force and try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename, config.value.wasm_compile, config.value.memory.recycle_threshold_mb);
             const mode: Prepare.Mode = if (fresh) .codegen_only else .full;
 
-            const outcome = try Prepare.run(arena_alloc, io, guest_dir, config.value.bindings, natyv_core_src, mode, config.value.images.enabled, assets_dir_opt);
+            const outcome = try Prepare.run(arena_alloc, io, guest_dir, config.value.bindings, natyv_core_src, mode, config.value.images.enabled, assets_dir_opt, config.value.memory.recycle_threshold_mb != null);
             if (outcome.err) |e| {
                 std.debug.print("{s}\n", .{e.message});
                 return error.PrepareFailed;
