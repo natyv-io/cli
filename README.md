@@ -8,8 +8,8 @@ codegen half, and the vendored AppImage-packing plugin source (`tools/appimage-p
 The `ntx-lsp` language server and every editor extension (`vscode-ntx`, `zed-ntx`, etc.) each live in
 their own repo now -- see the [natyv-io](https://github.com/natyv-io) org.
 
-See [natyv-io/natyv](https://github.com/natyv-io/natyv) for the project's own README and
-architectural reference until this repo grows its own.
+See the [natyv-io org page](https://github.com/natyv-io) for the project overview, install
+instructions, and roadmap.
 
 Depends on [natyv-io/shared](https://github.com/natyv-io/shared) for the `conf.natyv.json`
 schema/parser (shared with [natyv-io/core](https://github.com/natyv-io/core)) and the `.ntx`
