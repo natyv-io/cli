@@ -19,3 +19,11 @@ src/bindgen/generated_check.go
 # tools/appimage-packer's own real Cargo build-artifact directories.
 tools/appimage-packer/plugin/target/
 tools/appimage-packer/backhand-patched/target/
+
+# Copied in by natyv build's own bundling step immediately before it
+# invokes zig build -- whatever app is currently being bundled.
+# Same three entries core/.gitignore already carries; regenerated on
+# every build, never source.
+src/assets/embedded_app.wasm
+src/assets/embedded_config.json
+src/assets/embedded_ca_certs.json
