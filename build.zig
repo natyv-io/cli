@@ -91,10 +91,66 @@ pub fn build(b: *std.Build) void {
     // core -- `Stylesheet`/`Resolver`/`Parser`/`Expose`/`Codegen` -- all
     // come from natyv-io/shared now. Their own unit tests moved with them
     // and run as part of `shared`'s own `zig build test`, not this repo's.
-    const shared_dep = b.dependency("shared", .{ .target = target, .optimize = optimize });
-    const config_mod = shared_dep.module("Config");
-    const stylesheet_mod = shared_dep.module("Stylesheet");
-    const resolver_mod = shared_dep.module("Resolver");
+    //
+    // `-Dshared-src=` overrides that pinned dependency with a local
+    // natyv-io/shared checkout, the same escape-hatch shape
+    // `-Dextism-prefix` already has, and the same one natyv-io/core's own
+    // build.zig carries. Without it, a change spanning both repos cannot
+    // be built at all until shared is committed, pushed and re-pinned --
+    // which makes iterating on one impossible.
+    //
+    // Unlike core (which imports only `Config`, a single file that imports
+    // nothing but std), this repo pulls five modules whose inter-module
+    // wiring lives in shared's own build.zig, so the override has to
+    // reproduce it: Resolver -> Stylesheet, Expose -> Parser, and
+    // Codegen -> {Resolver, Expose, Parser}. If shared ever adds an edge
+    // there, it has to be mirrored here too -- the cost of the escape
+    // hatch, and the reason this is local-development-only. A release
+    // always builds against the pinned dependency.
+    const shared_mods = blk: {
+        const Mods = struct {
+            config: *std.Build.Module,
+            stylesheet: *std.Build.Module,
+            resolver: *std.Build.Module,
+            expose: *std.Build.Module,
+            codegen: *std.Build.Module,
+        };
+        const shared_src = b.option([]const u8, "shared-src", "Path to a local natyv-io/shared checkout, overriding the pinned dependency (local development only)");
+        if (shared_src) |dir| {
+            const mod = struct {
+                fn make(bb: *std.Build, root: []const u8, sub: []const u8, t: anytype, o: anytype) *std.Build.Module {
+                    return bb.createModule(.{
+                        .root_source_file = .{ .cwd_relative = bb.pathJoin(&.{ root, sub }) },
+                        .target = t,
+                        .optimize = o,
+                    });
+                }
+            }.make;
+            const cfg = mod(b, dir, "src/Config.zig", target, optimize);
+            const sheet = mod(b, dir, "src/styling/Stylesheet.zig", target, optimize);
+            const res = mod(b, dir, "src/styling/Resolver.zig", target, optimize);
+            res.addImport("Stylesheet", sheet);
+            const parser = mod(b, dir, "src/ntx/Parser.zig", target, optimize);
+            const exp = mod(b, dir, "src/ntx/Expose.zig", target, optimize);
+            exp.addImport("Parser", parser);
+            const cg = mod(b, dir, "src/ntx/Codegen.zig", target, optimize);
+            cg.addImport("Resolver", res);
+            cg.addImport("Expose", exp);
+            cg.addImport("Parser", parser);
+            break :blk Mods{ .config = cfg, .stylesheet = sheet, .resolver = res, .expose = exp, .codegen = cg };
+        }
+        const dep = b.dependency("shared", .{ .target = target, .optimize = optimize });
+        break :blk Mods{
+            .config = dep.module("Config"),
+            .stylesheet = dep.module("Stylesheet"),
+            .resolver = dep.module("Resolver"),
+            .expose = dep.module("Expose"),
+            .codegen = dep.module("Codegen"),
+        };
+    };
+    const config_mod = shared_mods.config;
+    const stylesheet_mod = shared_mods.stylesheet;
+    const resolver_mod = shared_mods.resolver;
 
     const styling_codegen_mod = b.createModule(.{
         .root_source_file = b.path("src/styling/Codegen.zig"),
@@ -106,12 +162,12 @@ pub fn build(b: *std.Build) void {
     const run_codegen_tests = b.addRunArtifact(codegen_tests);
 
     // `.ntx` tooling: `Expose`/`Codegen` also come from natyv-io/shared now
-    // (see the `shared_dep` note above; their own internal `Parser` wiring
+    // (see the `shared_mods` note above; their own internal `Parser` wiring
     // is already baked into `shared`'s own build.zig, so nothing here
     // needs to reference `Parser` directly) -- `Validate` below is
     // `cli`-only (not needed by `ntx-lsp`), so it stays local.
-    const ntx_expose_mod = shared_dep.module("Expose");
-    const ntx_codegen_module = shared_dep.module("Codegen");
+    const ntx_expose_mod = shared_mods.expose;
+    const ntx_codegen_module = shared_mods.codegen;
 
     const ntx_validate_module = b.createModule(.{
         .root_source_file = b.path("src/ntx/Validate.zig"),
