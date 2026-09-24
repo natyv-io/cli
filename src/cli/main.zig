@@ -408,6 +408,12 @@ pub fn main(init: std.process.Init) !void {
     // texture fill at all, and `Prepare.run` itself only treats it as a
     // real error if a texture is actually referenced with none present.
     const assets_dir_path = try std.fs.path.join(allocator, &.{ config_dir, "assets" });
+    // `icon` is relative to the config file's own directory, not to
+    // `assets/` like fonts and textures -- resolved once here since both
+    // `prepare` (staging it for the system tray) and `build` (packaging it
+    // into .icns/.ico/an AppImage icon) need the same joined path.
+    const config_icon_path: ?[]const u8 = if (config.value.icon) |icon| try std.fs.path.join(allocator, &.{ config_dir, icon }) else null;
+    defer if (config_icon_path) |p| allocator.free(p);
     defer allocator.free(assets_dir_path);
     var assets_dir_opt: ?std.Io.Dir = std.Io.Dir.cwd().openDir(io, assets_dir_path, .{}) catch null;
     defer if (assets_dir_opt) |*d| d.close(io);
@@ -430,7 +436,7 @@ pub fn main(init: std.process.Init) !void {
             // `bindings` entries at all.
             const natyv_core_src = init.environ_map.get("NATYV_CORE_SRC") orelse build_options.natyv_core_src_default;
             const mode: Prepare.Mode = if (parsed.codegen) .codegen_only else .full;
-            const outcome = try Prepare.run(arena.allocator(), io, guest_dir, config.value.bindings, natyv_core_src, mode, config.value.images.enabled, assets_dir_opt, config.value.memory.recycle_threshold_mb != null, config.value.ui.font, config.value.ui.font_size);
+            const outcome = try Prepare.run(arena.allocator(), io, guest_dir, config.value.bindings, natyv_core_src, mode, config.value.images.enabled, assets_dir_opt, config.value.memory.recycle_threshold_mb != null, config.value.ui.font, config.value.ui.font_size, config_icon_path);
             if (outcome.err) |e| {
                 std.debug.print("{s}\n", .{e.message});
                 return error.PrepareFailed;
@@ -496,7 +502,7 @@ pub fn main(init: std.process.Init) !void {
             const fresh = !parsed.force and try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename, build_options.cli_version, config.value.wasm_compile, config.value.memory.recycle_threshold_mb);
             const mode: Prepare.Mode = if (fresh) .codegen_only else .full;
 
-            const outcome = try Prepare.run(arena_alloc, io, guest_dir, config.value.bindings, natyv_core_src, mode, config.value.images.enabled, assets_dir_opt, config.value.memory.recycle_threshold_mb != null, config.value.ui.font, config.value.ui.font_size);
+            const outcome = try Prepare.run(arena_alloc, io, guest_dir, config.value.bindings, natyv_core_src, mode, config.value.images.enabled, assets_dir_opt, config.value.memory.recycle_threshold_mb != null, config.value.ui.font, config.value.ui.font_size, config_icon_path);
             if (outcome.err) |e| {
                 std.debug.print("{s}\n", .{e.message});
                 return error.PrepareFailed;
@@ -553,7 +559,7 @@ pub fn main(init: std.process.Init) !void {
             // simple; the icon path is `Config.icon`, relative to the
             // config file's own directory, same convention as `assets/`.
             const bundle_id = try config.value.effectiveBundleId(arena_alloc);
-            const icon_path: ?[]const u8 = if (config.value.icon) |icon| try std.fs.path.join(arena_alloc, &.{ config_dir, icon }) else null;
+            const icon_path = config_icon_path;
 
             // Real custom-CA staging: read each `allowed_sockets[].
             // ca_cert_path` (relative to `config_dir`, same convention as
@@ -586,7 +592,7 @@ pub fn main(init: std.process.Init) !void {
                 };
 
                 std.debug.print("natyv build: {s} -- bundling...\n", .{config.value.name});
-                const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, outcome.has_window_style, outcome.has_app_font, config.value.sqlite.enabled, bundle_id, icon_path, null, native_os, config.value.linux_package, ca_certs_json, cache_dir, config.value.build_mode.optimizeFlag());
+                const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, outcome.has_window_style, outcome.has_app_font, outcome.has_tray_icon, config.value.sqlite.enabled, bundle_id, icon_path, null, native_os, config.value.linux_package, ca_certs_json, cache_dir, config.value.build_mode.optimizeFlag());
                 if (bundle_result.err) |e| {
                     std.debug.print("{s}\n", .{e.message});
                     return error.BundleFailed;
@@ -621,7 +627,7 @@ pub fn main(init: std.process.Init) !void {
                     const target_triple: ?[]const u8 = if (CompileTargets.isNativeTarget(resolved)) null else resolved.triple;
 
                     std.debug.print("natyv build: {s} -- bundling for {s}...\n", .{ config.value.name, target_name });
-                    const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, outcome.has_window_style, outcome.has_app_font, config.value.sqlite.enabled, bundle_id, icon_path, target_triple, resolved_os, config.value.linux_package, ca_certs_json, cache_dir, config.value.build_mode.optimizeFlag());
+                    const bundle_result = try Bundle.run(arena_alloc, io, natyv_core_src, wasm_full_path, parsed.config_path, dist_dir, config.value.name, config.value.bindings.len > 0, binding_include_dirs, binding_lib_dirs, binding_link, binding_zig_deps, binding_vendor_c_files, outcome.has_textures, outcome.has_window_style, outcome.has_app_font, outcome.has_tray_icon, config.value.sqlite.enabled, bundle_id, icon_path, target_triple, resolved_os, config.value.linux_package, ca_certs_json, cache_dir, config.value.build_mode.optimizeFlag());
                     if (bundle_result.err) |e| {
                         std.debug.print("{s}\n", .{e.message});
                         return error.BundleFailed;
