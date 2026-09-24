@@ -1,4 +1,9 @@
 const std = @import("std");
+/// Read only for `.version` -- the single source of truth for the natyv
+/// CLI's own version, baked into the binary so `BuildCache` can invalidate
+/// an app's cache when the toolchain that generated its code changes (see
+/// `src/cli/BuildCache.zig`'s own header for why that matters).
+const zon = @import("build.zig.zon");
 
 // Explicit manual override for Extism's install prefix -- see
 // natyv-io/core's own build.zig for the full reasoning (identical here).
@@ -325,6 +330,7 @@ pub fn build(b: *std.Build) void {
     const natyv_core_src_default = b.option([]const u8, "natyv-core-src", "Compile-time default path to a natyv-io/core checkout, baked into the natyv CLI binary -- overridable at runtime via NATYV_CORE_SRC. Real packaging wrappers set this to wherever they vendor natyv-core's source.") orelse (b.build_root.path orelse ".");
     const cli_build_options = b.addOptions();
     cli_build_options.addOption([]const u8, "natyv_core_src_default", natyv_core_src_default);
+    cli_build_options.addOption([]const u8, "cli_version", zon.version);
 
     const cli_module = b.createModule(.{
         .root_source_file = b.path("src/cli/main.zig"),
