@@ -42,6 +42,16 @@
 //! app's cache exactly once; the upgrade *to* the first version that has
 //! this is covered too, since adding a value the old CLI never hashed
 //! changes the digest by itself.
+//!
+//! **Why the binary's own hash is in there too (2026-09-28).** The version
+//! only changes on a release. A dev CLI rebuilt with new codegen -- or one
+//! built against a local `-Dshared-src` -- keeps the same version string,
+//! so every app still read fresh and bundled a wasm built by the previous
+//! transpiler (hit for real during the Canvas fixture click-through, where
+//! the cache and generated output had to be deleted by hand).
+//! `toolchainIdentity` appends a hash of the running executable: any
+//! rebuilt CLI invalidates each app once, and an identical binary (every
+//! install of a given release) still gets cache hits.
 
 const std = @import("std");
 const Io = std.Io;
@@ -140,6 +150,24 @@ pub fn isFresh(allocator: std.mem.Allocator, io: Io, guest_dir: Io.Dir, wasm_bas
     const cached = try readCachedHash(allocator, io, guest_dir) orelse return false;
     const current = try computeSourceHash(allocator, io, guest_dir, toolchain, wasm_compile, recycle_threshold_mb);
     return std.mem.eql(u8, &cached, &current);
+}
+
+/// The `toolchain` string for `computeSourceHash`/`isFresh`: `version`
+/// plus a SHA-256 of `exe`'s bytes (the running `natyv` binary, via
+/// `std.process.openExecutable`). See this file's header for why the
+/// version alone isn't enough.
+pub fn toolchainIdentity(allocator: std.mem.Allocator, io: Io, version: []const u8, exe: Io.File) ![]const u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = exe.readStreaming(io, &.{&buf}) catch |e| switch (e) {
+            error.EndOfStream => break,
+            else => return e,
+        };
+        hasher.update(buf[0..n]);
+    }
+    const hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
+    return std.fmt.allocPrint(allocator, "{s}+{s}", .{ version, &hex });
 }
 
 /// Stand-in toolchain version for the tests below -- these exercise the
@@ -258,6 +286,32 @@ test "isFresh: a cache written by an older toolchain is not fresh" {
     // ...and the same CLI that wrote it still sees a real cache hit, so
     // this costs nothing on the ordinary no-upgrade path.
     try std.testing.expect(try isFresh(allocator, io, tmp.dir, "app.wasm", "0.1.0", "tinygo build -o app.wasm .", null));
+}
+
+test "toolchainIdentity: a rebuilt binary with the same version is a different identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Stand-ins for two builds of the CLI; the second is larger than one
+    // read buffer so the loop runs more than once.
+    try tmp.dir.writeFile(io, .{ .sub_path = "natyv-a", .data = "old codegen" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "natyv-b", .data = "new codegen" ** 10000 });
+
+    const a = try tmp.dir.openFile(io, "natyv-a", .{});
+    defer a.close(io);
+    const a_again = try tmp.dir.openFile(io, "natyv-a", .{});
+    defer a_again.close(io);
+    const b = try tmp.dir.openFile(io, "natyv-b", .{});
+    defer b.close(io);
+
+    const id_a = try toolchainIdentity(allocator, io, "0.2.0", a);
+    try std.testing.expect(std.mem.startsWith(u8, id_a, "0.2.0+"));
+    try std.testing.expectEqualStrings(id_a, try toolchainIdentity(allocator, io, "0.2.0", a_again));
+    try std.testing.expect(!std.mem.eql(u8, id_a, try toolchainIdentity(allocator, io, "0.2.0", b)));
 }
 
 test "generated output files are excluded from the hash" {

@@ -61,8 +61,8 @@ pub const ParsedArgs = struct {
     /// `BuildCache`'s freshness check as stale for this invocation, so
     /// `prepare`/`wasm_compile` always re-run regardless of the cached
     /// hash. A manual escape hatch alongside the freshness check itself
-    /// now also hashing `wasm_compile` and the CLI's own version (see
-    /// `BuildCache.zig`) -- those two fixes close the specific gaps that
+    /// now also hashing `wasm_compile` and the CLI's own version and
+    /// binary (see `BuildCache.zig`) -- those fixes close the specific gaps that
     /// motivated adding this flag (editing compile flags alone, and later
     /// upgrading the CLI alone, didn't invalidate the cache), but a flag
     /// is still worth having for any other cache surprise (e.g. a
@@ -494,12 +494,22 @@ pub fn main(init: std.process.Init) !void {
             // invocation, fresh or not; only the `.ntx` walk/transpile
             // itself (and, further down, `wasm_compile`) are skippable.
             const wasm_basename = try config.value.wasmFilename(arena_alloc);
-            // `build_options.cli_version` is this binary's own version from
-            // `build.zig.zon`, standing in for "whatever transpiler produced
-            // the generated code" -- without it, a CLI upgrade that changes
-            // codegen output leaves every app's cache reading fresh and its
-            // wasm stale. See `BuildCache.zig`'s own header.
-            const fresh = !parsed.force and try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename, build_options.cli_version, config.value.wasm_compile, config.value.memory.recycle_threshold_mb);
+            // This binary's own version from `build.zig.zon` plus a hash of
+            // the binary itself, standing in for "whatever transpiler
+            // produced the generated code" -- without it, a CLI upgrade or
+            // rebuild that changes codegen output leaves every app's cache
+            // reading fresh and its wasm stale. See `BuildCache.zig`'s own
+            // header. If the binary can't be read, fall back to the version
+            // alone rather than fail the build.
+            const toolchain = blk: {
+                const exe = std.process.openExecutable(io, .{}) catch |e| {
+                    std.debug.print("natyv build: couldn't open the natyv binary to hash it ({s}); the build cache will key on the version alone\n", .{@errorName(e)});
+                    break :blk build_options.cli_version;
+                };
+                defer exe.close(io);
+                break :blk try BuildCache.toolchainIdentity(arena_alloc, io, build_options.cli_version, exe);
+            };
+            const fresh = !parsed.force and try BuildCache.isFresh(arena_alloc, io, guest_dir, wasm_basename, toolchain, config.value.wasm_compile, config.value.memory.recycle_threshold_mb);
             const mode: Prepare.Mode = if (fresh) .codegen_only else .full;
 
             const outcome = try Prepare.run(arena_alloc, io, guest_dir, config.value.bindings, natyv_core_src, mode, config.value.images.enabled, assets_dir_opt, config.value.memory.recycle_threshold_mb != null, config.value.ui.font, config.value.ui.font_size, config_icon_path);
@@ -544,7 +554,7 @@ pub fn main(init: std.process.Init) !void {
                     return error.WasmCompileFailed;
                 }
 
-                const new_hash = try BuildCache.computeSourceHash(arena_alloc, io, guest_dir, build_options.cli_version, config.value.wasm_compile, config.value.memory.recycle_threshold_mb);
+                const new_hash = try BuildCache.computeSourceHash(arena_alloc, io, guest_dir, toolchain, config.value.wasm_compile, config.value.memory.recycle_threshold_mb);
                 try BuildCache.writeCachedHash(io, guest_dir, new_hash);
             }
 
